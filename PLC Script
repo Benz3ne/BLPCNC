@@ -1,0 +1,769 @@
+local inst = mc.mcGetInstance()
+local rc = 0
+
+
+
+
+-- Get machine enabled state properly
+local machEnabledHandle = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED)
+local machEnabled = 0
+if machEnabledHandle and machEnabledHandle > 0 then
+    machEnabled = mc.mcSignalGetState(machEnabledHandle)
+end
+
+-- Get machine state
+local machState, rc = mc.mcCntlGetState(inst)
+local inCycle = mc.mcCntlIsInCycle(inst)
+
+-- Initialize tracking variables for end of script
+local machStateOld = machState  -- Will be used at script end
+local machWasEnabled = machEnabled  -- Will be used at script end
+
+-- Get current tool
+local currentTool = mc.mcToolGetCurrent(inst)
+
+-- Increment test counter
+testcount = testcount + 1
+
+-------------------------------------------------------
+--  Set plate align (G68) Led
+-------------------------------------------------------
+local curLedState = math.tointeger(scr.GetProperty("ledPlateAlign", "Value"))
+local curAlignState = math.tointeger((mc.mcCntlGetPoundVar(inst, 4016) - 69))
+curAlignState = math.abs(curAlignState)
+if (curLedState ~= curAlignState) then
+	scr.SetProperty("ledPlateAlign", "Value", tostring(curAlignState))
+end
+-------------------------------------------------------
+--  Coroutine resume
+-------------------------------------------------------
+if (wait ~= nil) and (machState == 0) then --wait exist and state == idle
+	local state = coroutine.status(wait)
+    if state == "suspended" then --wait is suspended
+        coroutine.resume(wait)
+    end
+end
+-------------------------------------------------------
+--  Cycle time label update
+-------------------------------------------------------
+--Requires a static text box named "CycleTime" on the screen
+if (machEnabled == 1) then
+	local cycletime = mc.mcCntlGetRunTime(inst)  -- Remove the undefined 'time' parameter
+	scr.SetProperty("CycleTime", "Label", SecondsToTime(cycletime))
+end
+-------------------------------------------------------
+--  Set Height Offset Led and Monitor H Sync
+-------------------------------------------------------
+local HOState = mc.mcCntlGetPoundVar(inst, 4008)
+local activeH = mc.mcCntlGetPoundVar(inst, 4120)
+-- currentTool already declared above, don't redeclare
+
+-- Update LED
+if (HOState == 49) then
+    scr.SetProperty("ledHOffset", "Value", "0")
+else
+    scr.SetProperty("ledHOffset", "Value", "1")
+    
+end
+-------------------------------------------------------
+--  Set Spindle Ratio DRO
+-------------------------------------------------------
+local spinmotormax, rangemax, ratio
+spinmotormax, rc = scr.GetProperty('droSpinMotorMax', 'Value')
+spinmotormax = tonumber(spinmotormax) or 1   
+rangemax, rc = scr.GetProperty('droRangeMax', 'Value')
+rangemax = tonumber(rangemax) or 1
+ratio = (rangemax / spinmotormax)    
+scr.SetProperty('droRatio', 'Value', tostring(ratio))
+
+-------------------------------------------------------
+--  Set Feedback Ratio DRO Updated 5-30-16
+-------------------------------------------------------
+local range, rc = mc.mcSpindleGetCurrentRange(inst)
+local fbratio, rc = mc.mcSpindleGetFeedbackRatio(inst, range)
+scr.SetProperty('droFeedbackRatio', 'Value', tostring(fbratio))
+
+-------------------------------------------------------
+--  PLC First Run
+-------------------------------------------------------
+if (testcount == 1) then --Set Keyboard input startup state
+    local iReg = mc.mcIoGetHandle (inst, "Keyboard/Enable")
+    mc.mcIoSetState(iReg, 1) --Set register to 1 to ensure KeyboardInputsToggle function will do a disable.
+    KeyboardInputsToggle()
+    DecToFrac(0)
+    DecToFrac(1)
+    DecToFrac(2)
+	---------------------------------------------------------------
+	-- Set Persistent DROs.
+	---------------------------------------------------------------
+
+    DROTable = {
+	[1034] = "droEdgeFinder",
+    [1035] = "droGageBlock",
+    [1036] = "droGageBlockT"
+    }
+	
+	-- ******************************************************************************************* --
+	-- The following is a loop. As a rule of thumb loops should be avoided in the PLC Script.  --
+	-- However, this loop only runs during the first run of the PLC script so it is acceptable.--
+	-- ******************************************************************************************* --                                                     
+
+    for name,number in pairs (DROTable) do -- for each paired name (key) and number (value) in the DRO table
+        local droName = (DROTable[name]) -- make the variable named droName equal the name from the table above
+        --wx.wxMessageBox (droName)
+        local val = mc.mcProfileGetString(inst, "PersistentDROs", (droName), "NotFound") -- Get the Value from the profile ini
+        if(val ~= "NotFound")then -- If the value is not equal to NotFound
+            scr.SetProperty((droName), "Value", val) -- Set the dros value to the value from the profile ini
+        end -- End the If statement
+    end -- End the For loop
+end
+
+
+
+
+
+
+-- Initialize persistent globals on first run
+if not _G.toolPLCInit then
+    _G.toolPLCInit = true
+    _G.lastTool = -999  -- Force first update
+	_G.lastSyncedTool = -999
+    _G.lastPollTime = os.clock()
+    _G.debounceStart = nil
+    _G.debouncing = false
+    _G.enablePromptDone = false
+    _G.toolPresentHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)
+    
+    -- Validate handle
+    if not _G.toolPresentHandle or _G.toolPresentHandle <= 0 then
+        mc.mcCntlSetLastError(inst, "ERROR: Invalid handle for Input #17 (Tool Present)")
+        _G.toolPresentHandle = nil
+    end
+    
+    -- Set current tool to 0 on startup
+    mc.mcToolSetCurrent(inst, 0)
+end
+
+-- Function to prompt tool selection
+local function promptToolSelection(isStartup)
+    -- CHECK M6 PROTECTION FLAG FIRST
+    local m6Running = mc.mcCntlGetPoundVar(inst, 499) == 1
+    local suppressPrompt = mc.mcCntlGetPoundVar(inst, 498) == 1
+    
+    if m6Running or suppressPrompt then
+        -- M6 is running - DO NOT prompt
+        return
+    end
+    
+    if not _G.toolChoices then
+        mc.mcCntlSetLastError(inst, "ERROR: Tool list not populated")
+        return
+    end
+    
+    local message = isStartup and 
+        "Tool detected in spindle but active tool is T0.\nSelect the actual tool:" or
+        "Tool detected in spindle but active tool is T0.\nSelect the actual tool:"
+    
+    local dlg = wx.wxSingleChoiceDialog(wx.NULL, 
+        message, 
+        "Tool Mismatch Detected", 
+        _G.toolChoices)
+    
+    if dlg:ShowModal() == wx.wxID_OK then
+        local selection = dlg:GetSelection()  -- 0-based
+        local newTool = _G.toolNumbers[selection + 1]
+        
+        -- Force PLC to see a change even if same tool selected
+        _G.lastTool = -999
+        
+        mc.mcToolSetCurrent(inst, newTool)
+        wx.wxMilliSleep(50)
+		
+        -- SYNC H OFFSET
+        mc.mcCntlGcodeExecuteWait(inst, "G49")  -- Cancel first
+        wx.wxMilliSleep(100)
+        
+        if newTool > 0 then
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G43 H%d", newTool))
+            wx.wxMilliSleep(100)
+            
+            -- Record when dialog set the H offset
+            _G.hOffsetLastSync = os.clock()
+            
+            -- Verify
+            local activeH = mc.mcCntlGetPoundVar(inst, 4120)
+            local desc = mc.mcToolGetDesc(inst, newTool) or "Unnamed"
+            if activeH == newTool then
+             --   mc.mcCntlSetLastError(inst, string.format("Tool set to T%d - %s (H%d active)", newTool, desc, newTool))
+            else
+             --   mc.mcCntlSetLastError(inst, string.format("Tool set to T%d - %s (H%.0f WARNING!)", newTool, desc, activeH))
+            end
+        else
+         --   mc.mcCntlSetLastError(inst, "Tool set to T0 - No Tool (H offset cancelled)")
+            _G.hOffsetLastSync = os.clock()
+        end
+        
+        
+        
+        if UpdateToolPreview then
+            UpdateToolPreview()
+        end
+    else
+        
+        mc.mcToolSetCurrent(inst, 1)
+        
+        
+        mc.mcCntlGcodeExecuteWait(inst, "G49")
+        wx.wxMilliSleep(100)
+        mc.mcCntlGcodeExecuteWait(inst, "G43 H1")
+        
+        -- Record when dialog set the H offset
+        _G.hOffsetLastSync = os.clock()
+        
+        wx.wxMessageBox("Tool selection cancelled.\n\nTool has been set to T1 by default.\nPlease verify the correct tool number.", 
+                       "Tool Set to T1", wx.wxOK + wx.wxICON_WARNING)
+        
+      
+        local activeH = mc.mcCntlGetPoundVar(inst, 4120)
+        if activeH == 1 then
+         --   mc.mcCntlSetLastError(inst, "Tool set to T1 by default (H1 active)")
+        else
+         --   mc.mcCntlSetLastError(inst, string.format("Tool set to T1 by default (H%.0f WARNING!)", activeH))
+        end
+     
+        
+        -- Update the preview label
+        if UpdateToolPreview then
+            UpdateToolPreview()
+        end
+    end
+    
+    dlg:Destroy()  -- Always destroy dialog
+end
+
+-- Check for enable condition (tool present but T0 active) - ONLY when machine is enabled
+if machEnabled == 1 and not _G.enablePromptDone and _G.toolPresentHandle then
+    local toolPresent = mc.mcSignalGetState(_G.toolPresentHandle)
+    --local currentTool = mc.mcToolGetCurrent(inst)
+    
+    -- Check protection flags
+    local m6Running = mc.mcCntlGetPoundVar(inst, 499) == 1
+    local suppressPrompt = mc.mcCntlGetPoundVar(inst, 498) == 1
+    
+    if toolPresent == 1 and currentTool == 0 and not m6Running and not suppressPrompt then
+        promptToolSelection(true)  -- true = startup
+    end
+    _G.enablePromptDone = true
+elseif machEnabled == 0 then
+    -- Reset flag when machine is disabled so prompt can show again next enable
+    _G.enablePromptDone = false
+end
+
+-- Monitor current tool and sync dropdown if no user selection active
+currentTool = mc.mcToolGetCurrent(inst)
+if currentTool ~= _G.lastTool then
+    local toolChangeTime = os.clock()
+    _G.lastTool = currentTool
+    
+    -- Only sync H offset if machine is idle, no M6 running, and enough time has passed
+    local machState = mc.mcCntlGetState(inst)
+    local m6Running = mc.mcCntlGetPoundVar(inst, 499) == 1
+    
+    -- Check if this was a recent manual sync (within 1 second)
+    local timeSinceLastSync = toolChangeTime - (_G.hOffsetLastSync or 0)
+    
+    if machState == 0 and not m6Running and timeSinceLastSync > 1.0 then
+        -- Check if H offset is already correct
+        local currentH = mc.mcCntlGetPoundVar(inst, 4120)
+        local compMode = mc.mcCntlGetPoundVar(inst, 4008)
+        
+        local needsSync = false
+        if currentTool == 0 and compMode == 43 then
+            needsSync = true  -- T0 but H offset active
+        elseif currentTool > 0 and (compMode == 49 or currentH ~= currentTool) then
+            needsSync = true  -- Tool > 0 but wrong/no H offset
+        end
+        
+        if needsSync then
+            mc.mcCntlGcodeExecuteWait(inst, "G49")
+            if currentTool > 0 then
+                mc.mcCntlGcodeExecuteWait(inst, string.format("G43 H%d", currentTool))
+              --  mc.mcCntlSetLastError(inst, string.format("PLC: H offset synced to H%d for T%d", currentTool, currentTool))
+            else
+              --  mc.mcCntlSetLastError(inst, "PLC: H offset cancelled for T0")
+            end
+            _G.hOffsetLastSync = os.clock()
+        end
+    end
+    
+    -- Update dropdown to reflect current tool (existing code)
+    if not _G.selectedToolIndex then
+        -- Find tool in dropdown list
+        local index = -1
+        if _G.toolNumbers then
+            for i, t in ipairs(_G.toolNumbers) do
+                if t == currentTool then
+                    index = i - 1  -- Convert to 0-based
+                    break
+                end
+            end
+        end
+        
+        if index >= 0 then
+            scr.SetProperty("lstCurrentTool", "Value", tostring(index))
+        else
+            -- Tool not in dropdown - set to T0
+            scr.SetProperty("lstCurrentTool", "Value", "0")
+        end
+        
+        -- Update preview
+        if UpdateToolPreview then
+            UpdateToolPreview()
+        end
+    end
+end
+
+-- Poll for mismatch every 1000ms (only when enabled and after initial prompt)
+if machEnabled == 1 and _G.enablePromptDone and os.clock() - _G.lastPollTime >= 1.0 then
+    _G.lastPollTime = os.clock()
+    
+    -- Check protection flags
+    local m6Running = mc.mcCntlGetPoundVar(inst, 499) == 1
+    local suppressPrompt = mc.mcCntlGetPoundVar(inst, 498) == 1
+    
+    if _G.toolPresentHandle and not m6Running and not suppressPrompt then
+        local toolPresent = mc.mcSignalGetState(_G.toolPresentHandle)
+        
+        -- Check for mismatch: tool present but T0 active
+        if toolPresent == 1 and currentTool == 0 then
+            if not _G.debouncing then
+                _G.debouncing = true
+                _G.debounceStart = os.clock()
+            elseif os.clock() - _G.debounceStart >= 0.5 then  -- 500ms debounce
+                promptToolSelection(false)  -- false = not startup
+                _G.debouncing = false
+                _G.debounceStart = nil
+            end
+        else
+            -- Reset debounce if no mismatch
+            _G.debouncing = false
+            _G.debounceStart = nil
+        end
+    else
+        -- Reset debounce if M6 is running
+        _G.debouncing = false
+        _G.debounceStart = nil
+    end
+end
+
+
+
+
+
+
+-- DUST/VACUUM/BOOT AUTOMATION - POUND VARIABLE VERSION
+
+-- Initialize on first run
+if not _G.dustAutoInit then
+    _G.dustAutoInit = true
+    _G.lastMachineState = mc.mcCntlGetState(inst)
+    
+    -- Initialize pound variables if they're uninitialized (will be -1.79e308)
+    if mc.mcCntlGetPoundVar(inst, 400) < -1e300 then
+        mc.mcCntlSetPoundVar(inst, 400, 0)  -- Dust collect auto
+    end
+    if mc.mcCntlGetPoundVar(inst, 401) < -1e300 then
+        mc.mcCntlSetPoundVar(inst, 401, 0)  -- Vacuum auto
+    end
+    if mc.mcCntlGetPoundVar(inst, 402) < -1e300 then
+        mc.mcCntlSetPoundVar(inst, 402, 0)  -- Dust boot auto
+    end
+    if mc.mcCntlGetPoundVar(inst, 499) < -1e300 then
+        mc.mcCntlSetPoundVar(inst, 499, 0)  -- M6 running flag
+    end
+    if mc.mcCntlGetPoundVar(inst, 496) < -1e300 then
+        mc.mcCntlSetPoundVar(inst, 496, 0)  -- Probe flag
+    end
+    
+end
+
+-- Get current machine state
+local currentState = mc.mcCntlGetState(inst)
+
+-- Check M6 protection flags
+local m6Flag = mc.mcCntlGetPoundVar(inst, 499)
+local probeFlag = mc.mcCntlGetPoundVar(inst, 496)
+
+-- Only process on state changes
+if currentState ~= _G.lastMachineState then
+    
+    -- Define state constants
+    local STATE_IDLE = 0
+    local STATE_FRUN = 100
+    
+    -- PROGRAM START: Idle -> Feed Run
+    if _G.lastMachineState == STATE_IDLE and currentState == STATE_FRUN then
+        
+        -- Check dust collection auto (#400)
+        if mc.mcCntlGetPoundVar(inst, 400) == 1 then
+            local hDust = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT4)
+            if hDust and hDust > 0 then
+                mc.mcSignalSetState(hDust, 1)  -- Turn ON
+            end
+        end
+        
+        -- Check dust boot auto (#402)
+        if mc.mcCntlGetPoundVar(inst, 402) == 1 then
+            local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+            if hBoot and hBoot > 0 then
+                mc.mcSignalSetState(hBoot, 1)  -- Lower boot
+            end
+        end
+        
+        -- Log what's enabled
+        local dustOn = mc.mcCntlGetPoundVar(inst, 400) == 1
+        local bootOn = mc.mcCntlGetPoundVar(inst, 402) == 1
+      
+        
+    -- PROGRAM END: Feed Run -> Idle
+    elseif _G.lastMachineState == STATE_FRUN and currentState == STATE_IDLE then
+        
+        -- Check if M6 or probe is running - if so, DO NOT auto stop!
+        if m6Flag == 1 or probeFlag == 1 then
+            -- M6/Probe is running, skip auto stop
+        else
+            -- Normal auto stop behavior
+            local msg = "AUTO STOP: "
+            
+            -- Always turn off dust collection
+            local hDust = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT4)
+            if hDust and hDust > 0 then
+                mc.mcSignalSetState(hDust, 0)  -- Turn OFF
+                msg = msg .. "Dust OFF, "
+            end
+            
+            -- Always raise dust boot
+            local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+            if hBoot and hBoot > 0 then
+                mc.mcSignalSetState(hBoot, 0)  -- Raise boot
+                msg = msg .. "Boot UP, "
+            end
+            
+            -- Check vacuum auto shutdown (#401)
+            if mc.mcCntlGetPoundVar(inst, 401) == 1 then
+                local hVac1 = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT5)
+                local hVac2 = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT6)
+                
+                if hVac1 and hVac1 > 0 then
+                    mc.mcSignalSetState(hVac1, 0)  -- Turn OFF
+                end
+                if hVac2 and hVac2 > 0 then
+                    mc.mcSignalSetState(hVac2, 0)  -- Turn OFF
+                end
+                msg = msg .. "Vacuums OFF"
+            else
+                msg = msg .. "Vacuums unchanged"
+            end
+            
+            mc.mcCntlSetLastError(inst, msg)
+        end
+    end
+    
+    -- Update last state for next cycle
+    _G.lastMachineState = currentState
+end
+
+
+
+
+-- ===== HOMING INDICATOR AND WARNING RESET =====
+do
+    local inst = mc.mcGetInstance()
+    
+    -- Initialize persistent variables
+    if _G.lastHomingFlashState == nil then
+        _G.lastHomingFlashState = nil
+        _G.lastHomedState = nil
+        _G.AXES_HOMED = false
+    end
+    
+    -- Check if all axes are homed
+    local allHomed = true
+    local unhomedAxes = {}
+    
+    for axis = 0, 5 do
+        local enabledOk, enabled = pcall(mc.mcAxisIsEnabled, inst, axis)
+        local homedOk, homed = pcall(mc.mcAxisIsHomed, inst, axis)
+        
+        if enabledOk and homedOk then
+            if enabled == 1 and homed ~= 1 then
+                allHomed = false
+                table.insert(unhomedAxes, axis)
+            end
+        end
+    end
+    
+    -- Calculate flash state
+    local flashOn = (math.floor(testcount / 6) % 2) == 0
+    
+    -- Update button appearance if not all homed
+    if not allHomed then
+        if _G.lastHomingFlashState ~= flashOn or _G.lastHomedState ~= allHomed then
+            local color = flashOn and "#FFFF00" or "#4B4B4B"
+            
+            pcall(scr.SetProperty, "btnRefAllAxes", "Bg Color", color)
+            pcall(scr.SetProperty, "btnRefAllAxes", "Fg Color", "#000000")
+            pcall(scr.SetProperty, "btnRefAllAxes", "Label", "HOME\nREQUIRED")
+            
+            _G.lastHomingFlashState = flashOn
+        end
+    else
+        -- All axes homed - restore normal button
+        if _G.lastHomedState == false or _G.lastHomedState == nil then
+            pcall(scr.SetProperty, "btnRefAllAxes", "Bg Color", "#4B4B4B")
+            pcall(scr.SetProperty, "btnRefAllAxes", "Fg Color", "#FFFFFF")
+            pcall(scr.SetProperty, "btnRefAllAxes", "Label", "Ref All\nAxis")
+        end
+        
+        -- Reset warning bypass when all axes are homed
+        if _G.HOMING_WARNING_IGNORED then
+            _G.HOMING_WARNING_IGNORED = false
+        end
+    end
+    
+    -- Update global state
+    _G.lastHomedState = allHomed
+    _G.AXES_HOMED = allHomed
+end
+-- ===== END HOMING INDICATOR AND WARNING RESET =====
+
+
+
+
+
+
+
+-- ============================================
+-- Work Offset Monitoring Section
+-- Monitors and syncs button states
+-- ============================================
+-- Initialize tracking variable if needed
+if not _G.lastWorkOffset then
+    _G.lastWorkOffset = -1  -- Force first update
+end
+
+-- Get current work offset
+local currentOffset = mc.mcCntlGetPoundVar(inst, mc.SV_MOD_GROUP_14 or 5220)
+
+-- Check if offset has changed
+if currentOffset ~= _G.lastWorkOffset then
+    -- Update buttons if the function exists
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+    
+    -- Only log if this is a real change (not initialization)
+    if _G.lastWorkOffset ~= -1 then
+        if currentOffset >= 54 and currentOffset <= 59 then
+            -- Standard G54-G59
+            mc.mcCntlSetLastError(inst, string.format("Work Offset: G%.0f", currentOffset))
+        elseif math.abs(currentOffset - 54.1) < 0.01 then
+            -- G54.1 detected - warn user
+            local pNumber = mc.mcCntlGetPoundVar(inst, mc.SV_BUFP or 5219)
+            mc.mcCntlSetLastError(inst, string.format("WARNING: G54.1 P%d active - not shown in UI", pNumber))
+        else
+            -- Unknown offset
+            mc.mcCntlSetLastError(inst, string.format("WARNING: Unknown work offset %.1f", currentOffset))
+        end
+    end
+    
+    -- Update tracking variable
+    _G.lastWorkOffset = currentOffset
+end
+
+
+
+
+
+-- ============================================
+-- SOFT LIMITS STATE INITIALIZATION
+-- ============================================
+if not _G.softLimitsInit then
+    _G.softLimitsInit = true
+    _G.lastSoftLimitsState = nil  -- Force first update
+end
+
+-- ============================================
+-- SOFT LIMITS STATE MONITORING
+-- Keeps button synchronized with actual state
+-- ============================================
+
+-- Get current soft limits state from signal
+local softLimitsHandle = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON)
+
+if softLimitsHandle and softLimitsHandle > 0 then
+    local softLimitsEnabled = mc.mcSignalGetState(softLimitsHandle)
+    
+    -- Check if state has changed
+    if softLimitsEnabled ~= _G.lastSoftLimitsState then
+        -- State changed - update button
+        if softLimitsEnabled == 1 then
+            scr.SetProperty("btnSoftLimits", "Bg Color", "#00FF00")  -- Green
+            scr.SetProperty("btnSoftLimits", "Label", "Soft Limits\nENABLED")
+            
+            -- Only log if this was a change (not initialization)
+            if _G.lastSoftLimitsState ~= nil then
+                mc.mcCntlSetLastError(inst, "Soft limits ENABLED")
+            end
+        else
+            scr.SetProperty("btnSoftLimits", "Bg Color", "#FF0000")  -- Red
+            scr.SetProperty("btnSoftLimits", "Label", "Soft Limits\nDISABLED")
+            
+            -- Only log if this was a change (not initialization)
+            if _G.lastSoftLimitsState ~= nil then
+                mc.mcCntlSetLastError(inst, "WARNING: Soft limits DISABLED")
+            end
+        end
+		
+        -- Update tracking variable
+        _G.lastSoftLimitsState = softLimitsEnabled
+    end
+elseif _G.lastSoftLimitsState ~= -1 then
+    -- Handle error state only once
+    scr.SetProperty("btnSoftLimits", "Bg Color", "#808080")  -- Gray
+    scr.SetProperty("btnSoftLimits", "Label", "Soft Limits\nERROR")
+    mc.mcCntlSetLastError(inst, "ERROR: Cannot read soft limits state")
+    _G.lastSoftLimitsState = -1
+end
+
+
+
+
+
+-- ============================================
+-- Input 8 to Output 2 Mirroring and Tool Detection
+-- ============================================
+-- Initialize persistent state
+if not _G.lastInput8State then 
+    _G.lastInput8State = -1 
+    _G.toolCheckPending = false
+    _G.toolCheckTime = 0
+    _G.lastToolSensorState = -1  -- Track tool sensor state
+end
+
+-- Get Input 8 state
+local input8Handle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT8)
+if input8Handle and input8Handle > 0 then
+    local input8State = mc.mcSignalGetState(input8Handle)
+    
+    -- Only process on state change
+    if input8State ~= _G.lastInput8State then
+        -- Mirror to Output 2
+        local out2Handle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT2)
+        if out2Handle and out2Handle > 0 then
+            mc.mcSignalSetState(out2Handle, input8State)
+        end
+        
+        -- Tool detection on falling edge (button release, clamp closing)
+        if input8State == 0 and _G.lastInput8State == 1 then
+            -- Schedule tool check for 1 second later
+            _G.toolCheckPending = true
+            _G.toolCheckTime = os.clock() + 1.0
+        --    mc.mcCntlSetLastError(inst, "PLC: Tool check scheduled for 1s delay")
+        end
+        
+        _G.lastInput8State = input8State
+    end
+end
+
+-- Handle pending tool check after delay
+if _G.toolCheckPending and os.clock() >= _G.toolCheckTime then
+    _G.toolCheckPending = false
+  --  mc.mcCntlSetLastError(inst, "PLC: Checking for tool...")
+    
+    -- Check Input #17 (tool present)
+    local toolPresentHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)
+    if not toolPresentHandle or toolPresentHandle <= 0 then
+      --  mc.mcCntlSetLastError(inst, "PLC: ERROR - Invalid handle for Input 17")
+        return
+    end
+    
+    local toolPresent = mc.mcSignalGetState(toolPresentHandle)
+    local currentTool = mc.mcToolGetCurrent(inst)
+    
+  --  mc.mcCntlSetLastError(inst, string.format("PLC: Tool sensor=%d, Current tool=T%d", toolPresent, currentTool))
+    
+    -- Check if tool sensor state CHANGED from 0 to 1 (tool inserted)
+    if toolPresent == 1 and _G.lastToolSensorState == 0 then
+     --   mc.mcCntlSetLastError(inst, "PLC: New tool detected (was empty, now has tool)")
+        
+        -- Check M6 protection flags
+        local m6Running = mc.mcCntlGetPoundVar(inst, 499) == 1
+        local suppressPrompt = mc.mcCntlGetPoundVar(inst, 498) == 1
+        
+        if not m6Running and not suppressPrompt then
+            if not _G.toolChoices then
+          --      mc.mcCntlSetLastError(inst, "PLC: ERROR - Tool choices not populated")
+                return
+            end
+            
+         --   mc.mcCntlSetLastError(inst, "PLC: Showing tool selection dialog...")
+            
+            -- Show tool selection dialog
+            local dlg = wx.wxSingleChoiceDialog(wx.NULL, "Select Tool:", "Tool Confirmation", _G.toolChoices)
+            if dlg:ShowModal() == wx.wxID_OK then
+                local selection = dlg:GetSelection()  -- 0-based
+                local newTool = _G.toolNumbers[selection + 1]
+                
+                -- Set tool
+                mc.mcToolSetCurrent(inst, newTool)
+                
+                -- Sync H offset
+                mc.mcCntlGcodeExecuteWait(inst, "G49")  -- Cancel first
+                wx.wxMilliSleep(100)
+                
+                if newTool > 0 then
+                    mc.mcCntlGcodeExecuteWait(inst, string.format("G43 H%d", newTool))
+                    wx.wxMilliSleep(100)
+                    
+                    -- Verify it worked
+                    local activeH = mc.mcCntlGetPoundVar(inst, 4120)
+                    if activeH == newTool then
+                     --   mc.mcCntlSetLastError(inst, string.format("Tool changed to T%d (H%d active)", newTool, newTool))
+                    else
+                     --   mc.mcCntlSetLastError(inst, string.format("Tool changed to T%d but H%.0f active - CHECK!", newTool, activeH))
+                    end
+                else
+                 --   mc.mcCntlSetLastError(inst, "Tool changed to T0 (H offset cancelled)")
+                end
+            else
+                wx.wxMessageBox("Tool change cancelled. Tool not updated.", "Info", wx.wxOK + wx.wxICON_INFORMATION)
+            end
+            dlg:Destroy()
+            
+            -- Update preview if function exists
+            if UpdateToolPreview then
+                UpdateToolPreview()
+            end
+        end
+    elseif toolPresent == 0 and _G.lastToolSensorState == 1 then
+        mc.mcCntlSetLastError(inst, "PLC: Tool removed from spindle")
+    elseif toolPresent == 0 then
+        mc.mcCntlSetLastError(inst, "PLC: No tool in spindle")
+    else
+        mc.mcCntlSetLastError(inst, "PLC: Tool still present, no change")
+    end
+    
+    -- Update the last tool sensor state
+    _G.lastToolSensorState = toolPresent
+end
+
+
+
+
+
+
+-------------------------------------------------------
+--This is the last thing we do.  So keep it at the end of the script!
+machStateOld = machState;
+machWasEnabled = machEnabled;

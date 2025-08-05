@@ -1,4 +1,4 @@
---[[ M311: Multi-Direction Double-Tap Probe - Boss/Bore Corrected Version
+--[[ M311: Multi-Direction Double-Tap Probe
 
 Usage: SN M311 where N is direction (1-5)
   S1 M311  ; Probe +X
@@ -80,28 +80,6 @@ function m311()
     if type(maxTravel) ~= "number" or maxTravel <= 0 then maxTravel = 1 end
     if type(backoff1) ~= "number" or backoff1 < 0 then backoff1 = 0.1 end
     if type(backoff2) ~= "number" or backoff2 < 0 then backoff2 = 0.1 end
-    
-    -- Safety check: Remove tool if present
-    local toolPresentHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)
-    if toolPresentHandle > 0 then
-        local toolPresent = mc.mcSignalGetState(toolPresentHandle)
-        if toolPresent == 1 then
-            LOG("Removing tool for probe operation")
-            mc.mcCntlGcodeExecuteWait(inst, "M6 T0")
-        end
-    end
-    
-    -- Safety check: Deploy probe if necessary
-    local probeDownHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7)
-    if probeDownHandle > 0 then
-        local probeDeployed = mc.mcSignalGetState(probeDownHandle)
-        if probeDeployed == 0 then
-            LOG("Deploying probe")
-            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z0")  -- Move to safe Z
-            mc.mcSignalSetState(probeDownHandle, 1)       -- Deploy probe
-            mc.mcCntlGcodeExecuteWait(inst, "G4 P0.5")    -- Wait for deployment
-        end
-    end
     
     -- Get starting position in work coordinates
     local startPos = mc.mcAxisGetPos(inst, probeInfo.axis)

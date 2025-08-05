@@ -1,0 +1,206 @@
+--[[ M311: Multi-Direction Double-Tap Probe - Boss/Bore Corrected Version
+
+Usage: SN M311 where N is direction (1-5)
+  S1 M311  ; Probe +X
+  S2 M311  ; Probe -X
+  S3 M311  ; Probe +Y
+  S4 M311  ; Probe -Y
+  S5 M311  ; Probe -Z
+
+REQUIRED POUND VARIABLES:
+#300 = Probe tip diameter
+#301 = X offset from spindle center to probe tip
+#302 = Y offset from spindle center to probe tip
+#303 = Fast feedrate for probing
+#304 = Slow feedrate for final probe
+#305 = Maximum travel distance
+#306 = First backoff distance
+#307 = Second backoff distance (can be 0)
+
+OUTPUT VARIABLES:
+#389 = Machine coordinate of final probe contact
+#390 = Final probe contact position
+#391 = Edge position (adjusted for probe radius)
+#392 = Spindle position (adjusted for probe offset)
+
+NOTES:
+- For BOSS (external) probing: Probe moves INWARD, compensation adds radius in direction of travel
+- For BORE (internal) probing: Probe moves OUTWARD, compensation subtracts radius from direction of travel
+- This version is configured for BOSS probing as used by the Boss Probe script
+]]--
+
+function m311()
+    local inst = mc.mcGetInstance()
+    
+    local function LOG(msg)
+        mc.mcCntlSetLastError(inst, "[PROBE] " .. tostring(msg))
+    end
+    
+    -- Get direction from S value
+    local direction = mc.mcSpindleGetCommandRPM(inst)
+    if direction < 1 or direction > 5 then
+        LOG("ERROR: Invalid direction. Use S1-S5 before M311")
+        return
+    end
+    
+    -- Define probe directions
+    -- dir: direction of probe travel (+1 or -1)
+    -- For boss probing: probe moves TOWARD center (inward)
+    local directions = {
+        [1] = {axis = mc.X_AXIS, dir = 1, name = "+X"},   -- Probe moving in +X direction
+        [2] = {axis = mc.X_AXIS, dir = -1, name = "-X"},  -- Probe moving in -X direction
+        [3] = {axis = mc.Y_AXIS, dir = 1, name = "+Y"},   -- Probe moving in +Y direction
+        [4] = {axis = mc.Y_AXIS, dir = -1, name = "-Y"},  -- Probe moving in -Y direction
+        [5] = {axis = mc.Z_AXIS, dir = -1, name = "-Z"}   -- Probe moving in -Z direction
+    }
+    
+    local probeInfo = directions[math.floor(direction)]
+    local axisName = (probeInfo.axis == mc.X_AXIS and "X") or 
+                     (probeInfo.axis == mc.Y_AXIS and "Y") or "Z"
+    
+    -- Pound variable mapping for probe contact positions
+    local poundVarMap = {X = 5061, Y = 5062, Z = 5063}
+    
+    LOG("Probing " .. probeInfo.name)
+    
+    -- Read parameters from pound variables
+    local probeDiameter = mc.mcCntlGetPoundVar(inst, 300)
+    local xOffset = mc.mcCntlGetPoundVar(inst, 301)
+    local yOffset = mc.mcCntlGetPoundVar(inst, 302)
+    local fastFeed = mc.mcCntlGetPoundVar(inst, 303)
+    local slowFeed = mc.mcCntlGetPoundVar(inst, 304)
+    local maxTravel = mc.mcCntlGetPoundVar(inst, 305)
+    local backoff1 = mc.mcCntlGetPoundVar(inst, 306)
+    local backoff2 = mc.mcCntlGetPoundVar(inst, 307)
+    
+    -- Validate parameters with sensible defaults
+    if type(probeDiameter) ~= "number" or probeDiameter < 0 then 
+        probeDiameter = 0.125  -- Default 1/8" probe
+    end
+    if type(xOffset) ~= "number" then xOffset = 0 end
+    if type(yOffset) ~= "number" then yOffset = 0 end
+    if type(fastFeed) ~= "number" or fastFeed <= 0 then fastFeed = 20 end
+    if type(slowFeed) ~= "number" or slowFeed <= 0 then slowFeed = 3 end
+    if type(maxTravel) ~= "number" or maxTravel <= 0 then maxTravel = 1 end
+    if type(backoff1) ~= "number" or backoff1 < 0 then backoff1 = 0.1 end
+    if type(backoff2) ~= "number" or backoff2 < 0 then backoff2 = 0.1 end
+    
+    -- Safety check: Remove tool if present
+    local toolPresentHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)
+    if toolPresentHandle > 0 then
+        local toolPresent = mc.mcSignalGetState(toolPresentHandle)
+        if toolPresent == 1 then
+            LOG("Removing tool for probe operation")
+            mc.mcCntlGcodeExecuteWait(inst, "M6 T0")
+        end
+    end
+    
+    -- Safety check: Deploy probe if necessary
+    local probeDownHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7)
+    if probeDownHandle > 0 then
+        local probeDeployed = mc.mcSignalGetState(probeDownHandle)
+        if probeDeployed == 0 then
+            LOG("Deploying probe")
+            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z0")  -- Move to safe Z
+            mc.mcSignalSetState(probeDownHandle, 1)       -- Deploy probe
+            mc.mcCntlGcodeExecuteWait(inst, "G4 P0.5")    -- Wait for deployment
+        end
+    end
+    
+    -- Get starting position in work coordinates
+    local startPos = mc.mcAxisGetPos(inst, probeInfo.axis)
+    
+    -- Ensure absolute positioning and feed per minute mode
+    mc.mcCntlGcodeExecuteWait(inst, "G90 G94")
+    
+    -- FIRST PROBE: Fast approach
+    local fastTarget = startPos + (maxTravel * probeInfo.dir)
+    local probeCmd = string.format("G31.1 %s%.4f F%.1f", 
+                                   axisName, fastTarget, fastFeed)
+    mc.mcCntlGcodeExecuteWait(inst, probeCmd)
+    
+    -- Get first contact position
+    local contact1 = mc.mcCntlGetPoundVar(inst, poundVarMap[axisName])
+    
+    -- Verify probe made contact (didn't reach full travel)
+    local currentPos = mc.mcAxisGetPos(inst, probeInfo.axis)
+    if math.abs(currentPos - fastTarget) < 0.001 then
+        LOG("ERROR: No probe contact within travel distance")
+        return
+    end
+    
+    -- SECOND PROBE: Slow approach (if backoff1 > 0)
+    local finalContact = contact1
+    if backoff1 > 0 then
+        -- Back off from first contact
+        local backPos = contact1 - (backoff1 * probeInfo.dir)
+        mc.mcCntlGcodeExecuteWait(inst, string.format("G0 %s%.4f", axisName, backPos))
+        
+        -- Slow probe toward contact point
+        local slowTarget = contact1 + ((backoff1 * 2) * probeInfo.dir)
+        probeCmd = string.format("G31.1 %s%.4f F%.1f", 
+                                axisName, slowTarget, slowFeed)
+        mc.mcCntlGcodeExecuteWait(inst, probeCmd)
+        
+        -- Get final precise contact position
+        finalContact = mc.mcCntlGetPoundVar(inst, poundVarMap[axisName])
+    else
+        LOG("Single-tap probe mode (backoff1 = 0)")
+    end
+    
+    -- Get machine coordinate of final position
+    local machinePos = mc.mcAxisGetMachinePos(inst, probeInfo.axis)
+    
+    -- CALCULATE EDGE POSITION WITH PROBE RADIUS COMPENSATION
+    local edgePosition = finalContact
+    
+    -- Apply probe radius compensation for X and Y axes
+    -- For BOSS probing (probe moving INWARD toward center):
+    -- - When probing from +X side (moving -X, dir = -1): edge = contact - radius
+    -- - When probing from -X side (moving +X, dir = 1): edge = contact + radius
+    -- The formula: edge = contact + (radius * dir) achieves this correctly
+    
+    if axisName == "X" or axisName == "Y" then
+        local probeRadius = probeDiameter / 2.0
+        -- CORRECTED FORMULA: Add (not subtract) radius * direction
+        edgePosition = finalContact + (probeRadius * probeInfo.dir)
+        
+        LOG(string.format("%s probe: contact=%.4f, radius=%.4f, dir=%d, edge=%.4f",
+                          axisName, finalContact, probeRadius, probeInfo.dir, edgePosition))
+    end
+    -- Note: Z axis typically doesn't need radius compensation for edge finding
+    
+    -- CALCULATE SPINDLE POSITION (compensate for probe offset from spindle)
+    local spindlePosition = edgePosition
+    if axisName == "X" then
+        -- X offset is from spindle TO probe, so subtract to get spindle position
+        spindlePosition = edgePosition - xOffset
+    elseif axisName == "Y" then
+        -- Y offset is from spindle TO probe, so subtract to get spindle position
+        spindlePosition = edgePosition - yOffset
+    end
+    -- Note: Z axis typically doesn't have spindle offset
+    
+    -- Store results in pound variables
+    mc.mcCntlSetPoundVar(inst, 389, machinePos)      -- Machine coordinate
+    mc.mcCntlSetPoundVar(inst, 390, finalContact)    -- Probe contact position
+    mc.mcCntlSetPoundVar(inst, 391, edgePosition)    -- Edge position (radius compensated)
+    mc.mcCntlSetPoundVar(inst, 392, spindlePosition) -- Spindle position (offset compensated)
+    
+    -- Final backoff if specified
+    if backoff2 > 0 then
+        local finalBackPos = finalContact - (backoff2 * probeInfo.dir)
+        mc.mcCntlGcodeExecuteWait(inst, string.format("G0 %s%.4f", axisName, finalBackPos))
+    else
+        LOG("No final backoff (backoff2 = 0)")
+    end
+    
+    -- Log completion with output variables
+    LOG(string.format("Complete: Contact=%.4f, Edge=%.4f (#389-392 updated)",
+                      finalContact, edgePosition))
+end
+
+-- Allow testing in editor
+if mc.mcInEditor() == 1 then
+    m311()
+end

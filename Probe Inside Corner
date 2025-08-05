@@ -1,0 +1,413 @@
+-- Inside Corner Probe - M311 Implementation
+
+-- Required Pound Variables:
+-- #301 = X offset from spindle center to probe tip
+-- #302 = Y offset from spindle center to probe tip  
+-- #305 = Maximum probe travel distance
+-- #391 = M311 output: Edge position (adjusted for probe radius)
+
+-- Required Macro:
+-- m311.mcs must exist in your profile's Macros folder
+
+local inst = mc.mcGetInstance()
+if not inst then 
+    return 
+end
+
+-- Helper function to safely read profile integers using string functions
+local function ProfileGetInt(section, key, default)
+    local strValue = mc.mcProfileGetString(inst, section, key, tostring(default))
+    return tonumber(strValue) or default
+end
+
+-- Helper function to safely write profile integers using string functions
+local function ProfileSetInt(section, key, value)
+    return mc.mcProfileWriteString(inst, section, key, tostring(value))
+end
+
+-- Load saved settings using string functions
+local lastCorner = ProfileGetInt("InsideCornerProbe", "CornerSelection", 1)
+local lastAction = ProfileGetInt("InsideCornerProbe", "ActionMode", 1)
+local lastOffset = ProfileGetInt("InsideCornerProbe", "OffsetMode", 1)
+
+-- Determine parent window
+local parent = wx.NULL
+local app = wx.wxGetApp()
+if app then
+    local ok, top = pcall(function() return app:GetTopWindow() end)
+    if ok and top then parent = top end
+end
+
+-- Dialog dimensions - compact
+local dlgW, dlgH = 320, 260
+local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
+local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
+local posX = math.floor((sw - dlgW) / 2)
+local posY = math.floor((sh - dlgH) / 2)
+
+-- Create main dialog
+local dlg = wx.wxDialog(parent, wx.wxID_ANY,
+    "Inside Corner Probe",
+    wx.wxPoint(posX, posY), wx.wxSize(dlgW, dlgH),
+    wx.wxDEFAULT_DIALOG_STYLE)
+
+-- Main panel
+local panel = wx.wxPanel(dlg, wx.wxID_ANY)
+local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+
+-- Corner selection in 2x2 grid
+local cornerChoices = {
+    "X- Y+",  -- Top Left
+    "X+ Y+",  -- Top Right
+    "X- Y-",  -- Bottom Left  
+    "X+ Y-"   -- Bottom Right
+}
+
+local cornerBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Corner Type")
+local cornerCenterSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+cornerCenterSizer:AddStretchSpacer()
+
+local cornerRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
+    "", wx.wxDefaultPosition, wx.wxDefaultSize,
+    cornerChoices, 2, wx.wxRA_SPECIFY_COLS)
+cornerRadio:SetSelection(lastCorner - 1)  -- 0-based index
+
+cornerCenterSizer:Add(cornerRadio, 0, wx.wxALL, 5)
+cornerCenterSizer:AddStretchSpacer()
+cornerBox:Add(cornerCenterSizer, 0, wx.wxEXPAND, 0)
+mainSizer:Add(cornerBox, 0, wx.wxALL + wx.wxEXPAND, 10)
+
+-- Combined Options Section - more compact
+local optionsBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Probe Options")
+
+-- Create a grid sizer for compact layout
+local optionsGrid = wx.wxFlexGridSizer(2, 1, 2, 5)  -- 2 rows, 1 col, minimal spacing
+
+-- Datum position (using wxRadioBox for reliability)
+local datumChoices = {"Probe Position", "Spindle Center"}
+local datumRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
+    "Datum Position", wx.wxDefaultPosition, wx.wxDefaultSize,
+    datumChoices, 2, wx.wxRA_SPECIFY_COLS)
+datumRadio:SetSelection(lastOffset - 1)  -- 0-based index
+optionsGrid:Add(datumRadio, 0, wx.wxEXPAND, 0)
+
+-- Action (using wxRadioBox for reliability)
+local actionChoices = {"Set Datum", "Print Coords"}
+local actionRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
+    "Action", wx.wxDefaultPosition, wx.wxDefaultSize,
+    actionChoices, 2, wx.wxRA_SPECIFY_COLS)
+actionRadio:SetSelection(lastAction - 1)  -- 0-based index
+optionsGrid:Add(actionRadio, 0, wx.wxEXPAND + wx.wxTOP, 5)
+
+optionsBox:Add(optionsGrid, 0, wx.wxEXPAND + wx.wxALL, 5)
+mainSizer:Add(optionsBox, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM + wx.wxEXPAND, 10)
+
+-- Spacer before buttons
+mainSizer:AddStretchSpacer()
+
+-- Create standard button sizer
+local buttonSizer = wx.wxStdDialogButtonSizer()
+local okBtn = wx.wxButton(panel, wx.wxID_OK, "OK")
+local cancelBtn = wx.wxButton(panel, wx.wxID_CANCEL, "Cancel")
+
+okBtn:SetMinSize(wx.wxSize(90, 28))
+cancelBtn:SetMinSize(wx.wxSize(90, 28))
+
+buttonSizer:AddButton(okBtn)
+buttonSizer:AddButton(cancelBtn)
+buttonSizer:Realize()
+
+mainSizer:Add(buttonSizer, 0, wx.wxALL + wx.wxALIGN_CENTER, 8)
+
+-- Apply layout
+panel:SetSizer(mainSizer)
+mainSizer:Fit(panel)
+dlg:Fit()
+dlg:Centre()
+
+-- Show dialog and handle result
+if dlg:ShowModal() == wx.wxID_OK then
+    -- Get selections using proven GetSelection() method (returns 0-based index)
+    local cornerSel = cornerRadio:GetSelection() + 1  -- Convert to 1-based
+    local offsetSel = datumRadio:GetSelection() + 1
+    local actionSel = actionRadio:GetSelection() + 1
+    
+    -- Save settings using string functions since SetInt doesn't exist
+    ProfileSetInt("InsideCornerProbe", "CornerSelection", cornerSel)
+    ProfileSetInt("InsideCornerProbe", "OffsetMode", offsetSel)
+    ProfileSetInt("InsideCornerProbe", "ActionMode", actionSel)
+    
+    dlg:Destroy()
+    
+    -- Check if M311 macro exists (safely, without executing it)
+    local profileName = mc.mcProfileGetName(inst) or "Mach4Mill"
+    local macroPath = wx.wxGetCwd() .. "\\Profiles\\" .. profileName .. "\\Macros\\m311.mcs"
+    
+    if not wx.wxFileName.FileExists(macroPath) then
+        mc.mcCntlSetLastError(inst, "ERROR: M311 macro not found at: " .. macroPath)
+        wx.wxMessageBox("M311 macro not found!\n\nPlease ensure m311.mcs exists in:\n" .. macroPath, 
+                       "Probe Error", wx.wxOK + wx.wxICON_ERROR)
+        return
+    end
+    
+    -- Execute probing sequence using M311
+    local function ExecuteCornerProbe()
+        -- Get probe parameters from pound variables
+        local xProbeOffset = mc.mcCntlGetPoundVar(inst, 301)
+        local yProbeOffset = mc.mcCntlGetPoundVar(inst, 302)
+        local maxTravel = mc.mcCntlGetPoundVar(inst, 305)
+        
+        -- Validate and set defaults
+        if type(xProbeOffset) ~= "number" then xProbeOffset = 0 end
+        if type(yProbeOffset) ~= "number" then yProbeOffset = 0 end
+        if type(maxTravel) ~= "number" or maxTravel <= 0 then maxTravel = 1.0 end
+        
+        mc.mcCntlSetLastError(inst, string.format("Probe offsets: X=%.4f Y=%.4f", 
+                                                  xProbeOffset, yProbeOffset))
+        
+        -- Determine probe directions based on corner selection
+        local xDirection, yDirection
+        
+        if cornerSel == 1 then      -- X- Y+ (Top Left)
+            xDirection = 2  -- S2 M311 (Probe -X)
+            yDirection = 3  -- S3 M311 (Probe +Y)
+        elseif cornerSel == 2 then  -- X+ Y+ (Top Right)
+            xDirection = 1  -- S1 M311 (Probe +X)
+            yDirection = 3  -- S3 M311 (Probe +Y)
+        elseif cornerSel == 3 then  -- X- Y- (Bottom Left)
+            xDirection = 2  -- S2 M311 (Probe -X)
+            yDirection = 4  -- S4 M311 (Probe -Y)
+        else                        -- X+ Y- (Bottom Right)
+            xDirection = 1  -- S1 M311 (Probe +X)
+            yDirection = 4  -- S4 M311 (Probe -Y)
+        end
+        
+        mc.mcCntlSetLastError(inst, "Starting inside corner probe sequence...")
+        
+        -- Get starting position for reference
+        local startX = mc.mcAxisGetPos(inst, mc.X_AXIS)
+        local startY = mc.mcAxisGetPos(inst, mc.Y_AXIS)
+        local startZ = mc.mcAxisGetPos(inst, mc.Z_AXIS)
+        
+        -- Get starting machine position for calculations
+        local startMachX = mc.mcAxisGetMachinePos(inst, mc.X_AXIS)
+        local startMachY = mc.mcAxisGetMachinePos(inst, mc.Y_AXIS)
+        
+        mc.mcCntlSetLastError(inst, string.format("Start position: X%.4f Y%.4f", startX, startY))
+        
+        -- PROBE X DIRECTION FIRST
+        mc.mcCntlSetLastError(inst, "Probing X direction...")
+        local xProbeCmd = string.format("S%d M311", xDirection)
+        local rc = mc.mcCntlGcodeExecuteWait(inst, xProbeCmd)
+        
+        if rc ~= mc.MERROR_NOERROR then
+            mc.mcCntlSetLastError(inst, "ERROR: X direction probe failed with code: " .. tostring(rc))
+            return false
+        end
+        
+        -- Get X edge position from M311 output variable #391
+        local xEdge = mc.mcCntlGetPoundVar(inst, 391)
+        if type(xEdge) ~= "number" or xEdge < -1e300 then
+            mc.mcCntlSetLastError(inst, "ERROR: X probe contact not detected (#391 not set)")
+            return false
+        end
+        
+        mc.mcCntlSetLastError(inst, string.format("X edge found at: %.4f", xEdge))
+        
+        -- Validate probe actually moved (not just hit travel limit)
+        local xMovement = math.abs(xEdge - startX)
+        if xMovement < 0.001 then
+            mc.mcCntlSetLastError(inst, "ERROR: X probe did not move - check probe connection")
+            return false
+        elseif xMovement >= (maxTravel - 0.001) then
+            mc.mcCntlSetLastError(inst, "WARNING: X probe may have hit travel limit")
+        end
+        
+        -- Store X machine position when probe touched
+        local xEdgeMachinePos = mc.mcAxisGetMachinePos(inst, mc.X_AXIS)
+        
+        -- RETURN TO START POSITION
+        mc.mcCntlSetLastError(inst, "Returning to start position...")
+        mc.mcCntlGcodeExecuteWait(inst, string.format("G0 X%.4f Y%.4f", startX, startY))
+        
+        -- PROBE Y DIRECTION
+        mc.mcCntlSetLastError(inst, "Probing Y direction...")
+        local yProbeCmd = string.format("S%d M311", yDirection)
+        rc = mc.mcCntlGcodeExecuteWait(inst, yProbeCmd)
+        
+        if rc ~= mc.MERROR_NOERROR then
+            mc.mcCntlSetLastError(inst, "ERROR: Y direction probe failed with code: " .. tostring(rc))
+            return false
+        end
+        
+        -- Get Y edge position from M311 output variable #391
+        local yEdge = mc.mcCntlGetPoundVar(inst, 391)
+        if type(yEdge) ~= "number" or yEdge < -1e300 then
+            mc.mcCntlSetLastError(inst, "ERROR: Y probe contact not detected (#391 not set)")
+            return false
+        end
+        
+        mc.mcCntlSetLastError(inst, string.format("Y edge found at: %.4f", yEdge))
+        
+        -- Validate probe actually moved
+        local currentY = mc.mcAxisGetPos(inst, mc.Y_AXIS)
+        local yMovement = math.abs(yEdge - startY)
+        if yMovement < 0.001 then
+            mc.mcCntlSetLastError(inst, "ERROR: Y probe did not move - check probe connection")
+            return false
+        elseif yMovement >= (maxTravel - 0.001) then
+            mc.mcCntlSetLastError(inst, "WARNING: Y probe may have hit travel limit")
+        end
+        
+        -- Store Y machine position when probe touched
+        local yEdgeMachinePos = mc.mcAxisGetMachinePos(inst, mc.Y_AXIS)
+        
+        -- RETURN TO ORIGINAL START POSITION
+        mc.mcCntlSetLastError(inst, "Returning to original start position...")
+        mc.mcCntlGcodeExecuteWait(inst, string.format("G0 X%.4f Y%.4f", startX, startY))
+        
+        -- Calculate corner position in work coordinates
+        local cornerX = xEdge
+        local cornerY = yEdge
+        mc.mcCntlSetLastError(inst, string.format("Raw edge positions: X%.4f Y%.4f", cornerX, cornerY))
+        
+        -- CORRECTED: Calculate machine coordinates of the corner
+        -- Use the actual machine positions when probe touched, not work coords + offset
+        local cornerMachX = xEdgeMachinePos
+        local cornerMachY = yEdgeMachinePos
+        
+        -- Apply spindle offset if selected
+        if offsetSel == 2 then  -- Spindle Center selected
+            -- The offset is FROM spindle center TO probe tip
+            -- So to get spindle center from probe position, we subtract the offset
+            -- This is CORRECT for edge finding
+            cornerMachX = cornerMachX - xProbeOffset
+            cornerMachY = cornerMachY - yProbeOffset
+            mc.mcCntlSetLastError(inst, string.format("Spindle Center mode: Applying offset X%.4f Y%.4f", 
+                                                     xProbeOffset, yProbeOffset))
+            mc.mcCntlSetLastError(inst, string.format("Corner machine position adjusted to spindle center: X%.4f Y%.4f", 
+                                                     cornerMachX, cornerMachY))
+        else
+            mc.mcCntlSetLastError(inst, "Probe Position mode: No offset applied")
+            mc.mcCntlSetLastError(inst, string.format("Corner machine position at probe: X%.4f Y%.4f", 
+                                                     cornerMachX, cornerMachY))
+        end
+        
+        -- Display results
+        local resultMsg = string.format("Corner found at work coords: X%.4f Y%.4f", cornerX, cornerY)
+        if offsetSel == 2 then
+            resultMsg = resultMsg .. " (adjusted for spindle center)"
+        else
+            resultMsg = resultMsg .. " (probe position)"
+        end
+        mc.mcCntlSetLastError(inst, resultMsg)
+        
+        if actionSel == 1 then -- Set Datum
+            -- Get current work offset
+            local modalOffset = mc.mcCntlGetPoundVar(inst, 4014)
+            local currentOffset = 54  -- Default G54
+            if type(modalOffset) == "number" and modalOffset >= 54 and modalOffset <= 59 then
+                currentOffset = math.floor(modalOffset + 0.5)
+            end
+            
+            -- CORRECTED Work offset variable mapping (verified by tests)
+            local workOffsetVars = {
+                [54] = {x = 5221, y = 5222, z = 5223},  -- G54 CORRECT
+                [55] = {x = 5241, y = 5242, z = 5243},  -- G55 CORRECT
+                [56] = {x = 5261, y = 5262, z = 5263},  -- G56 CORRECT
+                [57] = {x = 5281, y = 5282, z = 5283},  -- G57 CORRECT
+                [58] = {x = 5301, y = 5302, z = 5303},  -- G58 CORRECT
+                [59] = {x = 5321, y = 5322, z = 5323}   -- G59 CORRECT
+            }
+            
+            local offsets = workOffsetVars[currentOffset]
+            if offsets then
+                -- Set new work offset values
+                -- We want the corner position to become work coordinate 0,0
+                -- So the work offset should equal the machine position of the corner
+                mc.mcCntlSetPoundVar(inst, offsets.x, cornerMachX)
+                mc.mcCntlSetPoundVar(inst, offsets.y, cornerMachY)
+                
+                -- Keep the Z offset unchanged
+                local currentZOffset = mc.mcCntlGetPoundVar(inst, offsets.z)
+                mc.mcCntlSetPoundVar(inst, offsets.z, currentZOffset)
+                
+                -- Force work offset update by executing G10 L2
+                -- G10 L2 P[offset] X[value] Y[value] sets work offset
+                local offsetP = currentOffset - 53  -- G54=P1, G55=P2, etc.
+                local g10Command = string.format("G10 L2 P%d X%.4f Y%.4f", 
+                                               offsetP, cornerMachX, cornerMachY)
+                mc.mcCntlSetLastError(inst, "Executing: " .. g10Command)
+                mc.mcCntlGcodeExecuteWait(inst, g10Command)
+                
+                -- Now activate the work offset
+                local gcode = string.format("G%d", currentOffset)
+                mc.mcCntlGcodeExecuteWait(inst, gcode)
+                
+                local offsetName = "G" .. tostring(currentOffset)
+                mc.mcCntlSetLastError(inst, string.format("Work offset %s updated: Corner is now X0 Y0", offsetName))
+                
+                -- Wait for update
+                wx.wxMilliSleep(100)
+                
+                -- Verify the new position
+                local newWorkX = mc.mcAxisGetPos(inst, mc.X_AXIS)
+                local newWorkY = mc.mcAxisGetPos(inst, mc.Y_AXIS)
+                
+                mc.mcCntlSetLastError(inst, string.format("Current position is now: X%.4f Y%.4f", 
+                                                         newWorkX, newWorkY))
+                
+                -- Verify offset was stored
+                local verifyX = mc.mcCntlGetPoundVar(inst, offsets.x)
+                local verifyY = mc.mcCntlGetPoundVar(inst, offsets.y)
+                mc.mcCntlSetLastError(inst, string.format("%s offset stored as: X%.4f Y%.4f", 
+                                                         offsetName, verifyX, verifyY))
+            else
+                mc.mcCntlSetLastError(inst, "ERROR: Invalid work offset")
+            end
+        else
+            -- Print coordinates only
+            mc.mcCntlSetLastError(inst, "===== CORNER PROBE RESULTS =====")
+            mc.mcCntlSetLastError(inst, string.format("Corner work coordinates: X%.4f Y%.4f", cornerX, cornerY))
+            mc.mcCntlSetLastError(inst, string.format("Corner machine coordinates: X%.4f Y%.4f", 
+                                                     cornerMachX, cornerMachY))
+            
+            -- Calculate what the current position would be if corner was set to 0,0
+            local currentPosIfZeroed = {
+                x = startMachX - cornerMachX,
+                y = startMachY - cornerMachY
+            }
+            mc.mcCntlSetLastError(inst, string.format("Your position relative to corner: X%.4f Y%.4f", 
+                                                     currentPosIfZeroed.x, currentPosIfZeroed.y))
+            
+            -- Show which work offset would be affected
+            local offsetName = "G" .. tostring(currentOffset)
+            mc.mcCntlSetLastError(inst, string.format("Current work offset: %s", offsetName))
+            mc.mcCntlSetLastError(inst, "================================")
+        end
+        
+        return true
+    end
+    
+    -- Execute the probing sequence with proper error handling
+    local success, result = pcall(ExecuteCornerProbe)
+    
+    if not success then
+        -- Lua error occurred
+        mc.mcCntlSetLastError(inst, "ERROR: Lua error - " .. tostring(result))
+        wx.wxMessageBox("Lua error in probe sequence:\n" .. tostring(result), 
+                       "Probe Error", wx.wxOK + wx.wxICON_ERROR)
+    elseif result == false then
+        -- ExecuteCornerProbe returned false (probe failure)
+        -- Error message already set in status bar by ExecuteCornerProbe
+        wx.wxMessageBox("Probe sequence failed!\n\nCheck the status bar for details.", 
+                       "Probe Error", wx.wxOK + wx.wxICON_ERROR)
+    else
+        -- Success
+        mc.mcCntlSetLastError(inst, "Probe sequence completed successfully")
+    end
+    
+else
+    -- User cancelled
+    dlg:Destroy()
+end

@@ -1,0 +1,1646 @@
+pageId = 0
+screenId = 0
+testcount = 0
+machState = 0
+machStateOld = -1
+machEnabled = 0
+machWasEnabled = 0
+inst = mc.mcGetInstance()
+Tframe = nil --TouchFrame handle
+
+--mobdebug = require('mobdebug')
+--mobdebug.onexit = mobdebug.done
+--mobdebug.start() -- This line is to start the debug Process Comment out for no debuging
+
+---------------------------------------------------------------
+-- Signal Library
+---------------------------------------------------------------
+SigLib = {
+	
+[mc.OSIG_MACHINE_ENABLED] = function (state)
+    machEnabled = state;
+    ButtonEnable()
+    
+    -- Reset homing warning bypass based on machine state
+    if state == 0 then
+        -- Machine disabled - reset bypass immediately
+        if _G.HOMING_WARNING_IGNORED then
+            _G.HOMING_WARNING_IGNORED = false
+            local inst = mc.mcGetInstance()
+        --    mc.mcCntlSetLastError(inst, "Machine disabled - homing protection restored")
+        end
+        
+        -- Clear tool selection on disable
+        _G.selectedToolIndex = nil
+        
+    elseif state == 1 then
+        -- Machine enabled - refresh tool dropdown
+        if PopulateTools then
+            PopulateTools()
+        end
+        
+        -- CHECK H OFFSET STATE
+        local inst = mc.mcGetInstance()
+        local currentTool = mc.mcToolGetCurrent(inst)
+        local activeH = mc.mcCntlGetPoundVar(inst, 4120)
+        local compMode = mc.mcCntlGetPoundVar(inst, 4008)
+        
+        if currentTool > 0 and compMode == 43 and activeH ~= currentTool then
+      --      mc.mcCntlSetLastError(inst, string.format("WARNING: Machine enabled with T%d but H%.0f active!", currentTool, activeH))
+        end
+        
+        -- Check if we should show warning
+        local anyUnhomed = false
+        
+        for axis = 0, 5 do
+            local enabled = mc.mcAxisIsEnabled(inst, axis)
+            local homed = mc.mcAxisIsHomed(inst, axis)
+            if enabled == 1 and homed ~= 1 then
+                anyUnhomed = true
+                break
+            end
+        end
+        
+        -- Log status
+        if anyUnhomed then
+            mc.mcCntlSetLastError(inst, "Machine enabled - axes not homed, jog protection active")
+        end
+    end
+end,
+
+
+
+
+[mc.ISIG_INPUT1] = function (state) -- this is an example for a condition in the signal table.
+   -- if (state == 1) then   
+--        CycleStart()
+--    --else
+--        --mc.mcCntlFeedHold (0)
+--    end
+end,
+
+
+
+[mc.OSIG_JOG_CONT] = function (state)
+    if( state == 1) then 
+       scr.SetProperty('labJogMode', 'Label', 'Continuous');
+       scr.SetProperty('txtJogInc', 'Bg Color', '#C0C0C0');--Light Grey
+       scr.SetProperty('txtJogInc', 'Fg Color', '#808080');--Dark Grey
+    end
+end,
+
+[mc.OSIG_JOG_INC] = function (state)
+    if( state == 1) then
+        scr.SetProperty('labJogMode', 'Label', 'Incremental');
+        scr.SetProperty('txtJogInc', 'Bg Color', '#FFFFFF');--White    
+        scr.SetProperty('txtJogInc', 'Fg Color', '#000000');--Black
+   end
+end,
+
+[mc.OSIG_JOG_MPG] = function (state)
+    if( state == 1) then
+        scr.SetProperty('labJogMode', 'Label', '');
+        scr.SetProperty('txtJogInc', 'Bg Color', '#C0C0C0');--Light Grey
+        scr.SetProperty('txtJogInc', 'Fg Color', '#808080');--Dark Grey
+        --add the bits to grey jog buttons becasue buttons can't be MPGs
+    end
+end
+}
+
+---------------------------------------------------------------
+-- Message Library
+---------------------------------------------------------------
+-- More messages can be found in the Message Script section of the scripting manual
+--or by typing "mc.MSG_" scroll through the list to see if one of the messages fits your use case
+MsgLib = {
+	[mc.MSG_REG_CHANGED] = function (param1, param2)
+		-- param1 in this case is the handle of the register that has changed
+		-- For information on handles/registers please reference our scripting manual
+		--local value = mc.mcRegGetValue(param1)
+		--local info = mc.mcRegGetInfo(param1)
+	end
+}
+---------------------------------------------------------------
+-- Keyboard Inputs Toggle() function. Updated to handle multiple buttons
+---------------------------------------------------------------
+function KeyboardInputsToggle()
+    local iReg = mc.mcIoGetHandle (inst, "Keyboard/Enable")
+    local iReg2 = mc.mcIoGetHandle (inst, "Keyboard/EnableKeyboardJog")
+    
+    if (iReg ~= nil) and (iReg2 ~= nil) then
+        local val = mc.mcIoGetState(iReg);
+        if (val == 1) then
+            mc.mcIoSetState(iReg, 0);
+            mc.mcIoSetState(iReg2, 0);
+            
+            -- Update all keyboard jog buttons
+            scr.SetProperty('btnKeyboardJog', 'Bg Color', '');
+            scr.SetProperty('btnKeyboardJog', 'Label', 'Keyboard\nInputs Enable');
+            
+            -- Handle duplicate button if it exists
+            if scr.GetProperty('btnKeyboardJog_1', 'Bg Color') ~= nil then
+                scr.SetProperty('btnKeyboardJog_1', 'Bg Color', '');
+                scr.SetProperty('btnKeyboardJog_1', 'Label', 'Keyboard\nInputs Enable');
+            end
+        else
+            mc.mcIoSetState(iReg, 1);
+            mc.mcIoSetState(iReg2, 1);
+            
+            -- Update all keyboard jog buttons
+            scr.SetProperty('btnKeyboardJog', 'Bg Color', '#00FF00');
+            scr.SetProperty('btnKeyboardJog', 'Label', 'Keyboard\nInputs Disable');
+            
+            -- Handle duplicate button if it exists
+            if scr.GetProperty('btnKeyboardJog_1', 'Bg Color') ~= nil then
+                scr.SetProperty('btnKeyboardJog_1', 'Bg Color', '#00FF00');
+                scr.SetProperty('btnKeyboardJog_1', 'Label', 'Keyboard\nInputs Disable');
+            end
+        end
+    end
+end
+---------------------------------------------------------------
+-- Remember Position function.
+---------------------------------------------------------------
+function RememberPosition()
+    local pos = mc.mcAxisGetMachinePos(inst, 0) -- Get current X (0) Machine Coordinates
+    mc.mcProfileWriteString(inst, "RememberPos", "X", string.format (pos)) --Create a register and write the machine coordinates to it
+    local pos = mc.mcAxisGetMachinePos(inst, 1) -- Get current Y (1) Machine Coordinates
+    mc.mcProfileWriteString(inst, "RememberPos", "Y", string.format (pos)) --Create a register and write the machine coordinates to it
+    local pos = mc.mcAxisGetMachinePos(inst, 2) -- Get current Z (2) Machine Coordinates
+    mc.mcProfileWriteString(inst, "RememberPos", "Z", string.format (pos)) --Create a register and write the machine coordinates to it
+end
+---------------------------------------------------------------
+-- Return to Position function.
+---------------------------------------------------------------
+function ReturnToPosition()
+    local xval = mc.mcProfileGetString(inst, "RememberPos", "X", "NotFound") -- Get the register Value
+    local yval = mc.mcProfileGetString(inst, "RememberPos", "Y", "NotFound") -- Get the register Value
+    local zval = mc.mcProfileGetString(inst, "RememberPos", "Z", "NotFound") -- Get the register Value
+    
+    if(xval == "NotFound")then -- check to see if the register is found
+        wx.wxMessageBox('Register xval does not exist.\nYou must remember a postion before you can return to it.'); -- If the register does not exist tell us in a message box
+    elseif (yval == "NotFound")then -- check to see if the register is found
+        wx.wxMessageBox('Register yval does not exist.\nYou must remember a postion before you can return to it.'); -- If the register does not exist tell us in a message box
+    elseif (zval == "NotFound")then -- check to see if the register is found
+        wx.wxMessageBox('Register zval does not exist.\nYou must remember a postion before you can return to it.'); -- If the register does not exist tell us in a message box
+    else
+        mc.mcCntlMdiExecute(inst, "G00 G53 Z0.0000 \n G00 G53 X" .. xval .. "\n G00 G53 Y" .. yval .. "\n G00 G53 Z" .. zval)
+    end
+end
+---------------------------------------------------------------
+-- Spin CW function.
+---------------------------------------------------------------
+function SpinCW()
+    local sigh = mc.mcSignalGetHandle(inst, mc.OSIG_SPINDLEON);
+    local sigState = mc.mcSignalGetState(sigh);
+    
+    if (sigState == 1) then 
+        mc.mcSpindleSetDirection(inst, 0);
+    else 
+        mc.mcSpindleSetDirection(inst, 1);
+    end
+end
+---------------------------------------------------------------
+-- Spin CCW function.
+---------------------------------------------------------------
+function SpinCCW()
+    local sigh = mc.mcSignalGetHandle(inst, mc.OSIG_SPINDLEON);
+    local sigState = mc.mcSignalGetState(sigh);
+    
+    if (sigState == 1) then 
+        mc.mcSpindleSetDirection(inst, 0);
+    else 
+        mc.mcSpindleSetDirection(inst, -1);
+    end
+end
+---------------------------------------------------------------
+-- Open Docs function.
+---------------------------------------------------------------
+function OpenDocs()
+    local major, minor = wx.wxGetOsVersion()
+    local dir = mc.mcCntlGetMachDir(inst);
+    local cmd = "explorer.exe /open," .. dir .. "\\Docs\\"
+    if(minor <= 5) then -- Xp we don't need the /open
+        cmd = "explorer.exe ," .. dir .. "\\Docs\\"
+    end
+	os.execute(cmd)
+    scr.RefreshScreen(250); -- Windows 7 and 8 seem to require the screen to be refreshed.  
+end
+---------------------------------------------------------------
+-- Cycle Stop function.
+---------------------------------------------------------------
+function CycleStop()
+mc.mcCntlCycleStop(inst);
+mc.mcSpindleSetDirection(inst, 0);
+mc.mcCntlSetLastError(inst, "Cycle Stopped");
+	if(wait ~= nil) then
+		wait = nil;
+	end
+end
+---------------------------------------------------------------
+-- Button Jog Mode Toggle() function.
+---------------------------------------------------------------
+function ButtonJogModeToggle()
+    local cont = mc.mcSignalGetHandle(inst, mc.OSIG_JOG_CONT);
+    local jogcont = mc.mcSignalGetState(cont)
+    local inc = mc.mcSignalGetHandle(inst, mc.OSIG_JOG_INC);
+    local joginc = mc.mcSignalGetState(inc)
+    local mpg = mc.mcSignalGetHandle(inst, mc.OSIG_JOG_MPG);
+    local jogmpg = mc.mcSignalGetState(mpg)
+    
+    if (jogcont == 1) then
+        mc.mcSignalSetState(cont, 0)
+        mc.mcSignalSetState(inc, 1)
+        mc.mcSignalSetState(mpg, 0)        
+    else
+        mc.mcSignalSetState(cont, 1)
+        mc.mcSignalSetState(inc, 0)
+        mc.mcSignalSetState(mpg, 0)
+    end
+
+end
+---------------------------------------------------------------
+-- Ref All Home() function.
+---------------------------------------------------------------
+function RefAllHome()
+    mc.mcAxisDerefAll(inst)  --Just to turn off all ref leds
+    mc.mcAxisHomeAll(inst)
+    coroutine.yield() --yield coroutine so we can do the following after motion stops
+    ----See ref all home button and plc script for coroutine.create and coroutine.resume
+    wx.wxMessageBox('Referencing is complete')
+end
+---------------------------------------------------------------
+-- Go To Work Zero() function.
+---------------------------------------------------------------
+function GoToWorkZero()
+    mc.mcCntlMdiExecute(inst, "G00 X0 Y0")--Without Z moves
+    --mc.mcCntlMdiExecute(inst, "G00 G53 Z0\nG00 X0 Y0 A0\nG00 Z0")--With Z moves
+end
+---------------------------------------------------------------
+-- Cycle Start() function.
+---------------------------------------------------------------
+function CycleStart()	
+	
+	if not CheckHomingBeforeMove() then
+        return
+    end
+	
+	local rc
+    local tab, rc = scr.GetProperty("MainTabs", "Current Tab")
+    local tabG_Mdione, rc = scr.GetProperty("nbGCodeMDI1", "Current Tab")
+	local tabG_Mditwo, rc = scr.GetProperty("nbGCodeMDI2", "Current Tab")
+	local state = mc.mcCntlGetState(inst)
+	--mc.mcCntlSetLastError(inst,"tab == " .. tostring(tab))
+	
+	if (state == mc.MC_STATE_MRUN_MACROH) then 
+		mc.mcCntlCycleStart(inst)
+	elseif ((tonumber(tab) == 0 and tonumber(tabG_Mdione) == 1)) then  
+		scr.ExecMdi('mdi1')
+	elseif ((tonumber(tab) == 5 and tonumber(tabG_Mditwo) == 1)) then  
+		scr.ExecMdi('mdi2')
+	else
+		mc.mcCntlCycleStart(inst)    
+	end
+end
+-------------------------------------------------------
+--  Seconds to time Added 5-9-16
+-------------------------------------------------------
+--Converts decimal seconds to an HH:MM:SS.xx format
+function SecondsToTime(seconds)
+	if seconds == 0 then
+		return "00:00:00.00"
+	else
+		local hours = string.format("%02.f", math.floor(seconds/3600))
+		local mins = string.format("%02.f", math.floor((seconds/60) - (hours*60)))
+		local secs = string.format("%04.2f",(seconds - (hours*3600) - (mins*60)))
+		return hours .. ":" .. mins .. ":" .. secs
+	end
+end
+---------------------------------------------------------------
+-- Set Button Jog Mode to Cont.
+---------------------------------------------------------------
+local cont = mc.mcSignalGetHandle(inst, mc.OSIG_JOG_CONT);
+local jogcont = mc.mcSignalGetState(cont)
+mc.mcSignalSetState(cont, 1)
+-------------------------------------------------------
+--  Decimal to Fractions
+-------------------------------------------------------
+function DecToFrac(axis)
+	--Determine position to get and labels to set.
+    local work = mc.mcAxisGetPos(inst, axis)
+	local lab = string.format("lblFrac" .. tostring(axis))
+	local labNum = string.format("lblFracNum" .. tostring(axis))
+	local labDen = string.format("lblFracDen" .. tostring(axis))
+    local sign = (" ")		--Use a blank space so we do not get any errors.
+	
+    if work < 0 then	--Change the sign to -
+		sign = ("-")
+	end
+	
+	work = math.abs (work)
+	local remainder = math.fmod(work, .0625)
+
+	if remainder >= .03125 then 	--Round up to the closest 1/16
+		work = work + remainder
+	else							--Round down to the closest 1/16
+		work = work - remainder
+	end
+
+	local inches = math.floor(work / 1.000)
+	local iremainder = work % 1.000
+	local halves = math.floor(iremainder / .5000)
+	local remainder = iremainder % .5000
+	local quarters = math.floor(remainder / .2500)
+	local remainder = remainder % .2500
+	local eights = math.floor(remainder / .1250)
+	local remainder = remainder % .1250
+	local sixteens = math.floor(remainder / .0625)
+
+	numar = 0	--Default to 0. The next if statement will change it if needed.
+	denom = 0	--Default to 0. The next if statement will change it if needed.
+
+	if sixteens > 0 then
+		numar = math.floor(iremainder / .0625)
+		denom = 16
+	elseif eights > 0 then
+		numar = math.floor(iremainder / .1250)
+		denom = 8
+	elseif quarters > 0 then
+		numar = math.floor(iremainder / .2500)
+		denom = 4
+	elseif halves > 0 then
+		numar = math.floor(iremainder / .5000)
+		denom = 2
+	end
+	
+    scr.SetProperty((lab), 'Label', (sign) .. tostring(inches))
+	scr.SetProperty((labNum), 'Label', tostring(numar))
+	scr.SetProperty((labDen), 'Label', "/" .. tostring(denom))
+end
+---------------------------------------------------------------
+--Timer panel example
+---------------------------------------------------------------
+TimerPanel = wx.wxPanel (wx.NULL, wx.wxID_ANY, wx.wxDefaultPosition, wx.wxSize( 0,0 ) )
+timer = wx.wxTimer(TimerPanel)
+TimerPanel:Connect(wx.wxEVT_TIMER,
+function (event)
+    wx.wxMessageBox("Hello")
+    timer:Stop()
+end)
+---------------------------------------------------------------
+-- Load modules
+---------------------------------------------------------------
+--Master module
+package.loaded.mcRegister = nil
+mm = require "mcRegister"
+
+--ErrorCheck module Added 11-4-16
+package.loaded.mcErrorCheck = nil
+mcErrorCheck = require "mcErrorCheck"
+
+--Trace module
+package.loaded.mcTrace = nil
+mcTrace = require "mcTrace"
+
+---------------------------------------------------------------
+-- Get fixtue offset pound variables function Updated 5-16-16
+---------------------------------------------------------------
+function GetFixOffsetVars()
+    local FixOffset = mc.mcCntlGetPoundVar(inst, mc.SV_MOD_GROUP_14)
+    local Pval = mc.mcCntlGetPoundVar(inst, mc.SV_BUFP)
+    local FixNum, whole, frac
+
+    if (FixOffset ~= 54.1) then --G54 through G59
+        whole, frac = math.modf (FixOffset)
+        FixNum = (whole - 53) 
+        PoundVarX = ((mc.SV_FIXTURES_START - mc.SV_FIXTURES_INC) + (FixNum * mc.SV_FIXTURES_INC))
+        CurrentFixture = string.format('G' .. tostring(FixOffset)) 
+    else --G54.1 P1 through G54.1 P100
+        FixNum = (Pval + 6)
+        CurrentFixture = string.format('G54.1 P' .. tostring(Pval))
+        if (Pval > 0) and (Pval < 51) then -- G54.1 P1 through G54.1 P50
+            PoundVarX = ((mc.SV_FIXTURE_EXPAND - mc.SV_FIXTURES_INC) + (Pval * mc.SV_FIXTURES_INC))
+        elseif (Pval > 50) and (Pval < 101) then -- G54.1 P51 through G54.1 P100
+            PoundVarX = ((mc.SV_FIXTURE_EXPAND2 - mc.SV_FIXTURES_INC) + (Pval * mc.SV_FIXTURES_INC))	
+        end
+    end
+PoundVarY = (PoundVarX + 1)
+PoundVarZ = (PoundVarX + 2)
+return PoundVarX, PoundVarY, PoundVarZ, FixNum, CurrentFixture
+-------------------------------------------------------------------------------------------------------------------
+--return information from the fixture offset function
+-------------------------------------------------------------------------------------------------------------------
+--PoundVar(Axis) returns the pound variable for the current fixture for that axis (not the pound variables value).
+--CurretnFixture returned as a string (examples G54, G59, G54.1 P12).
+--FixNum returns a simple number (1-106) for current fixture (examples G54 = 1, G59 = 6, G54.1 P1 = 7, etc).
+-------------------------------------------------------------------------------------------------------------------
+end
+---------------------------------------------------------------
+-- Button Enable function Updated 11-8-2015
+---------------------------------------------------------------
+function ButtonEnable() --This function enables or disables buttons associated with an axis if the axis is enabled or disabled.
+
+    AxisTable = {
+        [0] = 'X',
+        [1] = 'Y',
+        [2] = 'Z',
+        [3] = 'A',
+        [4] = 'B',
+        [5] = 'C'}
+        
+    for Num, Axis in pairs (AxisTable) do -- for each paired Num (key) and Axis (value) in the Axis table
+        local rc = mc.mcAxisIsEnabled(inst,(Num)) -- find out if the axis is enabled, returns a 1 or 0
+        scr.SetProperty((string.format ('btnPos' .. Axis)), 'Enabled', tostring(rc)); --Turn the jog positive button on or off
+        scr.SetProperty((string.format ('btnNeg' .. Axis)), 'Enabled', tostring(rc)); --Turn the jog negative button on or off
+        scr.SetProperty((string.format ('btnZero' .. Axis)), 'Enabled', tostring(rc)); --Turn the zero axis button on or off
+        scr.SetProperty((string.format ('btnRef' .. Axis)), 'Enabled', tostring(rc)); --Turn the reference button on or off
+    end
+    
+end
+ButtonEnable()
+
+
+
+
+
+
+-- Global table to map dropdown indices to tool numbers
+_G.toolNumbers = {}
+_G.selectedToolIndex = nil  -- Track user selection separately
+
+function PopulateTools()
+    local inst = mc.mcGetInstance()
+    local tools = {}  -- List of display strings
+    
+    -- Tool 0 always first
+    table.insert(tools, "0 - No Tool")
+    table.insert(_G.toolNumbers, 0)
+    
+    -- Check all tools 1-99, but only include those with descriptions
+    for toolNum = 1, 99 do
+        local desc = mc.mcToolGetDesc(inst, toolNum)
+        if desc and desc ~= "" then
+            table.insert(tools, toolNum .. " - " .. desc)
+            table.insert(_G.toolNumbers, toolNum)
+        end
+    end
+    
+    -- Store for dialog
+    _G.toolChoices = tools
+    
+    -- Set the ListBox strings
+    local toolList = table.concat(tools, "|")
+    scr.SetProperty("lstCurrentTool", "Strings", toolList)
+    
+    -- Get current tool
+    local currTool = mc.mcToolGetCurrent(inst)
+    local index = 0  -- Default to 0 (No Tool)
+    
+    for i, t in ipairs(_G.toolNumbers) do
+        if t == currTool then
+            index = i - 1  -- Convert to 0-based
+            break
+        end
+    end
+    
+    -- Set dropdown to current tool
+    scr.SetProperty("lstCurrentTool", "Value", tostring(index))
+    _G.selectedToolIndex = nil  -- No selection yet
+    
+    -- Update display
+    UpdateToolPreview()
+    
+  --  mc.mcCntlSetLastError(inst, "Tool system ready - " .. (#tools - 1) .. " tools available")
+end
+
+function UpdateToolPreview()
+    local inst = mc.mcGetInstance()
+    
+    -- Always show the current tool
+    local currTool = mc.mcToolGetCurrent(inst)
+    local displayText = "T0 - No Tool"
+    
+    if currTool == 0 then
+        displayText = "T0 - No Tool"
+    else
+        local desc = mc.mcToolGetDesc(inst, currTool) or "Unnamed"
+        displayText = "T" .. currTool .. " - " .. desc
+    end
+    
+    -- Update preview label
+    scr.SetProperty("lblToolPreview", "Label", displayText)
+end
+
+-- Call on load
+PopulateTools()
+
+-- Initialize for PLC - force T0 on startup with H offset sync
+local inst = mc.mcGetInstance()
+mc.mcToolSetCurrent(inst, 0)  -- Set to T0
+mc.mcCntlGcodeExecuteWait(inst, "G49")  -- CRITICAL: Cancel any stale H offset
+--mc.mcCntlSetLastError(inst, "Startup: T0 set, H offset cancelled")
+
+_G.hOffsetSyncPending = false
+_G.hOffsetLastSync = 0
+
+
+
+
+-- ===== SCREEN LOAD SCRIPT =====
+-- REPLACE the existing ShowHomingRequiredDialog function with this enhanced version
+function ShowHomingRequiredDialog()
+    local inst = mc.mcGetInstance()
+    
+    -- Check which axes need homing
+    local unhomedAxes = {}
+    for axis = 0, 5 do
+        local enabled = mc.mcAxisIsEnabled(inst, axis)
+        local homed = mc.mcAxisIsHomed(inst, axis)
+        
+        if enabled and enabled == 1 and (not homed or homed ~= 1) then
+            local axisName = ({"X","Y","Z","A","B","C"})[axis + 1]
+            table.insert(unhomedAxes, axisName)
+        end
+    end
+    
+    -- If all axes are homed, return true (allow movement)
+    if #unhomedAxes == 0 then
+        return true
+    end
+    
+    -- Loop to handle going back from confirmation
+    local continueDialog = true
+    local finalResult = false
+    
+    while continueDialog do
+        -- Get screen size for centering
+        local screenWidth = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X)
+        local screenHeight = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y)
+        local dialogWidth = 350
+        local dialogHeight = 200
+        local xPos = (screenWidth - dialogWidth) / 2
+        local yPos = (screenHeight - dialogHeight) / 2
+        
+        -- Create custom dialog
+        local dialog = wx.wxDialog(wx.NULL, wx.wxID_ANY, "Homing Required",
+                                  wx.wxPoint(xPos, yPos), wx.wxSize(dialogWidth, dialogHeight),
+                                  wx.wxDEFAULT_DIALOG_STYLE)
+        
+        -- Create panel
+        local panel = wx.wxPanel(dialog, wx.wxID_ANY)
+        
+        -- Create message
+        local message = "You must home the following axes\nbefore movement:\n\n" ..
+                       table.concat(unhomedAxes, ", ")
+        
+        local staticText = wx.wxStaticText(panel, wx.wxID_ANY, message,
+                                          wx.wxDefaultPosition, wx.wxDefaultSize,
+                                          wx.wxALIGN_CENTER)
+        
+        -- Make text larger
+        local font = staticText:GetFont()
+        font:SetPointSize(12)
+        staticText:SetFont(font)
+        
+        -- Create buttons with specific sizes
+        local btnIgnore = wx.wxButton(panel, wx.wxID_ANY, "Ignore Warning", 
+                                     wx.wxDefaultPosition, wx.wxSize(120, 35))
+        local btnHomeAll = wx.wxButton(panel, wx.wxID_ANY, "HOME ALL",
+                                       wx.wxDefaultPosition, wx.wxSize(120, 35))
+        
+        -- Style the HOME ALL button - GREEN
+        btnHomeAll:SetBackgroundColour(wx.wxColour(0, 255, 0))  -- Bright green
+        btnHomeAll:SetForegroundColour(wx.wxColour(0, 0, 0))    -- Black text
+        
+        -- Make HOME ALL button text bold
+        local homeFont = btnHomeAll:GetFont()
+        homeFont:SetWeight(wx.wxFONTWEIGHT_BOLD)
+        homeFont:SetPointSize(11)
+        btnHomeAll:SetFont(homeFont)
+        
+        -- Make Home All the default button (Enter key)
+        btnHomeAll:SetDefault()
+        
+        -- Layout
+        local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+        local buttonSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        
+        mainSizer:Add(staticText, 1, wx.wxEXPAND + wx.wxALL, 20)
+        
+        buttonSizer:Add(btnIgnore, 0, wx.wxALL, 5)
+        buttonSizer:Add(btnHomeAll, 0, wx.wxALL, 5)
+        
+        mainSizer:Add(buttonSizer, 0, wx.wxALIGN_CENTER + wx.wxBOTTOM, 15)
+        
+        panel:SetSizer(mainSizer)
+        mainSizer:Fit(dialog)
+        
+        -- Center dialog on screen
+        dialog:Centre()
+        
+        -- Button event handlers
+        local dialogResult = "cancel"  -- Default
+        
+        btnIgnore:Connect(wx.wxEVT_COMMAND_BUTTON_CLICKED,
+            function(event)
+                dialogResult = "ignore"
+                dialog:EndModal(wx.wxID_OK)
+            end)
+        
+        btnHomeAll:Connect(wx.wxEVT_COMMAND_BUTTON_CLICKED,
+            function(event)
+                dialogResult = "home"
+                dialog:EndModal(wx.wxID_OK)
+            end)
+        
+        -- Show dialog
+        dialog:ShowModal()
+        dialog:Destroy()
+        
+        -- Handle dialog result
+        if dialogResult == "home" then
+            -- User chose Home All
+            mc.mcCntlSetLastError(inst, "Homing all axes...")
+            -- Call the RefAllHome function that already exists in your screen script
+            RefAllHome()
+            finalResult = true
+            continueDialog = false
+        elseif dialogResult == "ignore" then
+            -- Show confirmation dialog
+            local confirmResult = ShowIgnoreConfirmDialog()
+            
+            if confirmResult == "continue" then
+                -- User confirmed ignore
+                mc.mcCntlSetLastError(inst, "WARNING: Movement allowed without homing!")
+                finalResult = true
+                continueDialog = false
+            else
+                -- User chose to go back - loop will continue
+                mc.mcCntlSetLastError(inst, "Returning to homing dialog...")
+            end
+        else
+            -- Dialog was closed with X or escaped
+            mc.mcCntlSetLastError(inst, "Movement cancelled - axes not homed")
+            finalResult = false
+            continueDialog = false
+        end
+    end
+    
+    return finalResult
+end
+
+
+
+
+
+-- ===== SCREEN LOAD SCRIPT =====
+-- REPLACE the existing CheckHomingBeforeMove function with this version
+-- (This function should already exist in your Screen Load Script)
+function CheckHomingBeforeMove()
+    local inst = mc.mcGetInstance()
+    
+    -- Quick check if any axis needs homing
+    for axis = 0, 5 do
+        local enabled = mc.mcAxisIsEnabled(inst, axis)
+        local homed = mc.mcAxisIsHomed(inst, axis)
+        
+        if enabled and enabled == 1 and (not homed or homed ~= 1) then
+            -- Show enhanced dialog and return result
+            return ShowHomingRequiredDialog()
+        end
+    end
+    
+    return true  -- All homed, allow movement
+end
+
+
+
+
+-- ===== HOMING SAFETY SYSTEM INITIALIZATION =====
+-- REPLACE the existing initialization section (around line 818-847)
+-- This goes at the END of your Screen Load Script
+do
+    local inst = mc.mcGetInstance()
+    
+    -- Check initial homing state
+    local allHomed = true
+    for axis = 0, 5 do
+        local enabled = mc.mcAxisIsEnabled(inst, axis)
+        local homed = mc.mcAxisIsHomed(inst, axis)
+        if enabled and enabled == 1 and (not homed or homed ~= 1) then
+            allHomed = false
+            break
+        end
+    end
+    
+    -- Set initial global state
+    _G.AXES_HOMED = allHomed
+    _G.lastHomingFlashState = nil
+    _G.lastHomedState = nil
+    _G.jogSafetyCounter = 0
+    _G.lastJogStopTime = 0
+    _G.HOMING_WARNING_IGNORED = false  -- NEW: Track if user ignored warning
+    
+    -- Stop any active jogs on startup
+    for axis = 0, 5 do
+        mc.mcJogVelocityStop(inst, axis)
+    end
+    
+    -- Set initial button appearance based on homing state
+    if allHomed then
+        _G.HOMING_WARNING_IGNORED = false  -- Reset bypass when homed
+        scr.SetProperty("btnRefAllAxes", "Bg Color", "#4B4B4B")  -- Dark gray
+        scr.SetProperty("btnRefAllAxes", "Fg Color", "#FFFFFF")  -- White text
+        scr.SetProperty("btnRefAllAxes", "Label", "Ref All\nAxis")
+     --   mc.mcCntlSetLastError(inst, "All axes homed - movement enabled")
+    else
+        scr.SetProperty("btnRefAllAxes", "Bg Color", "#4B4B4B")  -- Start with dark gray
+        scr.SetProperty("btnRefAllAxes", "Fg Color", "#000000")  -- Black text
+        scr.SetProperty("btnRefAllAxes", "Label", "HOME\nREQUIRED")
+        mc.mcCntlSetLastError(inst, "Axes not homed - movement disabled")
+    end
+end
+-- ===== END HOMING SAFETY SYSTEM INITIALIZATION =====
+
+
+
+
+function ShowIgnoreConfirmDialog()
+    local inst = mc.mcGetInstance()
+    
+    -- Get screen size for centering
+    local screenWidth = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X)
+    local screenHeight = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y)
+    local dialogWidth = 300
+    local dialogHeight = 150
+    local xPos = (screenWidth - dialogWidth) / 2
+    local yPos = (screenHeight - dialogHeight) / 2
+    
+    -- Create confirmation dialog
+    local dialog = wx.wxDialog(wx.NULL, wx.wxID_ANY, "Confirm Ignore Homing",
+                              wx.wxPoint(xPos, yPos), wx.wxSize(dialogWidth, dialogHeight),
+                              wx.wxDEFAULT_DIALOG_STYLE)
+    
+    -- Create panel
+    local panel = wx.wxPanel(dialog, wx.wxID_ANY)
+    
+    -- Create warning message
+    local message = "ARE YOU SURE?\n\nRunning without homing can cause\ncrashes and damage!"
+    
+    local staticText = wx.wxStaticText(panel, wx.wxID_ANY, message,
+                                      wx.wxDefaultPosition, wx.wxDefaultSize,
+                                      wx.wxALIGN_CENTER)
+    
+    -- Make text larger and bold
+    local font = staticText:GetFont()
+    font:SetPointSize(11)
+    font:SetWeight(wx.wxFONTWEIGHT_BOLD)
+    staticText:SetFont(font)
+    
+    -- Set text color to red for warning
+    staticText:SetForegroundColour(wx.wxColour(255, 0, 0))
+    
+    -- Create buttons
+    local btnGoBack = wx.wxButton(panel, wx.wxID_ANY, "Go Back", 
+                                 wx.wxDefaultPosition, wx.wxSize(100, 30))
+    local btnContinue = wx.wxButton(panel, wx.wxID_ANY, "Continue",
+                                    wx.wxDefaultPosition, wx.wxSize(100, 30))
+    
+    -- Make Go Back the default (safer option)
+    btnGoBack:SetDefault()
+    
+    -- Layout
+    local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    local buttonSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    
+    mainSizer:Add(staticText, 1, wx.wxEXPAND + wx.wxALL, 20)
+    
+    buttonSizer:Add(btnGoBack, 0, wx.wxALL, 5)
+    buttonSizer:Add(btnContinue, 0, wx.wxALL, 5)
+    
+    mainSizer:Add(buttonSizer, 0, wx.wxALIGN_CENTER + wx.wxBOTTOM, 10)
+    
+    panel:SetSizer(mainSizer)
+    mainSizer:Fit(dialog)
+    
+    -- Center dialog
+    dialog:Centre()
+    
+    -- Button event handlers
+    local result = "goback"  -- Default to go back
+    
+    btnGoBack:Connect(wx.wxEVT_COMMAND_BUTTON_CLICKED,
+        function(event)
+            result = "goback"
+            dialog:EndModal(wx.wxID_OK)
+        end)
+    
+    btnContinue:Connect(wx.wxEVT_COMMAND_BUTTON_CLICKED,
+        function(event)
+            result = "continue"
+            dialog:EndModal(wx.wxID_OK)
+        end)
+    
+    -- Show dialog
+    dialog:ShowModal()
+    dialog:Destroy()
+    
+    return result
+end
+
+
+
+
+
+
+-- Manual H set function
+function SetH(h)
+    local inst = mc.mcGetInstance()
+    if not h or h < 0 or h > 99 then
+     --   mc.mcCntlSetLastError(inst, "SetH: Invalid H value")
+        return
+    end
+    
+    local currentH = mc.mcCntlGetPoundVar(inst, 4120)
+    if currentH ~= h then
+        mc.mcCntlSetPoundVar(inst, 4120, h)
+        mc.mcCntlSetPoundVar(inst, 4008, 43)
+      --  mc.mcCntlSetLastError(inst, "H offset = " .. h)
+        
+        -- Clear sync tracking since manual override
+        _G.lastHSync.tool = -1
+        _G.lastHSync.h = h
+    end
+end
+
+
+
+
+--mc.mcCntlSetLastError(mc.mcGetInstance(), "Screen Load complete - UpdateToolPreview exists: " .. tostring(UpdateToolPreview ~= nil))
+
+
+
+
+-- ============================================
+-- ShowProbeSettingsDialog() Function
+-- ============================================
+function ShowProbeSettingsDialog()
+    local inst = mc.mcGetInstance()
+    
+    -- Probe & tool-change setting pound variables and their defaults
+    local PROBE_VARS = {
+        DIAMETER           = {var = 300,  default = 0.250,  desc = "Probe Diameter"},
+        X_OFFSET           = {var = 301,  default = 0.000,  desc = "X Offset (XYZ Probe)"},
+        Y_OFFSET           = {var = 302,  default = 0.000,  desc = "Y Offset (XYZ Probe)"},
+        FAST_FEED          = {var = 303,  default = 20.000, desc = "Fast Feed (XYZ Probe)"},
+        SLOW_FEED          = {var = 304,  default = 5.000,  desc = "Slow Feed (XYZ Probe)"},
+        MAX_TRAVEL         = {var = 305,  default = 0.100,  desc = "Max Travel (XYZ Probe)"},
+        BACKOFF_1          = {var = 306,  default = 0.100,  desc = "Backoff #1"},
+        BACKOFF_2          = {var = 307,  default = 0.100,  desc = "Backoff #2"},
+        TOOL_CHANGE_Z      = {var = 308,  default = -6.500, desc = "Tool Change Z Lift"},
+        PULLOUT_DISTANCE   = {var = 309,  default = 1.750,  desc = "Tool Pullout Dist."},
+        APPROACH_FEED      = {var = 310,  default = 200.000,desc = "Approach Feed"},
+        PROBE_X            = {var = 311,  default = 2.400,  desc = "Probe X Pos."},
+        PROBE_Y            = {var = 312,  default = 12.650, desc = "Probe Y Pos."},
+        MAX_PROBE_DEPTH    = {var = 314,  default = -9.000, desc = "Max Probe Depth"},
+        FAST_TOOL_FEED     = {var = 315,  default = 75.000, desc = "Fast Feed (Height)"},
+        SLOW_TOOL_FEED     = {var = 316,  default = 3.000,  desc = "Slow Feed (Height)"},
+        RETRACT_TOOL       = {var = 317,  default = 0.100,  desc = "Retract (Height)"}
+    }
+    
+    -- Helper: initialize any unset pound variable
+    local function initializePoundVar(varNum, defVal)
+        local v = mc.mcCntlGetPoundVar(inst, varNum)
+        if v < -1e300 then
+            mc.mcCntlSetPoundVar(inst, varNum, defVal)
+        end
+    end
+    
+    -- Initialize all defaults
+    for _, data in pairs(PROBE_VARS) do
+        initializePoundVar(data.var, data.default)
+    end
+    
+    -- Create dialog with adjusted size for better centering
+    local dialog = wx.wxDialog(wx.NULL, wx.wxID_ANY, "Probe & Tool-Change Settings",
+                              wx.wxDefaultPosition, wx.wxSize(480, 420),
+                              wx.wxDEFAULT_DIALOG_STYLE)
+    
+    -- Center the dialog on screen
+    dialog:Centre()
+    
+    -- Create main panel
+    local mainPanel = wx.wxPanel(dialog, wx.wxID_ANY)
+    local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    -- Create title
+    local title = wx.wxStaticText(mainPanel, wx.wxID_ANY,
+                    "Configure Probe & Tool-Change Parameters")
+    title:SetFont(wx.wxFont(12, wx.wxFONTFAMILY_DEFAULT,
+                            wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_BOLD))
+    mainSizer:Add(title, 0, wx.wxALIGN_CENTER + wx.wxALL, 10)
+    mainSizer:Add(wx.wxStaticLine(mainPanel, wx.wxID_ANY), 0, wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT, 10)
+    
+    -- Create scrolled window
+    local scrollWin = wx.wxScrolledWindow(mainPanel, wx.wxID_ANY,
+                                         wx.wxDefaultPosition, wx.wxDefaultSize,
+                                         wx.wxVSCROLL)
+    
+    -- Set scroll rate (pixels per scroll unit)
+    scrollWin:SetScrollRate(0, 20)
+    
+    -- Create sizer for scrolled content
+    local scrollSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    -- Input storage - store by var number for easy access
+    local inputs = {}
+    local inputOrder = {}  -- To maintain order
+    
+    -- Helper function to add section header
+    local function addSectionHeader(title, description)
+        -- Add some space before section (except first)
+        if #inputOrder > 0 then
+            scrollSizer:Add(wx.wxStaticLine(scrollWin, wx.wxID_ANY), 0, 
+                           wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT + wx.wxTOP, 15)
+        end
+        
+        -- Section title
+        local headerText = wx.wxStaticText(scrollWin, wx.wxID_ANY, title)
+        headerText:SetFont(wx.wxFont(11, wx.wxFONTFAMILY_DEFAULT,
+                                    wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_BOLD))
+        scrollSizer:Add(headerText, 0, wx.wxALL, 10)
+        
+        -- Section description
+        if description then
+            local descText = wx.wxStaticText(scrollWin, wx.wxID_ANY, description)
+            descText:SetFont(wx.wxFont(9, wx.wxFONTFAMILY_DEFAULT,
+                                      wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
+            descText:Wrap(440)  -- Wrap text to fit dialog
+            scrollSizer:Add(descText, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, 10)
+        end
+    end
+    
+    -- Helper function to add input grid for a section
+    local function addInputGrid(inputDefs)
+        local grid = wx.wxFlexGridSizer(#inputDefs, 3, 5, 10)
+        grid:AddGrowableCol(1, 1)
+        
+        for _, def in ipairs(inputDefs) do
+            local data, tip, unit = def[1], def[2], def[3]
+            
+            local lbl = wx.wxStaticText(scrollWin, wx.wxID_ANY, data.desc..":")
+            local val = string.format("%.4f", mc.mcCntlGetPoundVar(inst, data.var))
+            local txt = wx.wxTextCtrl(scrollWin, wx.wxID_ANY, val,
+                          wx.wxDefaultPosition, wx.wxSize(140,-1))
+            if tip then txt:SetToolTip(tip) end
+            local units = wx.wxStaticText(scrollWin, wx.wxID_ANY, unit or "")
+            
+            grid:Add(lbl, 0, wx.wxALIGN_RIGHT + wx.wxALIGN_CENTER_VERTICAL)
+            grid:Add(txt, 0, wx.wxEXPAND)
+            grid:Add(units, 0, wx.wxALIGN_LEFT + wx.wxALIGN_CENTER_VERTICAL)
+            
+            inputs[data.var] = txt
+            table.insert(inputOrder, data)
+        end
+        
+        scrollSizer:Add(grid, 0, wx.wxALL + wx.wxEXPAND, 10)
+    end
+    
+    -- XYZ Probe Section
+    addSectionHeader("XYZ Touch Probe", 
+                    "Settings for the spindle-mounted touch probe used for work offsets")
+    addInputGrid({
+        {PROBE_VARS.DIAMETER,    "Diameter of probe tip",              "in"},
+        {PROBE_VARS.X_OFFSET,    "X distance from spindle centerline", "in"},
+        {PROBE_VARS.Y_OFFSET,    "Y distance from spindle centerline", "in"},
+        {PROBE_VARS.FAST_FEED,   "Fast feed for XYZ probe",            "in/min"},
+        {PROBE_VARS.SLOW_FEED,   "Slow feed for accurate XYZ probe",   "in/min"},
+        {PROBE_VARS.MAX_TRAVEL,  "Max travel before abort",            "in"},
+        {PROBE_VARS.BACKOFF_1,   "Retract after 1st contact",          "in"},
+        {PROBE_VARS.BACKOFF_2,   "Retract after 2nd contact",          "in"}
+    })
+    
+    -- Tool Change Section
+    addSectionHeader("Tool Change Movement", 
+                    "Parameters for automatic tool change positioning")
+    addInputGrid({
+        {PROBE_VARS.TOOL_CHANGE_Z,    "Z lift for tool change moves",      "in"},
+        {PROBE_VARS.PULLOUT_DISTANCE, "Y-offset to clear spindle clamp",   "in"},
+        {PROBE_VARS.APPROACH_FEED,    "Feedrate for tool-change approach", "in/min"}
+    })
+    
+    -- Probe Station Section
+    addSectionHeader("Height Probe Station", 
+                    "Location of the fixed tool height probe")
+    addInputGrid({
+        {PROBE_VARS.PROBE_X, "Probe station X (machine coords)", "in"},
+        {PROBE_VARS.PROBE_Y, "Probe station Y (machine coords)", "in"}
+    })
+    
+    -- Tool Height Probe Section
+    addSectionHeader("Tool Height Probing", 
+                    "Settings for automatic tool height measurement")
+    addInputGrid({
+        {PROBE_VARS.MAX_PROBE_DEPTH, "Max Z travel for height probe",  "in"},
+        {PROBE_VARS.FAST_TOOL_FEED,  "Fast feed for height probing",   "in/min"},
+        {PROBE_VARS.SLOW_TOOL_FEED,  "Slow feed for height probing",   "in/min"},
+        {PROBE_VARS.RETRACT_TOOL,    "Retract after height probe",     "in"}
+    })
+    
+    -- Final divider
+    scrollSizer:Add(wx.wxStaticLine(scrollWin, wx.wxID_ANY), 0, 
+                   wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT + wx.wxTOP, 15)
+    
+    -- Info text
+    local info = "Values stored in pound variables #300-#312, #314-#317"
+    local infoText = wx.wxStaticText(scrollWin, wx.wxID_ANY, info)
+    infoText:SetFont(wx.wxFont(9, wx.wxFONTFAMILY_DEFAULT,
+                               wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
+    scrollSizer:Add(infoText, 0, wx.wxALIGN_CENTER + wx.wxALL, 10)
+    
+    -- Set sizer for scrolled window
+    scrollWin:SetSizer(scrollSizer)
+    scrollWin:FitInside()
+    
+    -- Add scrolled window to main sizer
+    mainSizer:Add(scrollWin, 1, wx.wxEXPAND + wx.wxALL, 5)
+    
+    -- Button panel (outside scroll area)
+    local btnPanel = wx.wxPanel(mainPanel, wx.wxID_ANY)
+    local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    
+    -- Create buttons
+    local btnReset = wx.wxButton(btnPanel, wx.wxID_ANY, "Reset to Defaults")
+    local btnOK = wx.wxButton(btnPanel, wx.wxID_OK, "OK")
+    local btnCancel = wx.wxButton(btnPanel, wx.wxID_CANCEL, "Cancel")
+    
+    btnSizer:Add(btnReset, 0, wx.wxALL, 5)
+    btnSizer:AddStretchSpacer()
+    btnSizer:Add(btnOK, 0, wx.wxALL, 5)
+    btnSizer:Add(btnCancel, 0, wx.wxALL, 5)
+    btnPanel:SetSizer(btnSizer)
+    
+    mainSizer:Add(btnPanel, 0, wx.wxEXPAND + wx.wxALL, 5)
+    
+    -- Reset button handler
+    btnReset:Connect(wx.wxEVT_COMMAND_BUTTON_CLICKED, function(event)
+        -- Create confirmation dialog
+        local confirmDlg = wx.wxMessageDialog(dialog,
+            "Are you sure you want to reset all probe settings to default values?\n\n" ..
+            "This action cannot be undone.",
+            "Confirm Reset to Defaults",
+            wx.wxYES_NO + wx.wxNO_DEFAULT + wx.wxICON_QUESTION)
+        
+        if confirmDlg:ShowModal() == wx.wxID_YES then
+            -- Reset all values to defaults
+            for _, data in ipairs(inputOrder) do
+                -- Update the text control
+                inputs[data.var]:SetValue(string.format("%.4f", data.default))
+            end
+            
+            wx.wxMessageBox("All values have been reset to defaults.\n\n" ..
+                           "Click OK to save these values, or Cancel to discard changes.",
+                           "Reset Complete", wx.wxOK + wx.wxICON_INFORMATION)
+        end
+        
+        confirmDlg:Destroy()
+    end)
+    
+    -- Set main panel sizer
+    mainPanel:SetSizer(mainSizer)
+    
+    -- Show dialog
+    if dialog:ShowModal() == wx.wxID_OK then
+        -- Validate and save
+        local allValid = true
+        local firstError = nil
+        
+        for varNum, txt in pairs(inputs) do
+            local val = tonumber(txt:GetValue())
+            if not val then
+                allValid = false
+                if not firstError then
+                    firstError = txt
+                end
+            end
+        end
+        
+        if allValid then
+            -- Save all values
+            for varNum, txt in pairs(inputs) do
+                local val = tonumber(txt:GetValue())
+                mc.mcCntlSetPoundVar(inst, varNum, val)
+            end
+            mc.mcCntlSetLastError(inst, "Probe settings saved successfully")
+        else
+            wx.wxMessageBox("Please enter valid numeric values for all fields",
+                           "Invalid Input", wx.wxOK + wx.wxICON_ERROR)
+            if firstError then
+                firstError:SetFocus()
+            end
+        end
+    end
+    
+    dialog:Destroy()
+end
+
+
+
+
+
+
+-- ============================================
+-- GetAllScreenButtons() Helper Function
+-- Finds all buttons matching a pattern
+-- ============================================
+function GetAllScreenButtons(pattern)
+    local buttons = {}
+    
+    -- Check base name
+    if scr.GetProperty(pattern, "Bg Color") ~= nil then
+        table.insert(buttons, pattern)
+    end
+    
+    -- Check common suffixes
+    local suffixes = {"_1", "_2", "_3", "_4", "_5", "(1)", "(2)", "(3)", "_copy", "_dup", "_a", "_b", "_c"}
+    for _, suffix in ipairs(suffixes) do
+        local name = pattern .. suffix
+        if scr.GetProperty(name, "Bg Color") ~= nil then
+            table.insert(buttons, name)
+        end
+    end
+    
+    -- Check numbered versions up to 10
+    for i = 1, 10 do
+        local name = pattern .. "_" .. i
+        if scr.GetProperty(name, "Bg Color") ~= nil then
+            table.insert(buttons, name)
+        end
+    end
+    
+    return buttons
+end
+
+
+
+
+
+
+-- ============================================
+-- UpdateWorkOffsetButtons() Function
+-- Updates all work offset button states
+-- ============================================
+function UpdateWorkOffsetButtons()
+    local inst = mc.mcGetInstance()
+    
+    -- Get current work offset from pound variable
+    local currentOffset = mc.mcCntlGetPoundVar(inst, mc.SV_MOD_GROUP_14 or 5220)
+    
+    -- Extract the offset number
+    local offsetNum = math.floor(currentOffset)
+    
+    -- Update all buttons for each offset
+    for offset = 54, 59 do
+        -- Find all buttons that start with this pattern
+        local pattern = string.format("tbtnG%.0f", offset)
+        local buttons = GetAllScreenButtons(pattern)
+        
+        -- Determine if this offset is active
+        local isActive = (offset == offsetNum)
+        
+        -- Update all found buttons
+        for _, btnName in ipairs(buttons) do
+            if isActive then
+                scr.SetProperty(btnName, "Bg Color", "#00FF00")  -- Green
+                scr.SetProperty(btnName, "Button State", "1")
+            else
+                scr.SetProperty(btnName, "Bg Color", "#C0C0C0")  -- Gray
+                scr.SetProperty(btnName, "Button State", "0")
+            end
+        end
+    end
+end
+
+-- ============================================
+-- Initialization Section
+-- This goes at the END of Screen Load Script
+-- ============================================
+-- Initialize work offset buttons on screen load
+do
+    local inst = mc.mcGetInstance()
+    
+    -- Small delay to ensure screen is fully loaded
+    wx.wxMilliSleep(100)
+    
+    -- Update buttons to show current work offset
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+        -- No logging here - keeps startup clean
+    end
+end
+
+
+
+
+
+
+
+
+
+
+-- ============================================
+-- Show Fixture Table Modal
+-- ============================================
+
+function ShowFixtureTable()
+    local inst = mc.mcGetInstance()
+    
+    -- Get screen dimensions for centering
+    local screenWidth = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X)
+    local screenHeight = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y)
+    local dialogWidth = 735
+    local dialogHeight = 250
+    
+    -- Calculate center position
+    local xPos = (screenWidth - dialogWidth) / 2
+    local yPos = (screenHeight - dialogHeight) / 2
+    
+    -- Create dialog with centered position
+    local dialog = wx.wxDialog(wx.NULL, wx.wxID_ANY, "Fixture Table",
+                              wx.wxPoint(xPos, yPos), wx.wxSize(dialogWidth, dialogHeight))
+    
+    local panel = wx.wxPanel(dialog, wx.wxID_ANY)
+    local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    -- Create list control - exact size for 6 rows
+    local list = wx.wxListCtrl(panel, wx.wxID_ANY,
+                              wx.wxDefaultPosition, wx.wxSize(715, 150),
+                              wx.wxLC_REPORT + wx.wxLC_SINGLE_SEL)
+    
+    -- Add columns - adjusted to fill exactly 715 pixels
+    list:InsertColumn(0, "Fixture", wx.wxLIST_FORMAT_LEFT, 100)
+    list:InsertColumn(1, "Description", wx.wxLIST_FORMAT_LEFT, 285)
+    list:InsertColumn(2, "X", wx.wxLIST_FORMAT_RIGHT, 110)
+    list:InsertColumn(3, "Y", wx.wxLIST_FORMAT_RIGHT, 110)
+    list:InsertColumn(4, "Z", wx.wxLIST_FORMAT_RIGHT, 110)
+    
+    -- Get current fixture
+    local currentOffset = 54  -- Default
+    
+    -- Try modal group first (most reliable)
+    local modalOffset = mc.mcCntlGetPoundVar(inst, 4014)
+    if modalOffset >= 54 and modalOffset <= 59 then
+        currentOffset = math.floor(modalOffset + 0.5)
+    else
+        -- Fallback to 5220
+        local offset5220 = mc.mcCntlGetPoundVar(inst, 5220)
+        if offset5220 >= 54 and offset5220 <= 59 then
+            currentOffset = math.floor(offset5220 + 0.5)
+        end
+    end
+    
+    -- Store fixture codes
+    local fixtureList = {}
+    local fixtureData = {}
+    local selectedIndex = -1
+    
+    -- Populate list with ONLY G54-G59
+    local itemIndex = 0
+    
+    for i = 54, 59 do
+        local fixture = string.format("G%d", i)
+        local desc = GetFixtureDescription(fixture)
+        
+        -- Get offsets from pound variables
+        local baseVar = 5221 + ((i - 54) * 20)
+        local x = mc.mcCntlGetPoundVar(inst, baseVar)
+        local y = mc.mcCntlGetPoundVar(inst, baseVar + 1)
+        local z = mc.mcCntlGetPoundVar(inst, baseVar + 2)
+        
+        list:InsertItem(itemIndex, fixture)
+        list:SetItem(itemIndex, 1, desc)
+        list:SetItem(itemIndex, 2, string.format("%.4f", x))
+        list:SetItem(itemIndex, 3, string.format("%.4f", y))
+        list:SetItem(itemIndex, 4, string.format("%.4f", z))
+        
+        -- Store fixture code and data
+        fixtureList[itemIndex] = fixture
+        fixtureData[itemIndex] = {
+            fixture = fixture,
+            desc = desc,
+            values = {x, y, z}
+        }
+        
+        -- Highlight current fixture
+        if i == currentOffset then
+            list:SetItemBackgroundColour(itemIndex, wx.wxColour(144, 238, 144))  -- Light green
+            list:SetItemState(itemIndex, wx.wxLIST_STATE_SELECTED, wx.wxLIST_STATE_SELECTED)
+            selectedIndex = itemIndex
+            list:EnsureVisible(itemIndex)
+        end
+        
+        itemIndex = itemIndex + 1
+    end
+    
+    mainSizer:Add(list, 1, wx.wxALL + wx.wxEXPAND, 5)
+    
+    -- Track selection changes
+    list:Connect(wx.wxEVT_COMMAND_LIST_ITEM_SELECTED, function(event)
+        selectedIndex = event:GetIndex()
+    end)
+    
+    list:Connect(wx.wxEVT_COMMAND_LIST_ITEM_DESELECTED, function(event)
+        selectedIndex = -1
+    end)
+    
+    -- Button panel
+    local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    local btnActivate = wx.wxButton(panel, wx.wxID_ANY, "Activate")
+    local btnEdit = wx.wxButton(panel, wx.wxID_ANY, "Edit")
+    local btnClose = wx.wxButton(panel, wx.wxID_CANCEL, "Close")
+    
+    btnSizer:Add(btnActivate, 0, wx.wxALL, 5)
+    btnSizer:Add(btnEdit, 0, wx.wxALL, 5)
+    btnSizer:AddStretchSpacer(1)
+    btnSizer:Add(btnClose, 0, wx.wxALL, 5)
+    mainSizer:Add(btnSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
+    
+    -- Event handlers
+    btnActivate:Connect(wx.wxEVT_COMMAND_BUTTON_CLICKED, function(event)
+        if selectedIndex >= 0 then
+            local fixture = fixtureList[selectedIndex]
+            if fixture then
+                mc.mcCntlMdiExecute(inst, fixture)
+                mc.mcCntlSetLastError(inst, fixture .. " Set")
+                dialog:EndModal(wx.wxID_OK)
+            end
+        else
+            wx.wxMessageBox("Please select a fixture", "No Selection")
+        end
+    end)
+    
+    btnEdit:Connect(wx.wxEVT_COMMAND_BUTTON_CLICKED, function(event)
+        if selectedIndex >= 0 then
+            local data = fixtureData[selectedIndex]
+            if data then
+                if EditFixture(data.fixture, data.desc, data.values) then
+                    dialog:EndModal(wx.wxID_OK)
+                    ShowFixtureTable()  -- Reopen with updated values
+                end
+            end
+        else
+            wx.wxMessageBox("Please select a fixture to edit", "No Selection")
+        end
+    end)
+    
+    -- Double-click to activate
+    list:Connect(wx.wxEVT_COMMAND_LIST_ITEM_ACTIVATED, function(event)
+        local index = event:GetIndex()
+        if index >= 0 and fixtureList[index] then
+            local fixture = fixtureList[index]
+            mc.mcCntlMdiExecute(inst, fixture)
+            mc.mcCntlSetLastError(inst, fixture .. " Set")
+            dialog:EndModal(wx.wxID_OK)
+        end
+    end)
+    
+    panel:SetSizer(mainSizer)
+    panel:Layout()
+    dialog:ShowModal()
+    dialog:Destroy()
+end
+
+
+
+
+
+-- ============================================
+-- Edit Fixture Function
+-- ============================================
+function EditFixture(fixtureCode, currentDesc, currentValues)
+    local inst = mc.mcGetInstance()
+    
+    -- Ensure currentValues is valid
+    currentValues = currentValues or {0, 0, 0}
+    
+    -- Create edit dialog
+    local dialog = wx.wxDialog(wx.NULL, wx.wxID_ANY, "Edit " .. fixtureCode,
+                              wx.wxDefaultPosition, wx.wxSize(400, 350))
+    
+    local panel = wx.wxPanel(dialog, wx.wxID_ANY)
+    local sizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    -- Description
+    sizer:Add(wx.wxStaticText(panel, wx.wxID_ANY, "Description:"), 
+              0, wx.wxALL, 5)
+    local descCtrl = wx.wxTextCtrl(panel, wx.wxID_ANY, currentDesc)
+    sizer:Add(descCtrl, 0, wx.wxALL + wx.wxEXPAND, 5)
+    
+    sizer:Add(wx.wxStaticLine(panel, wx.wxID_ANY), 0, wx.wxEXPAND + wx.wxALL, 10)
+    
+    -- Offset inputs
+    local offsetCtrls = {}
+    local axes = {"X", "Y", "Z"}
+    
+    for i, axis in ipairs(axes) do
+        sizer:Add(wx.wxStaticText(panel, wx.wxID_ANY, axis .. " Offset:"), 
+                  0, wx.wxALL, 5)
+        local ctrl = wx.wxTextCtrl(panel, wx.wxID_ANY, 
+                                  string.format("%.4f", currentValues[i]))
+        sizer:Add(ctrl, 0, wx.wxALL + wx.wxEXPAND, 5)
+        offsetCtrls[i] = ctrl
+    end
+    
+    -- Create button panel
+    local buttonPanel = wx.wxPanel(panel, wx.wxID_ANY)
+    local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    
+    local btnSave = wx.wxButton(buttonPanel, wx.wxID_OK, "Save", 
+                               wx.wxDefaultPosition, wx.wxSize(80, 30))
+    local btnCancel = wx.wxButton(buttonPanel, wx.wxID_CANCEL, "Cancel",
+                                 wx.wxDefaultPosition, wx.wxSize(80, 30))
+    local btnSetCurrent = wx.wxButton(buttonPanel, wx.wxID_ANY, "Set from Current",
+                                    wx.wxDefaultPosition, wx.wxSize(120, 30))
+    
+    btnSizer:Add(btnSave, 0, wx.wxALL, 5)
+    btnSizer:Add(btnCancel, 0, wx.wxALL, 5)
+    btnSizer:Add(btnSetCurrent, 0, wx.wxALL, 5)
+    
+    buttonPanel:SetSizer(btnSizer)
+    sizer:Add(buttonPanel, 0, wx.wxALIGN_CENTER + wx.wxALL, 10)
+    
+    -- Set from current position handler
+    btnSetCurrent:Connect(wx.wxEVT_COMMAND_BUTTON_CLICKED, function(event)
+        local xPos = mc.mcAxisGetMachinePos(inst, 0)
+        local yPos = mc.mcAxisGetMachinePos(inst, 1)
+        local zPos = mc.mcAxisGetMachinePos(inst, 2)
+        
+        offsetCtrls[1]:SetValue(string.format("%.4f", xPos))
+        offsetCtrls[2]:SetValue(string.format("%.4f", yPos))
+        offsetCtrls[3]:SetValue(string.format("%.4f", zPos))
+    end)
+    
+    panel:SetSizer(sizer)
+    panel:Layout()
+    
+    if dialog:ShowModal() == wx.wxID_OK then
+        -- Save description
+        SaveFixtureDescription(fixtureCode, descCtrl:GetValue())
+        
+        -- Save offsets
+        local baseVar = GetFixtureBaseVar(fixtureCode)
+        if baseVar > 0 then
+            for i = 1, 3 do  -- Only X, Y, Z
+                local value = tonumber(offsetCtrls[i]:GetValue()) or 0
+                mc.mcCntlSetPoundVar(inst, baseVar + (i - 1), value)
+            end
+            mc.mcCntlSetLastError(inst, "Offset Changes Saved")
+        end
+        
+        dialog:Destroy()
+        return true
+    end
+    
+    dialog:Destroy()
+    return false
+end
+
+
+
+
+
+
+-- ============================================
+-- Helper Functions
+-- ============================================
+function GetFixtureDescription(fixtureCode)
+    local inst = mc.mcGetInstance()
+    -- Remove spaces and dots for storage key
+    local key = fixtureCode:gsub("%s", ""):gsub("%.", "")
+    return mc.mcProfileGetString(inst, "FixtureDescriptions", key, "")
+end
+
+function SaveFixtureDescription(fixtureCode, description)
+    local inst = mc.mcGetInstance()
+    local key = fixtureCode:gsub("%s", ""):gsub("%.", "")
+    mc.mcProfileWriteString(inst, "FixtureDescriptions", key, description)
+end
+
+function GetFixtureBaseVar(fixtureCode)
+    -- Parse fixture code to get base pound variable
+    local g = fixtureCode:match("^G(%d+)$")
+    if g then
+        local num = tonumber(g)
+        if num >= 54 and num <= 59 then
+            return 5221 + ((num - 54) * 20)
+        end
+    end
+    return 0
+end
+
+
+
+
+
+-- ============================================
+-- Soft Limits Initialization
+-- Enable soft limits by default on startup
+-- ============================================
+do
+    local inst = mc.mcGetInstance()
+    
+    -- Get soft limits enabled state
+    local softLimitsHandle = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON)
+    if softLimitsHandle and softLimitsHandle > 0 then
+        -- Enable soft limits
+        mc.mcSignalSetState(softLimitsHandle, 1)
+    else
+        mc.mcCntlSetLastError(inst, "WARNING: Could not enable soft limits - invalid handle")
+    end
+end
+
+do
+    -- Simply sync the button - PLC will handle logging
+    if SyncSoftLimitsButton then
+        SyncSoftLimitsButton()
+    end
+end
+
+
+
+
+
+-- ============================================
+-- SyncSoftLimitsButton() Function
+-- Synchronizes button appearance with actual state
+-- ============================================
+function SyncSoftLimitsButton()
+    local inst = mc.mcGetInstance()
+    
+    -- Get soft limits signal handle
+    local hsig = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON)
+    if not hsig or hsig < 1 then
+        -- Invalid handle - set to error state
+        scr.SetProperty("btnSoftLimits", "Bg Color", "#808080")  -- Gray
+        scr.SetProperty("btnSoftLimits", "Label", "Soft Limits\nERROR")
+        return
+    end
+    
+    -- Get current state
+    local enabled = mc.mcSignalGetState(hsig)
+    
+    -- Update button appearance
+    if enabled == 1 then
+        scr.SetProperty("btnSoftLimits", "Bg Color", "#00FF00")  -- Green
+        scr.SetProperty("btnSoftLimits", "Label", "Soft Limits\nENABLED")
+    else
+        scr.SetProperty("btnSoftLimits", "Bg Color", "#FF0000")  -- Red
+        scr.SetProperty("btnSoftLimits", "Label", "Soft Limits\nDISABLED")
+    end
+end
+
+
+
+
+
+
+-- ============================================
+-- DUST COLLECTION BUTTON SYNCHRONIZATION
+-- ============================================
+function SyncDustButtons()
+    local inst = mc.mcGetInstance()
+    
+    -- Sync btnDustCollectAuto button (#400)
+    local dustCollectState = mc.mcCntlGetPoundVar(inst, 400)
+    scr.SetProperty("btnDustCollectAuto", "Bg Color", dustCollectState > 0 and "#00FF00" or "#FF0000")
+    
+    -- Sync btnDustBootAuto button (#402)
+    local dustBootState = mc.mcCntlGetPoundVar(inst, 402)
+    scr.SetProperty("btnDustBootAuto", "Bg Color", dustBootState > 0 and "#00FF00" or "#FF0000")
+    
+    -- Sync btnVacuumAuto button (#401) if it exists
+    if scr.GetProperty("btnVacuumAuto", "Bg Color") ~= nil then
+        local vacuumState = mc.mcCntlGetPoundVar(inst, 401)
+        scr.SetProperty("btnVacuumAuto", "Bg Color", vacuumState > 0 and "#00FF00" or "#FF0000")
+    end
+end
+
+-- ============================================
+-- Initialize dust collection automation system
+-- ============================================
+do
+    local inst = mc.mcGetInstance()
+    
+    -- Force all automations OFF on startup
+    mc.mcCntlSetPoundVar(inst, 400, 0)  -- Dust collection OFF
+    mc.mcCntlSetPoundVar(inst, 401, 0)  -- Vacuum auto OFF
+    mc.mcCntlSetPoundVar(inst, 402, 0)  -- Dust boot auto OFF
+    
+    -- Set all buttons to red (disabled state)
+    scr.SetProperty("btnDustCollectAuto", "Bg Color", "#FF0000")
+    scr.SetProperty("btnDustBootAuto", "Bg Color", "#FF0000")
+    
+    if scr.GetProperty("btnVacuumAuto", "Bg Color") ~= nil then
+        scr.SetProperty("btnVacuumAuto", "Bg Color", "#FF0000")
+    end
+end

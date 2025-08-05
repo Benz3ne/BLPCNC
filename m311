@@ -23,17 +23,13 @@ OUTPUT VARIABLES:
 #391 = Edge position (adjusted for probe radius)
 #392 = Spindle position (adjusted for probe offset)
 
-NOTES:
-- For BOSS (external) probing: Probe moves INWARD, compensation adds radius in direction of travel
-- For BORE (internal) probing: Probe moves OUTWARD, compensation subtracts radius from direction of travel
-- This version is configured for BOSS probing as used by the Boss Probe script
 ]]--
 
 function m311()
     local inst = mc.mcGetInstance()
     
     local function LOG(msg)
-        mc.mcCntlSetLastError(inst, "[PROBE] " .. tostring(msg))
+      --  mc.mcCntlSetLastError(inst, "[PROBE] " .. tostring(msg))
     end
     
     -- Get direction from S value

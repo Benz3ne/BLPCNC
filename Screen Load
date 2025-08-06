@@ -882,48 +882,60 @@ end
 
 
 -- ============================================
--- ShowProbeSettingsDialog() Function
+-- ShowProbeSettingsDialog() Function - ENHANCED VERSION
+-- Includes Work Surface Reference and Laser Offsets
+-- Ready to paste into Screen Load Script
 -- ============================================
 function ShowProbeSettingsDialog()
     local inst = mc.mcGetInstance()
     
-    -- Probe & tool-change setting pound variables and their defaults
+    -- Probe, laser & tool-change setting pound variables and their defaults
     local PROBE_VARS = {
-        DIAMETER           = {var = 300,  default = 0.250,  desc = "Probe Diameter"},
-        X_OFFSET           = {var = 301,  default = 0.000,  desc = "X Offset (XYZ Probe)"},
-        Y_OFFSET           = {var = 302,  default = 0.000,  desc = "Y Offset (XYZ Probe)"},
-        FAST_FEED          = {var = 303,  default = 20.000, desc = "Fast Feed (XYZ Probe)"},
-        SLOW_FEED          = {var = 304,  default = 5.000,  desc = "Slow Feed (XYZ Probe)"},
-        MAX_TRAVEL         = {var = 305,  default = 0.100,  desc = "Max Travel (XYZ Probe)"},
-        BACKOFF_1          = {var = 306,  default = 0.100,  desc = "Backoff #1"},
-        BACKOFF_2          = {var = 307,  default = 0.100,  desc = "Backoff #2"},
+        -- XYZ Touch Probe (T90)
+        PROBE_DIAMETER     = {var = 300,  default = 0.250,  desc = "Probe Diameter"},
+        PROBE_X_OFFSET     = {var = 301,  default = 0.000,  desc = "X Offset (Probe)"},
+        PROBE_Y_OFFSET     = {var = 302,  default = 0.000,  desc = "Y Offset (Probe)"},
+        PROBE_FAST_FEED    = {var = 303,  default = 20.000, desc = "Fast Feed (Probe)"},
+        PROBE_SLOW_FEED    = {var = 304,  default = 5.000,  desc = "Slow Feed (Probe)"},
+        PROBE_MAX_TRAVEL   = {var = 305,  default = 0.100,  desc = "Max Travel (Probe)"},
+        PROBE_BACKOFF_1    = {var = 306,  default = 0.100,  desc = "Backoff #1"},
+        PROBE_BACKOFF_2    = {var = 307,  default = 0.100,  desc = "Backoff #2"},
+        
+        -- Laser (T91)
+        LASER_X_OFFSET     = {var = 318,  default = 0.000,  desc = "X Offset (Laser)"},
+        LASER_Y_OFFSET     = {var = 319,  default = 0.000,  desc = "Y Offset (Laser)"},
+        
+        -- Tool Change Movement
         TOOL_CHANGE_Z      = {var = 308,  default = -6.500, desc = "Tool Change Z Lift"},
         PULLOUT_DISTANCE   = {var = 309,  default = 1.750,  desc = "Tool Pullout Dist."},
         APPROACH_FEED      = {var = 310,  default = 200.000,desc = "Approach Feed"},
-        PROBE_X            = {var = 311,  default = 2.400,  desc = "Probe X Pos."},
-        PROBE_Y            = {var = 312,  default = 12.650, desc = "Probe Y Pos."},
+        
+        -- Height Probe Station
+        PROBE_STATION_X    = {var = 311,  default = 2.400,  desc = "Probe Station X"},
+        PROBE_STATION_Y    = {var = 312,  default = 12.650, desc = "Probe Station Y"},
+        WORK_SURFACE_Z     = {var = 353,  default = -7.800, desc = "Work Surface Z Ref"},
+        
+        -- Tool Height Probing
         MAX_PROBE_DEPTH    = {var = 314,  default = -9.000, desc = "Max Probe Depth"},
         FAST_TOOL_FEED     = {var = 315,  default = 75.000, desc = "Fast Feed (Height)"},
         SLOW_TOOL_FEED     = {var = 316,  default = 3.000,  desc = "Slow Feed (Height)"},
         RETRACT_TOOL       = {var = 317,  default = 0.100,  desc = "Retract (Height)"}
     }
     
-    -- Helper: initialize any unset pound variable
-    local function initializePoundVar(varNum, defVal)
-        local v = mc.mcCntlGetPoundVar(inst, varNum)
-        if v < -1e300 then
-            mc.mcCntlSetPoundVar(inst, varNum, defVal)
+    -- Load all values from profile (or use defaults)
+    for _, data in pairs(PROBE_VARS) do
+        local saved = mc.mcProfileGetString(inst, "ProbeSettings", 
+                                           "Var_" .. data.var, "NOT_FOUND")
+        if saved ~= "NOT_FOUND" and tonumber(saved) then
+            mc.mcCntlSetPoundVar(inst, data.var, tonumber(saved))
+        else
+            mc.mcCntlSetPoundVar(inst, data.var, data.default)
         end
     end
     
-    -- Initialize all defaults
-    for _, data in pairs(PROBE_VARS) do
-        initializePoundVar(data.var, data.default)
-    end
-    
     -- Create dialog with adjusted size for better centering
-    local dialog = wx.wxDialog(wx.NULL, wx.wxID_ANY, "Probe & Tool-Change Settings",
-                              wx.wxDefaultPosition, wx.wxSize(480, 420),
+    local dialog = wx.wxDialog(wx.NULL, wx.wxID_ANY, "Probe, Laser & Tool-Change Settings",
+                              wx.wxDefaultPosition, wx.wxSize(500, 520),
                               wx.wxDEFAULT_DIALOG_STYLE)
     
     -- Center the dialog on screen
@@ -935,7 +947,7 @@ function ShowProbeSettingsDialog()
     
     -- Create title
     local title = wx.wxStaticText(mainPanel, wx.wxID_ANY,
-                    "Configure Probe & Tool-Change Parameters")
+                    "Configure Virtual Tool and Tool-Change Parameters")
     title:SetFont(wx.wxFont(12, wx.wxFONTFAMILY_DEFAULT,
                             wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_BOLD))
     mainSizer:Add(title, 0, wx.wxALIGN_CENTER + wx.wxALL, 10)
@@ -975,7 +987,7 @@ function ShowProbeSettingsDialog()
             local descText = wx.wxStaticText(scrollWin, wx.wxID_ANY, description)
             descText:SetFont(wx.wxFont(9, wx.wxFONTFAMILY_DEFAULT,
                                       wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
-            descText:Wrap(440)  -- Wrap text to fit dialog
+            descText:Wrap(460)  -- Wrap text to fit dialog
             scrollSizer:Add(descText, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, 10)
         end
     end
@@ -992,7 +1004,14 @@ function ShowProbeSettingsDialog()
             local val = string.format("%.4f", mc.mcCntlGetPoundVar(inst, data.var))
             local txt = wx.wxTextCtrl(scrollWin, wx.wxID_ANY, val,
                           wx.wxDefaultPosition, wx.wxSize(140,-1))
-            if tip then txt:SetToolTip(tip) end
+            
+            -- Set detailed tooltip
+            if tip then 
+                txt:SetToolTip(tip)
+                -- Also set tooltip on label for better discoverability
+                lbl:SetToolTip(tip)
+            end
+            
             local units = wx.wxStaticText(scrollWin, wx.wxID_ANY, unit or "")
             
             grid:Add(lbl, 0, wx.wxALIGN_RIGHT + wx.wxALIGN_CENTER_VERTICAL)
@@ -1006,57 +1025,95 @@ function ShowProbeSettingsDialog()
         scrollSizer:Add(grid, 0, wx.wxALL + wx.wxEXPAND, 10)
     end
     
-    -- XYZ Probe Section
-    addSectionHeader("XYZ Touch Probe", 
-                    "Settings for the spindle-mounted touch probe used for work offsets")
+    -- XYZ Touch Probe Section (T90)
+    addSectionHeader("XYZ Touch Probe (T90)", 
+                    "Settings for the spindle-mounted touch probe used for work offsets and part location")
     addInputGrid({
-        {PROBE_VARS.DIAMETER,    "Diameter of probe tip",              "in"},
-        {PROBE_VARS.X_OFFSET,    "X distance from spindle centerline", "in"},
-        {PROBE_VARS.Y_OFFSET,    "Y distance from spindle centerline", "in"},
-        {PROBE_VARS.FAST_FEED,   "Fast feed for XYZ probe",            "in/min"},
-        {PROBE_VARS.SLOW_FEED,   "Slow feed for accurate XYZ probe",   "in/min"},
-        {PROBE_VARS.MAX_TRAVEL,  "Max travel before abort",            "in"},
-        {PROBE_VARS.BACKOFF_1,   "Retract after 1st contact",          "in"},
-        {PROBE_VARS.BACKOFF_2,   "Retract after 2nd contact",          "in"}
+        {PROBE_VARS.PROBE_DIAMETER, 
+         "Pound Variable #300: The actual diameter of the probe tip ball. This value is critical for accurate edge-finding and bore measurements. Measure with calipers for best accuracy. Typical values: 0.250\" for 1/4\" probe tips.", 
+         "in"},
+        {PROBE_VARS.PROBE_X_OFFSET, 
+         "Pound Variable #301: The X-axis distance from the spindle centerline to the probe tip centerline when deployed. Positive values mean probe is to the right of spindle. Used to automatically shift work offsets when probe is active. Set to 0.000 if probe mounts concentrically in spindle.", 
+         "in"},
+        {PROBE_VARS.PROBE_Y_OFFSET, 
+         "Pound Variable #302: The Y-axis distance from the spindle centerline to the probe tip centerline when deployed. Positive values mean probe is forward of spindle. Used to automatically shift work offsets when probe is active. Set to 0.000 if probe mounts concentrically in spindle.", 
+         "in"},
+        {PROBE_VARS.PROBE_FAST_FEED, 
+         "Pound Variable #303: Initial fast approach speed for XYZ probing operations. This is the speed used for the first touch to quickly find the surface. Typical range: 10-30 ipm. Higher speeds save time but may reduce accuracy.", 
+         "in/min"},
+        {PROBE_VARS.PROBE_SLOW_FEED, 
+         "Pound Variable #304: Final slow approach speed for accurate XYZ probing. This is the speed used for the second, precise measurement. Typical range: 1-10 ipm. Slower speeds increase accuracy but take more time.", 
+         "in/min"},
+        {PROBE_VARS.PROBE_MAX_TRAVEL, 
+         "Pound Variable #305: Maximum distance the probe will travel before aborting if no contact is made. Safety feature to prevent probe damage. Should be slightly larger than expected distance to surface. Typical: 0.100-0.500\".", 
+         "in"},
+        {PROBE_VARS.PROBE_BACKOFF_1, 
+         "Pound Variable #306: Distance to retract after first fast probe contact before starting slow probe. Should be enough to ensure probe tip fully releases from surface. Typical: 0.050-0.100\".", 
+         "in"},
+        {PROBE_VARS.PROBE_BACKOFF_2, 
+         "Pound Variable #307: Distance to retract after final slow probe measurement. Final clearance distance from measured surface. Typical: 0.050-0.200\".", 
+         "in"}
+    })
+    
+    -- Laser Section (T91)
+    addSectionHeader("Laser Cross-Hair (T91)", 
+                    "Settings for the spindle-mounted laser used for visual alignment and positioning")
+    addInputGrid({
+        {PROBE_VARS.LASER_X_OFFSET, 
+         "Pound Variable #318: The X-axis distance from the spindle centerline to the laser cross-hair intersection point. Positive values mean laser is to the right of spindle. Used for accurate positioning when laser is active. Measure by comparing laser point to actual spindle position.", 
+         "in"},
+        {PROBE_VARS.LASER_Y_OFFSET, 
+         "Pound Variable #319: The Y-axis distance from the spindle centerline to the laser cross-hair intersection point. Positive values mean laser is forward of spindle. Used for accurate positioning when laser is active. Measure by comparing laser point to actual spindle position.", 
+         "in"}
     })
     
     -- Tool Change Section
     addSectionHeader("Tool Change Movement", 
-                    "Parameters for automatic tool change positioning")
+                    "Parameters for automatic tool change positioning and movements")
     addInputGrid({
-        {PROBE_VARS.TOOL_CHANGE_Z,    "Z lift for tool change moves",      "in"},
-        {PROBE_VARS.PULLOUT_DISTANCE, "Y-offset to clear spindle clamp",   "in"},
-        {PROBE_VARS.APPROACH_FEED,    "Feedrate for tool-change approach", "in/min"}
+        {PROBE_VARS.TOOL_CHANGE_Z, 
+         "Pound Variable #308: The Z height (in machine coordinates) where tools are safely grabbed and released during tool changes. Should be low enough to engage tool holder but high enough to clear when moving. Typical: -6.0 to -7.0\" depending on tool holder design.", 
+         "in"},
+        {PROBE_VARS.PULLOUT_DISTANCE, 
+         "Pound Variable #309: The Y-axis distance to pull tool forward after grabbing and before lifting to clear the tool holder fork. Prevents tool from catching on holder during lift. Typical: 1.5-2.0\" depending on holder design.", 
+         "in"},
+        {PROBE_VARS.APPROACH_FEED, 
+         "Pound Variable #310: The feedrate used when approaching tool holders during tool change operations. Should be slow enough for smooth engagement but fast enough for efficiency. Typical: 100-300 ipm.", 
+         "in/min"}
     })
     
-    -- Probe Station Section
+    -- Height Probe Station Section
     addSectionHeader("Height Probe Station", 
-                    "Location of the fixed tool height probe")
+                    "Location and reference for the fixed tool height setter")
     addInputGrid({
-        {PROBE_VARS.PROBE_X, "Probe station X (machine coords)", "in"},
-        {PROBE_VARS.PROBE_Y, "Probe station Y (machine coords)", "in"}
+        {PROBE_VARS.PROBE_STATION_X, 
+         "Pound Variable #311: The X machine coordinate of the tool height setter center. This is where tools move to measure their height. Must be accessible from tool change position without interference. Measure in machine coordinates with setter installed.", 
+         "in"},
+        {PROBE_VARS.PROBE_STATION_Y, 
+         "Pound Variable #312: The Y machine coordinate of the tool height setter center. This is where tools move to measure their height. Should be clear of clamps and fixtures. Measure in machine coordinates with setter installed.", 
+         "in"},
+        {PROBE_VARS.WORK_SURFACE_Z, 
+         "Pound Variable #353 - CRITICAL: The Z machine coordinate that represents your actual work surface (spoilboard top). All tool heights are measured as positive distances above this reference. Default -7.8\" is typical for many machines but MUST be calibrated to your specific machine. To calibrate: jog a tool tip to barely touch the spoilboard and note the Z machine coordinate.", 
+         "in"}
     })
     
-    -- Tool Height Probe Section
-    addSectionHeader("Tool Height Probing", 
-                    "Settings for automatic tool height measurement")
+    -- Tool Height Measurement Section
+    addSectionHeader("Tool Height Measurement", 
+                    "Settings for automatic tool height measurement at the probe station")
     addInputGrid({
-        {PROBE_VARS.MAX_PROBE_DEPTH, "Max Z travel for height probe",  "in"},
-        {PROBE_VARS.FAST_TOOL_FEED,  "Fast feed for height probing",   "in/min"},
-        {PROBE_VARS.SLOW_TOOL_FEED,  "Slow feed for height probing",   "in/min"},
-        {PROBE_VARS.RETRACT_TOOL,    "Retract after height probe",     "in"}
+        {PROBE_VARS.MAX_PROBE_DEPTH, 
+         "Pound Variable #314: Maximum Z depth (in machine coordinates) the tool will travel when searching for the height setter. Prevents crashes if setter is missing or tool is too short. Should be below your work surface but above machine limits. Typical: -9.0 to -10.0\".", 
+         "in"},
+        {PROBE_VARS.FAST_TOOL_FEED, 
+         "Pound Variable #315: Initial fast approach speed when measuring tool height. Used for first contact to quickly find the setter surface. Higher speeds save time during tool changes. Typical: 50-100 ipm.", 
+         "in/min"},
+        {PROBE_VARS.SLOW_TOOL_FEED, 
+         "Pound Variable #316: Final slow approach speed for accurate tool height measurement. Used for second precise measurement. Slower speeds increase repeatability. Typical: 1-5 ipm.", 
+         "in/min"},
+        {PROBE_VARS.RETRACT_TOOL, 
+         "Pound Variable #317: Distance to retract between fast and slow height measurements. Should fully release setter button/plunger. Too small may not release properly, too large wastes time. Typical: 0.050-0.150\".", 
+         "in"}
     })
-    
-    -- Final divider
-    scrollSizer:Add(wx.wxStaticLine(scrollWin, wx.wxID_ANY), 0, 
-                   wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT + wx.wxTOP, 15)
-    
-    -- Info text
-    local info = "Values stored in pound variables #300-#312, #314-#317"
-    local infoText = wx.wxStaticText(scrollWin, wx.wxID_ANY, info)
-    infoText:SetFont(wx.wxFont(9, wx.wxFONTFAMILY_DEFAULT,
-                               wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
-    scrollSizer:Add(infoText, 0, wx.wxALIGN_CENTER + wx.wxALL, 10)
     
     -- Set sizer for scrolled window
     scrollWin:SetSizer(scrollSizer)
@@ -1069,42 +1126,16 @@ function ShowProbeSettingsDialog()
     local btnPanel = wx.wxPanel(mainPanel, wx.wxID_ANY)
     local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
     
-    -- Create buttons
-    local btnReset = wx.wxButton(btnPanel, wx.wxID_ANY, "Reset to Defaults")
+    -- Create buttons (no reset button)
     local btnOK = wx.wxButton(btnPanel, wx.wxID_OK, "OK")
     local btnCancel = wx.wxButton(btnPanel, wx.wxID_CANCEL, "Cancel")
     
-    btnSizer:Add(btnReset, 0, wx.wxALL, 5)
     btnSizer:AddStretchSpacer()
     btnSizer:Add(btnOK, 0, wx.wxALL, 5)
     btnSizer:Add(btnCancel, 0, wx.wxALL, 5)
     btnPanel:SetSizer(btnSizer)
     
     mainSizer:Add(btnPanel, 0, wx.wxEXPAND + wx.wxALL, 5)
-    
-    -- Reset button handler
-    btnReset:Connect(wx.wxEVT_COMMAND_BUTTON_CLICKED, function(event)
-        -- Create confirmation dialog
-        local confirmDlg = wx.wxMessageDialog(dialog,
-            "Are you sure you want to reset all probe settings to default values?\n\n" ..
-            "This action cannot be undone.",
-            "Confirm Reset to Defaults",
-            wx.wxYES_NO + wx.wxNO_DEFAULT + wx.wxICON_QUESTION)
-        
-        if confirmDlg:ShowModal() == wx.wxID_YES then
-            -- Reset all values to defaults
-            for _, data in ipairs(inputOrder) do
-                -- Update the text control
-                inputs[data.var]:SetValue(string.format("%.4f", data.default))
-            end
-            
-            wx.wxMessageBox("All values have been reset to defaults.\n\n" ..
-                           "Click OK to save these values, or Cancel to discard changes.",
-                           "Reset Complete", wx.wxOK + wx.wxICON_INFORMATION)
-        end
-        
-        confirmDlg:Destroy()
-    end)
     
     -- Set main panel sizer
     mainPanel:SetSizer(mainSizer)
@@ -1129,9 +1160,20 @@ function ShowProbeSettingsDialog()
             -- Save all values
             for varNum, txt in pairs(inputs) do
                 local val = tonumber(txt:GetValue())
+                
+                -- Save to pound variable (runtime)
                 mc.mcCntlSetPoundVar(inst, varNum, val)
+                
+                -- Save to profile (persistent)
+                mc.mcProfileWriteString(inst, "ProbeSettings", 
+                                       "Var_" .. varNum, 
+                                       string.format("%.6f", val))
             end
-            mc.mcCntlSetLastError(inst, "Probe settings saved successfully")
+            
+            -- Force profile write to disk
+            mc.mcProfileFlush(inst)
+            
+            mc.mcCntlSetLastError(inst, "Settings saved successfully")
         else
             wx.wxMessageBox("Please enter valid numeric values for all fields",
                            "Invalid Input", wx.wxOK + wx.wxICON_ERROR)
@@ -1143,6 +1185,75 @@ function ShowProbeSettingsDialog()
     
     dialog:Destroy()
 end
+
+
+-- ============================================
+-- Initialize Probe Settings on Startup
+-- This section must be in Screen Load Script
+-- Place AFTER the function definition above
+-- ============================================
+do
+    local inst = mc.mcGetInstance()
+    
+    -- Probe and laser variables to initialize
+    local probeVars = {
+        -- Probe parameters
+        {300, 0.250},   -- Probe diameter
+        {301, 0.000},   -- Probe X offset
+        {302, 0.000},   -- Probe Y offset
+        {303, 20.000},  -- Probe fast feed
+        {304, 5.000},   -- Probe slow feed
+        {305, 0.100},   -- Probe max travel
+        {306, 0.100},   -- Probe backoff 1
+        {307, 0.100},   -- Probe backoff 2
+        
+        -- Tool change parameters
+        {308, -6.500},  -- Tool change Z
+        {309, 1.750},   -- Pullout distance
+        {310, 200.000}, -- Approach feed
+        
+        -- Height probe station
+        {311, 2.400},   -- Probe station X
+        {312, 12.650},  -- Probe station Y
+        
+        -- Tool height measurement
+        {314, -9.000},  -- Max probe depth
+        {315, 75.000},  -- Fast tool feed
+        {316, 3.000},   -- Slow tool feed
+        {317, 0.100},   -- Retract distance
+        
+        -- Laser offsets (NEW)
+        {318, 0.000},   -- Laser X offset
+        {319, 0.000},   -- Laser Y offset
+        
+        -- Work surface reference (NEW)
+        {353, -7.800}   -- Work surface Z reference
+    }
+    
+    -- Load each from profile or use default
+    for _, data in ipairs(probeVars) do
+        local varNum, defaultVal = data[1], data[2]
+        local v = mc.mcCntlGetPoundVar(inst, varNum)
+        
+        -- Only initialize if uninitialized (value will be -1.79e308)
+        if v < -1e300 then
+            local saved = mc.mcProfileGetString(inst, "ProbeSettings", 
+                                               "Var_" .. varNum, "NotFound")
+            if saved ~= "NotFound" then
+                local savedVal = tonumber(saved)
+                if savedVal then
+                    mc.mcCntlSetPoundVar(inst, varNum, savedVal)
+                else
+                    mc.mcCntlSetPoundVar(inst, varNum, defaultVal)
+                end
+            else
+                mc.mcCntlSetPoundVar(inst, varNum, defaultVal)
+            end
+        end
+    end
+end
+
+
 
 
 

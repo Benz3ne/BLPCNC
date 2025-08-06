@@ -407,8 +407,8 @@ if dlg:ShowModal() == wx.wxID_OK then
             
             if offsetSel == 2 then  -- Adjust for spindle if needed
                 -- CORRECTED: Subtract offsets for internal features
-                machX = machX - xProbeOffset
-                machY = machY - yProbeOffset
+                machX = machX + xProbeOffset
+                machY = machY + yProbeOffset
             end
             
             mc.mcCntlSetLastError(inst, string.format("Bore center (machine): X%.4f Y%.4f", machX, machY))

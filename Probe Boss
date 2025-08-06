@@ -7,10 +7,9 @@
 -- #304 = Slow feedrate for final probe
 -- #305 = Maximum probe travel distance
 -- #391 = M311 output: Edge position (adjusted for probe radius)
-
+--
 -- Required Macro:
 -- m311.mcs must exist in your profile's Macros folder
-
 
 local inst = mc.mcGetInstance()
 if not inst then 
@@ -550,8 +549,8 @@ if dlg:ShowModal() == wx.wxID_OK then
             
             if offsetSel == 2 then  -- Adjust for spindle if needed
                 -- Probe offset is FROM spindle TO probe, so subtract to get spindle position
-                machX = machX - xProbeOffset
-                machY = machY - yProbeOffset
+                machX = machX + xProbeOffset
+                machY = machY + yProbeOffset
             end
             
             mc.mcCntlSetLastError(inst, string.format("Boss center (machine): X%.4f Y%.4f", machX, machY))

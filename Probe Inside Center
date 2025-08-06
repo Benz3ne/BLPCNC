@@ -423,18 +423,18 @@ if dlg:ShowModal() == wx.wxID_OK then
                 -- Only set machine coordinates for axes that were probed
                 if probePoints.xPlus and probePoints.xMinus then
                     centerMachX = mc.mcAxisGetMachinePos(inst, mc.X_AXIS)
-                    -- CORRECTED: If spindle offset is selected, SUBTRACT offsets for internal features
-                    -- Probe offset is FROM spindle TO probe, so subtract to get spindle position
+                    -- CORRECTED: If spindle offset is selected, subtract offsets for internal features
+                    -- Probe offset is FROM spindle TO probe, so add to get spindle position
                     if offsetSel == 2 then
-                        centerMachX = centerMachX - xProbeOffset
+                        centerMachX = centerMachX + xProbeOffset
                     end
                 end
                 
                 if probePoints.yPlus and probePoints.yMinus then
                     centerMachY = mc.mcAxisGetMachinePos(inst, mc.Y_AXIS)
-                    -- CORRECTED: If spindle offset is selected, SUBTRACT offsets for internal features
+                    -- CORRECTED: If spindle offset is selected, add offsets for internal features
                     if offsetSel == 2 then
-                        centerMachY = centerMachY - yProbeOffset
+                        centerMachY = centerMachY + yProbeOffset
                     end
                 end
                 

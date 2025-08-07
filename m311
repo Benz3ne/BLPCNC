@@ -20,8 +20,12 @@ REQUIRED POUND VARIABLES:
 OUTPUT VARIABLES:
 #389 = Machine coordinate of final probe contact
 #390 = Final probe contact position
-#391 = Edge position (adjusted for probe radius)
+#391 = Edge position (adjusted for probe radius on X/Y, raw contact for Z)
 #392 = Spindle position (adjusted for probe offset)
+
+IMPORTANT: Z-axis probing does NOT apply radius compensation because touch probes
+are calibrated so their trigger point represents the actual surface location.
+Only X/Y axes need radius compensation for side probing.
 
 ]]--
 
@@ -71,7 +75,8 @@ function m311()
     
     -- Validate parameters with sensible defaults
     if type(probeDiameter) ~= "number" or probeDiameter < 0 then 
-        probeDiameter = 0.125  -- Default 1/8" probe
+        probeDiameter = 0  -- Default to 0 (no compensation)
+        LOG("WARNING: Using default probe diameter of 0 (no radius compensation). Set #300 for accurate edge detection.")
     end
     if type(xOffset) ~= "number" then xOffset = 0 end
     if type(yOffset) ~= "number" then yOffset = 0 end
@@ -127,22 +132,32 @@ function m311()
     
     -- CALCULATE EDGE POSITION WITH PROBE RADIUS COMPENSATION
     local edgePosition = finalContact
+    local probeRadius = probeDiameter / 2.0
     
-    -- Apply probe radius compensation for X and Y axes
-    -- For BOSS probing (probe moving INWARD toward center):
-    -- - When probing from +X side (moving -X, dir = -1): edge = contact - radius
-    -- - When probing from -X side (moving +X, dir = 1): edge = contact + radius
-    -- The formula: edge = contact + (radius * dir) achieves this correctly
-    
-    if axisName == "X" or axisName == "Y" then
-        local probeRadius = probeDiameter / 2.0
-        -- CORRECTED FORMULA: Add (not subtract) radius * direction
+    -- CRITICAL FIX: Z-axis touch probes do NOT need radius compensation
+    -- Touch probes are calibrated so the trigger point IS the surface
+    if axisName == "Z" then
+        -- NO compensation for Z - touch probe trigger point represents the actual surface
+        edgePosition = finalContact
+        LOG(string.format("Z probe: contact=%.4f (no radius compensation for touch probe)",
+                          finalContact))
+    else
+        -- Apply probe radius compensation for X/Y axes only
+        -- For side probing, we need to account for the probe ball radius
         edgePosition = finalContact + (probeRadius * probeInfo.dir)
         
-        LOG(string.format("%s probe: contact=%.4f, radius=%.4f, dir=%d, edge=%.4f",
-                          axisName, finalContact, probeRadius, probeInfo.dir, edgePosition))
+        if axisName == "X" then
+            -- When probing +X (dir=1): right edge = contact + radius
+            -- When probing -X (dir=-1): left edge = contact - radius
+            LOG(string.format("X probe: contact=%.4f, radius=%.4f, dir=%d, edge=%.4f",
+                              finalContact, probeRadius, probeInfo.dir, edgePosition))
+        elseif axisName == "Y" then
+            -- When probing +Y (dir=1): top edge = contact + radius
+            -- When probing -Y (dir=-1): bottom edge = contact - radius
+            LOG(string.format("Y probe: contact=%.4f, radius=%.4f, dir=%d, edge=%.4f",
+                              finalContact, probeRadius, probeInfo.dir, edgePosition))
+        end
     end
-    -- Note: Z axis typically doesn't need radius compensation for edge finding
     
     -- CALCULATE SPINDLE POSITION (compensate for probe offset from spindle)
     local spindlePosition = edgePosition
@@ -158,7 +173,7 @@ function m311()
     -- Store results in pound variables
     mc.mcCntlSetPoundVar(inst, 389, machinePos)      -- Machine coordinate
     mc.mcCntlSetPoundVar(inst, 390, finalContact)    -- Probe contact position
-    mc.mcCntlSetPoundVar(inst, 391, edgePosition)    -- Edge position (radius compensated)
+    mc.mcCntlSetPoundVar(inst, 391, edgePosition)    -- Edge position (radius compensated for X/Y, raw for Z)
     mc.mcCntlSetPoundVar(inst, 392, spindlePosition) -- Spindle position (offset compensated)
     
     -- Final backoff if specified

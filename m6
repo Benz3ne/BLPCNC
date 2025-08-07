@@ -1,7 +1,7 @@
---[[ Tool Change M6 - v7.1 Cleaned
+--[[ Tool Change M6 - v7.2 T1 No Measure
 WORK SURFACE: Z-7.8 machine coords is ZERO reference
 Virtual Tools: T90=Probe (Output#7), T91=Laser (Output#1) 
-Physical Tools: T1-T89 with auto-measurement
+Physical Tools: T1=No auto-measurement, T2-T89 with auto-measurement
 #300-#302 = Probe params
 #308-#313 = Tool change params  
 #314-#317 = Height measurement params
@@ -486,6 +486,55 @@ function m6()
     mc.mcCntlGcodeExecuteWait(inst, "G49")
     mc.mcCntlGcodeExecuteWait(inst, "G43 H" .. requestedTool)
     
+    -- Skip measurement for Tool 1
+    if requestedTool == 1 then
+        mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
+        mc.mcCntlSetFRO(inst, saved.fro)
+        
+        local restoreGcode = ""
+        
+        if saved.plane == 17 then
+            restoreGcode = restoreGcode .. "G17\n"
+        elseif saved.plane == 18 then
+            restoreGcode = restoreGcode .. "G18\n"
+        elseif saved.plane == 19 then
+            restoreGcode = restoreGcode .. "G19\n"
+        end
+        
+        if saved.absInc == 90 then
+            restoreGcode = restoreGcode .. "G90\n"
+        elseif saved.absInc == 91 then
+            restoreGcode = restoreGcode .. "G91\n"
+        end
+        
+        restoreGcode = restoreGcode .. "G94\n"
+        
+        if saved.workOffset >= 54 and saved.workOffset <= 59.3 then
+            restoreGcode = restoreGcode .. "G" .. saved.workOffset .. "\n"
+        end
+        
+        if saved.toolComp == 40 then
+            restoreGcode = restoreGcode .. "G40\n"
+        elseif saved.toolComp == 41 then
+            restoreGcode = restoreGcode .. "G41\n"
+        elseif saved.toolComp == 42 then
+            restoreGcode = restoreGcode .. "G42\n"
+        end
+        
+        if saved.feedRate and saved.feedRate > 0 and saved.feedRate < 1e308 then
+            restoreGcode = restoreGcode .. "F" .. saved.feedRate .. "\n"
+        else
+            restoreGcode = restoreGcode .. "F100\n"
+        end
+        
+        mc.mcCntlGcodeExecuteWait(inst, restoreGcode)
+        
+        mc.mcCntlSetLastError(inst, "T1 loaded (no measurement)")
+        
+        mc.mcCntlSetPoundVar(inst, 498, 0)
+        return
+    end
+    
     if mc.mcSignalGetState(handles.probe) == 1 then
         mc.mcCntlSetLastError(inst, "ERROR: Probe already triggered")
         mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
@@ -582,11 +631,8 @@ function m6()
     
     mc.mcCntlGcodeExecuteWait(inst, restoreGcode)
     
-    local offsetActive = mc.mcCntlGetPoundVar(inst, 4008) == 43
-    local offsetStatus = offsetActive and "ACTIVE" or "WARNING: NOT ACTIVE"
-    
-    mc.mcCntlSetLastError(inst, string.format("T%d (%.3f\") %s", 
-                                             requestedTool, toolHeight, offsetStatus))
+    mc.mcCntlSetLastError(inst, string.format("T%d measured: %.3f\"", 
+                                             requestedTool, toolHeight))
     
     mc.mcCntlSetPoundVar(inst, 498, 0)
 end

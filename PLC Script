@@ -170,14 +170,14 @@ local function promptToolSelection(isStartup)
         _G.toolChoices)
     
     if dlg:ShowModal() == wx.wxID_OK then
-        local selection = dlg:GetSelection()  -- 0-based
-        local newTool = _G.toolNumbers[selection + 1]
-        
-        -- Force PLC to see a change even if same tool selected
-        _G.lastTool = -999
-        
-        mc.mcToolSetCurrent(inst, newTool)
-        wx.wxMilliSleep(50)
+    local selection = dlg:GetSelection()  -- 0-based
+    local newTool = _G.toolNumbers[selection + 1]
+    
+    -- Force PLC to see a change even if same tool selected
+    _G.lastTool = -999
+    
+    mc.mcToolSetCurrent(inst, newTool)
+    wx.wxMilliSleep(50)
 		
         -- SYNC H OFFSET
         mc.mcCntlGcodeExecuteWait(inst, "G49")  -- Cancel first
@@ -250,7 +250,7 @@ if machEnabled == 1 and not _G.enablePromptDone and _G.toolPresentHandle then
     local m6Running = mc.mcCntlGetPoundVar(inst, 499) == 1
     local suppressPrompt = mc.mcCntlGetPoundVar(inst, 498) == 1
     
-    if toolPresent == 1 and currentTool == 0 and not m6Running and not suppressPrompt then
+    if toolPresent == 1 and currentTool == 0 and not suppressPrompt and currentTool < 90 then
         promptToolSelection(true)  -- true = startup
     end
     _G.enablePromptDone = true
@@ -264,6 +264,26 @@ currentTool = mc.mcToolGetCurrent(inst)
 if currentTool ~= _G.lastTool then
     local toolChangeTime = os.clock()
     _G.lastTool = currentTool
+	
+	--[[
+	-- Virtual Tool Offset Protection  
+    if _G.lastTool >= 90 and currentTool < 90 and mc.mcCntlGetPoundVar(inst, 410) == 1 then
+        -- Restore offsets from saved values
+        for i = 0, 5 do
+            local baseVar = 5221 + (i * 20)
+            local storageBase = 411 + (i * 2)
+            mc.mcCntlSetPoundVar(inst, baseVar, mc.mcCntlGetPoundVar(inst, storageBase))
+            mc.mcCntlSetPoundVar(inst, baseVar + 1, mc.mcCntlGetPoundVar(inst, storageBase + 1))
+        end
+        
+        -- Clear saved flag
+        mc.mcCntlSetPoundVar(inst, 410, 0)
+        
+        -- Safety: ensure hardware is off
+        mc.mcSignalSetState(mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7), 0)  -- Probe
+        mc.mcSignalSetState(mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT1), 0)  -- Laser
+    end
+	]]--
     
     -- Only sync H offset if machine is idle, no M6 running, and enough time has passed
     local machState = mc.mcCntlGetState(inst)
@@ -272,7 +292,7 @@ if currentTool ~= _G.lastTool then
     -- Check if this was a recent manual sync (within 1 second)
     local timeSinceLastSync = toolChangeTime - (_G.hOffsetLastSync or 0)
     
-    if machState == 0 and not m6Running and timeSinceLastSync > 1.0 then
+    if machState == 0 and timeSinceLastSync > 1.0 then
         -- Check if H offset is already correct
         local currentH = mc.mcCntlGetPoundVar(inst, 4120)
         local compMode = mc.mcCntlGetPoundVar(inst, 4008)
@@ -322,40 +342,6 @@ if currentTool ~= _G.lastTool then
         end
     end
 end
-
--- Poll for mismatch every 1000ms (only when enabled and after initial prompt)
-if machEnabled == 1 and _G.enablePromptDone and os.clock() - _G.lastPollTime >= 1.0 then
-    _G.lastPollTime = os.clock()
-    
-    -- Check protection flags
-    local m6Running = mc.mcCntlGetPoundVar(inst, 499) == 1
-    local suppressPrompt = mc.mcCntlGetPoundVar(inst, 498) == 1
-    
-    if _G.toolPresentHandle and not m6Running and not suppressPrompt then
-        local toolPresent = mc.mcSignalGetState(_G.toolPresentHandle)
-        
-        -- Check for mismatch: tool present but T0 active
-        if toolPresent == 1 and currentTool == 0 then
-            if not _G.debouncing then
-                _G.debouncing = true
-                _G.debounceStart = os.clock()
-            elseif os.clock() - _G.debounceStart >= 0.5 then  -- 500ms debounce
-                promptToolSelection(false)  -- false = not startup
-                _G.debouncing = false
-                _G.debounceStart = nil
-            end
-        else
-            -- Reset debounce if no mismatch
-            _G.debouncing = false
-            _G.debounceStart = nil
-        end
-    else
-        -- Reset debounce if M6 is running
-        _G.debouncing = false
-        _G.debounceStart = nil
-    end
-end
-
 
 
 
@@ -428,8 +414,8 @@ if currentState ~= _G.lastMachineState then
     -- PROGRAM END: Feed Run -> Idle
     elseif _G.lastMachineState == STATE_FRUN and currentState == STATE_IDLE then
         
-        -- Check if M6 or probe is running - if so, DO NOT auto stop!
-        if m6Flag == 1 or probeFlag == 1 then
+        -- Check if probe is running - if so, DO NOT auto stop!
+        if probeFlag == 1 then
             -- M6/Probe is running, skip auto stop
         else
             -- Normal auto stop behavior
@@ -641,6 +627,37 @@ end
 
 
 -- ============================================
+-- TOUCH PROBE BUTTON STATE MONITORING
+-- ============================================
+-- Monitor Output 7 for btnTouchProbe button state
+if not _G.lastProbeOutputState then 
+    _G.lastProbeOutputState = -1 
+end
+
+local output7Handle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7)
+if output7Handle and output7Handle > 0 then
+    local probeActive = mc.mcSignalGetState(output7Handle)
+    
+    -- Only update if state CHANGED
+    if probeActive ~= _G.lastProbeOutputState then
+        if probeActive == 1 then
+            -- Probe is DOWN (T90 active)
+            scr.SetProperty("btnTouchProbe", "Bg Color", "#00FF00")  -- Green
+            scr.SetProperty("btnTouchProbe", "Label", "Deactivate Probe\nChange to T0")
+        else
+            -- Probe is UP (T90 not active)
+            scr.SetProperty("btnTouchProbe", "Bg Color", "#FF0000")  -- Red
+            scr.SetProperty("btnTouchProbe", "Label", "Activate Probe\nChange to T90")
+        end
+        _G.lastProbeOutputState = probeActive
+    end
+end
+
+
+
+
+
+-- ============================================
 -- Input 8 to Output 2 Mirroring and Tool Detection
 -- ============================================
 -- Initialize persistent state
@@ -678,34 +695,50 @@ end
 
 -- Handle pending tool check after delay
 if _G.toolCheckPending and os.clock() >= _G.toolCheckTime then
-    _G.toolCheckPending = false
-  --  mc.mcCntlSetLastError(inst, "PLC: Checking for tool...")
+    
+    
+    -- CHECK IF MACHINE IS IN CYCLE OR BUSY
+    local machState = mc.mcCntlGetState(inst)
+    local inCycle = mc.mcCntlIsInCycle(inst)
+	
+	-- ADD THIS: Check if we're in a macro
+    local inMacro = (machState == mc.MC_STATE_MRUN_MACRO) or 
+                    (machState == mc.MC_STATE_MRUN_MACRO_HOLD) or
+                    (machState == mc.MC_STATE_MRUN_MACROH)
+    
+    -- Don't prompt if machine is not idle or is in cycle
+    if machState ~= 0 or inCycle == 1 then
+        -- Machine is busy - reschedule the check for later
+        _G.toolCheckPending = true
+        _G.toolCheckTime = os.clock() + 1.0  -- Try again in 1 second
+        return
+    end
     
     -- Check Input #17 (tool present)
     local toolPresentHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)
     if not toolPresentHandle or toolPresentHandle <= 0 then
-      --  mc.mcCntlSetLastError(inst, "PLC: ERROR - Invalid handle for Input 17")
+		_G.toolCheckPending = false
         return
     end
+	
+	_G.toolCheckPending = false
     
     local toolPresent = mc.mcSignalGetState(toolPresentHandle)
     local currentTool = mc.mcToolGetCurrent(inst)
     
-  --  mc.mcCntlSetLastError(inst, string.format("PLC: Tool sensor=%d, Current tool=T%d", toolPresent, currentTool))
-    
     -- Check if tool sensor state CHANGED from 0 to 1 (tool inserted)
     if toolPresent == 1 and _G.lastToolSensorState == 0 then
-     --   mc.mcCntlSetLastError(inst, "PLC: New tool detected (was empty, now has tool)")
         
-        -- Check M6 protection flags
-        local m6Running = mc.mcCntlGetPoundVar(inst, 499) == 1
-        local suppressPrompt = mc.mcCntlGetPoundVar(inst, 498) == 1
+        -- ADDITIONAL CHECK: Skip if current tool is in virtual range (90-99)
+        if currentTool >= 90 then
+            _G.lastToolSensorState = toolPresent
+            return
+        end
         
-        if not m6Running and not suppressPrompt then
-            if not _G.toolChoices then
-          --      mc.mcCntlSetLastError(inst, "PLC: ERROR - Tool choices not populated")
-                return
-            end
+        -- Only show dialog if we have tool choices
+        if not _G.toolChoices then
+            return
+        end
             
          --   mc.mcCntlSetLastError(inst, "PLC: Showing tool selection dialog...")
             
@@ -746,18 +779,85 @@ if _G.toolCheckPending and os.clock() >= _G.toolCheckTime then
                 UpdateToolPreview()
             end
         end
-    elseif toolPresent == 0 and _G.lastToolSensorState == 1 then
-        mc.mcCntlSetLastError(inst, "PLC: Tool removed from spindle")
-    elseif toolPresent == 0 then
-        mc.mcCntlSetLastError(inst, "PLC: No tool in spindle")
-    else
-        mc.mcCntlSetLastError(inst, "PLC: Tool still present, no change")
     end
     
     -- Update the last tool sensor state
     _G.lastToolSensorState = toolPresent
+
+
+
+
+
+--[[
+-- ============================================
+-- PROBE OVERTRAVEL SAFETY SYSTEM
+-- ============================================
+-- E-stop protection for probe overtravel on inputs 3 & 4
+
+if not _G.probeOvertravelInit then
+    _G.probeOvertravelInit = true
+    _G.lastProbeX = 0
+    _G.lastProbeY = 0
+    _G.overtravelTriggered = false
+    
+    -- Cache handles for efficiency
+    _G.probeXHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT3)
+    _G.probeYHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT4)
+    
+    -- Verify system is active
+    local status = "Probe safety: "
+    if _G.probeXHandle and _G.probeXHandle > 0 then
+        status = status .. "X-OK "
+    else
+        status = status .. "X-MISSING "
+    end
+    if _G.probeYHandle and _G.probeYHandle > 0 then
+        status = status .. "Y-OK"
+    else
+        status = status .. "Y-MISSING"
+    end
+    mc.mcCntlSetLastError(inst, status)
 end
 
+-- Monitor X-axis probe overtravel (Input 3)
+if _G.probeXHandle and _G.probeXHandle > 0 then
+    local probeXState = mc.mcSignalGetState(_G.probeXHandle)
+    
+    -- Rising edge triggers E-stop
+    if probeXState == 1 and _G.lastProbeX == 0 and not _G.overtravelTriggered then
+        _G.overtravelTriggered = true
+        mc.mcCntlEStop(inst)
+        mc.mcCntlSetLastError(inst, "*** PROBE OVERTRAVEL X - E-STOP ***")
+    end
+    _G.lastProbeX = probeXState
+end
+
+-- Monitor Y-axis probe overtravel (Input 4)
+if _G.probeYHandle and _G.probeYHandle > 0 then
+    local probeYState = mc.mcSignalGetState(_G.probeYHandle)
+    
+    -- Rising edge triggers E-stop
+    if probeYState == 1 and _G.lastProbeY == 0 and not _G.overtravelTriggered then
+        _G.overtravelTriggered = true
+        mc.mcCntlEStop(inst)
+        mc.mcCntlSetLastError(inst, "*** PROBE OVERTRAVEL Y - E-STOP ***")
+    end
+    _G.lastProbeY = probeYState
+end
+
+-- Reset flag when both sensors clear AND machine is idle
+if _G.overtravelTriggered then
+    local xClear = (not _G.probeXHandle) or (mc.mcSignalGetState(_G.probeXHandle) == 0)
+    local yClear = (not _G.probeYHandle) or (mc.mcSignalGetState(_G.probeYHandle) == 0)
+    local machState = mc.mcCntlGetState(inst)
+    
+    -- Only reset if sensors clear AND machine returns to idle (operator acknowledged)
+    if xClear and yClear and machState == mc.MC_STATE_IDLE then
+        _G.overtravelTriggered = false
+        mc.mcCntlSetLastError(inst, "Probe safety reset - ready")
+    end
+end
+]]--
 
 
 

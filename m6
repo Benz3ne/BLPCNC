@@ -24,7 +24,7 @@ function m6()
     -- Debug mode - set to false to suppress status messages
     local DEBUG_MODE = true
     
-    -- Function to print debug messages
+    -- Function to print debug messages (MOVED TO OUTER SCOPE)
     local function debugPrint(message)
         if DEBUG_MODE then
             mc.mcCntlSetLastError(inst, message)
@@ -38,12 +38,6 @@ function m6()
         -- [5] = true,
         -- [12] = true,
     }
-    
-    -- Initialize flags
-    mc.mcCntlSetPoundVar(inst, 498, 0)  -- Dialog suppression off
-    
-    local WORK_SURFACE_Z = -7.8
-    mc.mcCntlSetPoundVar(inst, 353, WORK_SURFACE_Z)
     
     -- ============================================
     -- VIRTUAL TOOLS CONFIGURATION TABLE
@@ -71,596 +65,657 @@ function m6()
     }
     
     -- ============================================
-    -- GENERIC VIRTUAL TOOL FUNCTIONS
+    -- STATE VARIABLES (Accessible to cleanup)
     -- ============================================
+    local saved = nil        -- Will hold saved state
+    local handles = nil      -- Will hold signal handles
+    local savedVirtualMode = nil  -- For virtual tool G90/G91 tracking
     
-    -- Get tool config with validation
-    local function getToolConfig(toolNum)
-        local config = VIRTUAL_TOOLS[toolNum]
-        if not config then
-            debugPrint(string.format("ERROR: T%d not configured", toolNum))
-            return nil
-        end
-        return config
-    end
-    
-    -- Apply virtual tool offset
-    local function applyVirtualOffset(toolNum)
-        local config = getToolConfig(toolNum)
-        if not config then return false end
+    -- ============================================
+    -- MAIN TOOL CHANGE LOGIC (Protected)
+    -- ============================================
+    local function toolChangeMain()
+        -- Initialize flags
+        mc.mcCntlSetPoundVar(inst, 498, 0)  -- Dialog suppression off
         
-        -- Get configured offsets
-        local xOffset = mc.mcCntlGetPoundVar(inst, config.xOffsetVar) or 0
-        local yOffset = mc.mcCntlGetPoundVar(inst, config.yOffsetVar) or 0
+        local WORK_SURFACE_Z = -7.8
+        mc.mcCntlSetPoundVar(inst, 353, WORK_SURFACE_Z)
         
-        -- Apply offset to all work coordinates
-        for i = 0, 5 do
-            local baseVar = 5221 + (i * 20)
-            local currentX = mc.mcCntlGetPoundVar(inst, baseVar)
-            local currentY = mc.mcCntlGetPoundVar(inst, baseVar + 1)
-            mc.mcCntlSetPoundVar(inst, baseVar, currentX - xOffset)
-            mc.mcCntlSetPoundVar(inst, baseVar + 1, currentY - yOffset)
-        end
+        -- ============================================
+        -- GENERIC VIRTUAL TOOL FUNCTIONS
+        -- ============================================
         
-        -- Store state and deltas
-        mc.mcCntlSetPoundVar(inst, 406, toolNum)  -- Which tool
-        mc.mcCntlSetPoundVar(inst, 407, xOffset)  -- X delta
-        mc.mcCntlSetPoundVar(inst, 408, yOffset)  -- Y delta
-        
-        return true
-    end
-    
-    -- Remove virtual tool offset
-    local function removeVirtualOffset()
-        local currentTool = mc.mcCntlGetPoundVar(inst, 406)
-        if currentTool <= 0 then return true end
-        
-        local xDelta = mc.mcCntlGetPoundVar(inst, 407)
-        local yDelta = mc.mcCntlGetPoundVar(inst, 408)
-        
-        -- Reverse the offset
-        for i = 0, 5 do
-            local baseVar = 5221 + (i * 20)
-            local currentX = mc.mcCntlGetPoundVar(inst, baseVar)
-            local currentY = mc.mcCntlGetPoundVar(inst, baseVar + 1)
-            mc.mcCntlSetPoundVar(inst, baseVar, currentX + xDelta)
-            mc.mcCntlSetPoundVar(inst, baseVar + 1, currentY + yDelta)
-        end
-        
-        -- Clear state
-        mc.mcCntlSetPoundVar(inst, 406, 0)
-        mc.mcCntlSetPoundVar(inst, 407, 0)
-        mc.mcCntlSetPoundVar(inst, 408, 0)
-        
-        return true
-    end
-    
-    -- Forward declaration for retractVirtualTool (BUG FIX)
-    local retractVirtualTool
-    
-    -- Deploy virtual tool
-    local function deployVirtualTool(toolNum)
-        local config = getToolConfig(toolNum)
-        if not config then return false end
-        
-        -- Check if already active
-        local currentVirtual = mc.mcCntlGetPoundVar(inst, 406)
-        if currentVirtual == toolNum then
-            debugPrint(string.format("%s already active", config.name))
-            return true
-        end
-        
-        -- Retract different virtual tool if active
-        if currentVirtual >= 90 and currentVirtual <= 99 then
-            if not retractVirtualTool() then
-                return false
+        -- Get tool config with validation
+        local function getToolConfig(toolNum)
+            local config = VIRTUAL_TOOLS[toolNum]
+            if not config then
+                error(string.format("T%d not configured", toolNum))
             end
+            return config
         end
         
-        -- Pre-deployment actions
-        if config.needsSpindleStop and mc.mcSpindleGetCommandRPM(inst) > 0 then
-            mc.mcSpindleSetDirection(inst, 0)
-            mc.mcCntlGcodeExecuteWait(inst, "G4 P1")  -- Wait for spindle
-        end
-        
-        if config.needsSafeZ then
-            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z0")
-        end
-        
-        -- Apply offsets
-        if not applyVirtualOffset(toolNum) then
-            return false
-        end
-        
-        -- Turn on hardware
-        local handle = mc.mcSignalGetHandle(inst, config.output)
-        if handle and handle > 0 then
-            mc.mcSignalSetState(handle, 1)
-        end
-        
-        -- Set tool and height offset
-        mc.mcToolSetCurrent(inst, toolNum)
-        mc.mcCntlGcodeExecuteWait(inst, "G49")  -- Cancel old
-        mc.mcCntlGcodeExecuteWait(inst, string.format("G43 H%d", toolNum))
-        
-        -- Check if height measured (if applicable)
-        if config.hasHeight then
-            local height = mc.mcToolGetData(inst, mc.MTOOL_MILL_HEIGHT, toolNum)
-            if type(height) ~= "number" or height < -1e300 then
-                debugPrint(string.format("%s deployed - use 'Measure Tool' button if needed", config.name))
-            else
-                debugPrint(string.format("%s deployed (Height: %.4f\")", config.name, height))
-            end
-        else
-            debugPrint(string.format("%s deployed", config.name))
-        end
-        
-        return true
-    end
-    
-    -- Retract virtual tool (Uses global function from Screen Load)
-    retractVirtualTool = function()
-        local currentTool = mc.mcCntlGetPoundVar(inst, 406)
-        if currentTool <= 0 then return true end
-        
-        local config = getToolConfig(currentTool)
-        if not config then return false end
-        
-        -- Move to safe position if needed (keep this M6-specific logic)
-        if config.needsSafeZ then
-            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z0")
-        end
-        
-        -- Call the global retraction function for everything else
-        if RetractVirtualTool then
-            local result = RetractVirtualTool()
-            if result then
-                debugPrint(string.format("%s retracted", config.name))
-            end
-            return result
-        else
-            debugPrint("ERROR: Global RetractVirtualTool function not found")
-            return false
-        end
-    end
-    
-    -- Recovery function for crashes
-    local function recoverVirtualToolState()
-        local state = mc.mcCntlGetPoundVar(inst, 406)
-        
-        -- Only recover if virtual tool was active
-        if state <= 0 or state >= 100 then return end
-        
-        local config = getToolConfig(state)
-        if config then
-            debugPrint(string.format("Recovering from %s deployment", config.name))
+        -- Apply virtual tool offset
+        local function applyVirtualOffset(toolNum)
+            local config = getToolConfig(toolNum)
+            if not config then return false end
             
-            -- Turn off hardware
-            local handle = mc.mcSignalGetHandle(inst, config.output)
-            if handle and handle > 0 then
-                mc.mcSignalSetState(handle, 0)
-            end
-        end
-        
-        -- Get deltas
-        local xDelta = mc.mcCntlGetPoundVar(inst, 407)
-        local yDelta = mc.mcCntlGetPoundVar(inst, 408)
-        
-        -- Basic sanity check
-        if math.abs(xDelta) > 10 or math.abs(yDelta) > 10 then
-            debugPrint("WARNING: Offset deltas seem invalid, skipping offset recovery")
-        else
-            -- Reverse the offsets
+            -- Get configured offsets
+            local xOffset = mc.mcCntlGetPoundVar(inst, config.xOffsetVar) or 0
+            local yOffset = mc.mcCntlGetPoundVar(inst, config.yOffsetVar) or 0
+            
+            -- Apply offset to all work coordinates
             for i = 0, 5 do
                 local baseVar = 5221 + (i * 20)
                 local currentX = mc.mcCntlGetPoundVar(inst, baseVar)
                 local currentY = mc.mcCntlGetPoundVar(inst, baseVar + 1)
-                
-                -- Only apply if values look reasonable
-                if math.abs(currentX) < 1000 and math.abs(currentY) < 1000 then
-                    mc.mcCntlSetPoundVar(inst, baseVar, currentX + xDelta)
-                    mc.mcCntlSetPoundVar(inst, baseVar + 1, currentY + yDelta)
+                mc.mcCntlSetPoundVar(inst, baseVar, currentX - xOffset)
+                mc.mcCntlSetPoundVar(inst, baseVar + 1, currentY - yOffset)
+            end
+            
+            -- Store state and deltas
+            mc.mcCntlSetPoundVar(inst, 406, toolNum)  -- Which tool
+            mc.mcCntlSetPoundVar(inst, 407, xOffset)  -- X delta
+            mc.mcCntlSetPoundVar(inst, 408, yOffset)  -- Y delta
+            
+            return true
+        end
+        
+        -- Remove virtual tool offset
+        local function removeVirtualOffset()
+            local currentTool = mc.mcCntlGetPoundVar(inst, 406)
+            if currentTool <= 0 then return true end
+            
+            local xDelta = mc.mcCntlGetPoundVar(inst, 407)
+            local yDelta = mc.mcCntlGetPoundVar(inst, 408)
+            
+            -- Reverse the offset
+            for i = 0, 5 do
+                local baseVar = 5221 + (i * 20)
+                local currentX = mc.mcCntlGetPoundVar(inst, baseVar)
+                local currentY = mc.mcCntlGetPoundVar(inst, baseVar + 1)
+                mc.mcCntlSetPoundVar(inst, baseVar, currentX + xDelta)
+                mc.mcCntlSetPoundVar(inst, baseVar + 1, currentY + yDelta)
+            end
+            
+            -- Clear state
+            mc.mcCntlSetPoundVar(inst, 406, 0)
+            mc.mcCntlSetPoundVar(inst, 407, 0)
+            mc.mcCntlSetPoundVar(inst, 408, 0)
+            
+            return true
+        end
+        
+        -- Forward declaration for retractVirtualTool
+        local retractVirtualTool
+        
+        -- Deploy virtual tool
+        local function deployVirtualTool(toolNum)
+            local config = getToolConfig(toolNum)
+            if not config then return false end
+            
+            -- Check if already active
+            local currentVirtual = mc.mcCntlGetPoundVar(inst, 406)
+            if currentVirtual == toolNum then
+                debugPrint(string.format("%s already active", config.name))
+                return true
+            end
+            
+            -- Retract different virtual tool if active
+            if currentVirtual >= 90 and currentVirtual <= 99 then
+                if not retractVirtualTool() then
+                    return false
                 end
             end
+            
+            -- Pre-deployment actions
+            if config.needsSpindleStop and mc.mcSpindleGetCommandRPM(inst) > 0 then
+                mc.mcSpindleSetDirection(inst, 0)
+                mc.mcCntlGcodeExecuteWait(inst, "G4 P1")  -- Wait for spindle
+            end
+            
+            if config.needsSafeZ then
+                mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z0")
+            end
+            
+            -- Apply offsets
+            if not applyVirtualOffset(toolNum) then
+                return false
+            end
+            
+            -- Turn on hardware
+            local handle = mc.mcSignalGetHandle(inst, config.output)
+            if handle and handle > 0 then
+                mc.mcSignalSetState(handle, 1)
+            end
+            
+            -- Set tool and height offset
+            mc.mcToolSetCurrent(inst, toolNum)
+            mc.mcCntlGcodeExecuteWait(inst, "G49")  -- Cancel old
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G43 H%d", toolNum))
+            
+            -- Check if height measured (if applicable)
+            if config.hasHeight then
+                local height = mc.mcToolGetData(inst, mc.MTOOL_MILL_HEIGHT, toolNum)
+                if type(height) ~= "number" or height < -1e300 then
+                    debugPrint(string.format("%s deployed - use 'Measure Tool' button if needed", config.name))
+                else
+                    debugPrint(string.format("%s deployed (Height: %.4f\")", config.name, height))
+                end
+            else
+                debugPrint(string.format("%s deployed", config.name))
+            end
+            
+            return true
         end
         
-        -- Ensure all virtual tool hardware is off
-        for toolNum, cfg in pairs(VIRTUAL_TOOLS) do
-            local h = mc.mcSignalGetHandle(inst, cfg.output)
-            if h and h > 0 then
-                mc.mcSignalSetState(h, 0)
+        -- Retract virtual tool (Uses global function from Screen Load)
+        retractVirtualTool = function()
+            local currentTool = mc.mcCntlGetPoundVar(inst, 406)
+            if currentTool <= 0 then return true end
+            
+            local config = getToolConfig(currentTool)
+            if not config then return false end
+            
+            -- Move to safe position if needed (keep this M6-specific logic)
+            if config.needsSafeZ then
+                mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z0")
+            end
+            
+            -- Debug: Check what globals are available
+            debugPrint("Checking for Screen Load globals...")
+            debugPrint("RetractVirtualTool exists: " .. tostring(RetractVirtualTool ~= nil))
+            debugPrint("_G.RetractVirtualTool exists: " .. tostring(_G.RetractVirtualTool ~= nil))
+            debugPrint("Type of RetractVirtualTool: " .. (RetractVirtualTool and type(RetractVirtualTool) or "nil"))
+            -- Also check if other Screen Load functions are visible
+            debugPrint("PopulateTools exists: " .. tostring(PopulateTools ~= nil))
+            debugPrint("UpdateToolPreview exists: " .. tostring(UpdateToolPreview ~= nil))
+            
+            -- Call the global retraction function for everything else
+            if RetractVirtualTool then
+                local result = RetractVirtualTool()
+                if result then
+                    debugPrint(string.format("%s retracted", config.name))
+                end
+                return result
+            else
+                debugPrint("ERROR: Global RetractVirtualTool function not found")
+                return false
             end
         end
         
-        -- Clear state
-        mc.mcCntlSetPoundVar(inst, 406, 0)
-        mc.mcCntlSetPoundVar(inst, 407, 0)
-        mc.mcCntlSetPoundVar(inst, 408, 0)
-        mc.mcToolSetCurrent(inst, 0)
-        mc.mcCntlGcodeExecuteWait(inst, "G49")
-    end
-    
-    -- Return physical tool helper for virtual tool swap (BUG FIX: Added return true)
-    local function returnPhysicalToolForVirtual(toolNum)
+        -- Recovery function for crashes
+        local function recoverVirtualToolState()
+            local state = mc.mcCntlGetPoundVar(inst, 406)
+            
+            -- Only recover if virtual tool was active
+            if state <= 0 or state >= 100 then return end
+            
+            local config = getToolConfig(state)
+            if config then
+                debugPrint(string.format("Recovering from %s deployment", config.name))
+                
+                -- Turn off hardware
+                local handle = mc.mcSignalGetHandle(inst, config.output)
+                if handle and handle > 0 then
+                    mc.mcSignalSetState(handle, 0)
+                end
+            end
+            
+            -- Get deltas
+            local xDelta = mc.mcCntlGetPoundVar(inst, 407)
+            local yDelta = mc.mcCntlGetPoundVar(inst, 408)
+            
+            -- Basic sanity check
+            if math.abs(xDelta) > 10 or math.abs(yDelta) > 10 then
+                debugPrint("WARNING: Offset deltas seem invalid, skipping offset recovery")
+            else
+                -- Reverse the offsets
+                for i = 0, 5 do
+                    local baseVar = 5221 + (i * 20)
+                    local currentX = mc.mcCntlGetPoundVar(inst, baseVar)
+                    local currentY = mc.mcCntlGetPoundVar(inst, baseVar + 1)
+                    
+                    -- Only apply if values look reasonable
+                    if math.abs(currentX) < 1000 and math.abs(currentY) < 1000 then
+                        mc.mcCntlSetPoundVar(inst, baseVar, currentX + xDelta)
+                        mc.mcCntlSetPoundVar(inst, baseVar + 1, currentY + yDelta)
+                    end
+                end
+            end
+            
+            -- Ensure all virtual tool hardware is off
+            for toolNum, cfg in pairs(VIRTUAL_TOOLS) do
+                local h = mc.mcSignalGetHandle(inst, cfg.output)
+                if h and h > 0 then
+                    mc.mcSignalSetState(h, 0)
+                end
+            end
+            
+            -- Clear state
+            mc.mcCntlSetPoundVar(inst, 406, 0)
+            mc.mcCntlSetPoundVar(inst, 407, 0)
+            mc.mcCntlSetPoundVar(inst, 408, 0)
+            mc.mcToolSetCurrent(inst, 0)
+            mc.mcCntlGcodeExecuteWait(inst, "G49")
+        end
+        
+        -- Return physical tool helper for virtual tool swap
+        local function returnPhysicalToolForVirtual(toolNum)
+            local TOOL_CHANGE_Z = mc.mcCntlGetPoundVar(inst, 308) or -6.5
+            local PULLOUT_DISTANCE = mc.mcCntlGetPoundVar(inst, 309) or 1.75
+            local APPROACH_FEED = mc.mcCntlGetPoundVar(inst, 310) or 200
+            
+            local x = mc.mcToolGetDataExDbl(inst, toolNum, "XToolChange") or 0
+            local y = mc.mcToolGetDataExDbl(inst, toolNum, "YToolChange") or 0
+            local z = mc.mcToolGetDataExDbl(inst, toolNum, "ZToolChange") or 0
+            
+            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z0")
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 X%.4f Y%.4f", x, y - PULLOUT_DISTANCE))
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G1 Z%.4f F%.1f", z, APPROACH_FEED))
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G1 Y%.4f F%.1f", y, APPROACH_FEED))
+            
+            local toolReleaseHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT2)
+            mc.mcCntlSetPoundVar(inst, 498, 1)
+            mc.mcSignalSetState(toolReleaseHandle, 1)
+            mc.mcCntlSetPoundVar(inst, 498, 0)
+            
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 Z%.4f", TOOL_CHANGE_Z))
+            
+            mc.mcCntlSetPoundVar(inst, 498, 1)
+            mc.mcSignalSetState(toolReleaseHandle, 0)
+            mc.mcCntlSetPoundVar(inst, 498, 0)
+            
+            return true
+        end
+        
+        -- ============================================
+        -- MAIN M6 LOGIC STARTS HERE
+        -- ============================================
+        
+        -- Always check recovery first
+        recoverVirtualToolState()
+        
+        -- Get tool info
+        local toolPresentHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)
+        local requestedTool = mc.mcToolGetSelected(inst)
+        local currentTool = mc.mcToolGetCurrent(inst)
+        
+        -- VIRTUAL TOOL REQUEST
+        if requestedTool >= 90 and requestedTool <= 99 then
+            -- Save and set G90 for virtual tool operations (they may use G53)
+            savedVirtualMode = mc.mcCntlGetPoundVar(inst, 4003)
+            mc.mcCntlGcodeExecuteWait(inst, "G90")
+            
+            -- If physical tool loaded, return it first
+            if currentTool > 0 and currentTool < 90 then
+                mc.mcCntlSetPoundVar(inst, 351, currentTool)
+                
+                if mc.mcSignalGetState(toolPresentHandle) == 1 then
+                    if not returnPhysicalToolForVirtual(currentTool) then
+                        error("Failed to return physical tool for virtual")
+                    end
+                    mc.mcToolSetCurrent(inst, 0)
+                end
+            end
+            
+            -- Deploy requested virtual tool
+            if not deployVirtualTool(requestedTool) then
+                error("Virtual tool deployment failed")
+            end
+            
+            -- Virtual tool path complete - savedVirtualMode will be restored in cleanup
+            return true, "Virtual tool deployed"
+        end
+        
+        -- RETRACT VIRTUAL TOOL (if active and physical tool requested)
+        if currentTool >= 90 and currentTool <= 99 then
+            -- Need G90 for potential G53 moves in retraction
+            local savedMode = mc.mcCntlGetPoundVar(inst, 4003)
+            mc.mcCntlGcodeExecuteWait(inst, "G90")
+            
+            retractVirtualTool()
+            currentTool = 0
+            
+            -- Restore mode after retraction
+            if savedMode == 91 then
+                mc.mcCntlGcodeExecuteWait(inst, "G91")
+            end
+        end
+        
+        -- ============================================
+        -- PHYSICAL TOOL CHANGE LOGIC
+        -- ============================================
+        
+        local SAFE_Z = 0
         local TOOL_CHANGE_Z = mc.mcCntlGetPoundVar(inst, 308) or -6.5
         local PULLOUT_DISTANCE = mc.mcCntlGetPoundVar(inst, 309) or 1.75
         local APPROACH_FEED = mc.mcCntlGetPoundVar(inst, 310) or 200
         
-        local x = mc.mcToolGetDataExDbl(inst, toolNum, "XToolChange") or 0
-        local y = mc.mcToolGetDataExDbl(inst, toolNum, "YToolChange") or 0
-        local z = mc.mcToolGetDataExDbl(inst, toolNum, "ZToolChange") or 0
+        local PROBE_X = mc.mcCntlGetPoundVar(inst, 311) or 2.4
+        local PROBE_Y = mc.mcCntlGetPoundVar(inst, 312) or 12.65
         
-        mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z0")
-        mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 X%.4f Y%.4f", x, y - PULLOUT_DISTANCE))
-        mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G1 Z%.4f F%.1f", z, APPROACH_FEED))
-        mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G1 Y%.4f F%.1f", y, APPROACH_FEED))
+        local MAX_PROBE_DEPTH = mc.mcCntlGetPoundVar(inst, 314) or -9.0
+        local FAST_FEED = mc.mcCntlGetPoundVar(inst, 315) or 75
+        local SLOW_FEED = mc.mcCntlGetPoundVar(inst, 316) or 3
+        local RETRACT = mc.mcCntlGetPoundVar(inst, 317) or 0.1
         
-        local toolReleaseHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT2)
-        mc.mcCntlSetPoundVar(inst, 498, 1)
-        mc.mcSignalSetState(toolReleaseHandle, 1)
-        mc.mcCntlSetPoundVar(inst, 498, 0)
+        local function validateProbeParams()
+            if MAX_PROBE_DEPTH >= SAFE_Z then
+                error("Max probe depth must be negative")
+            end
+            if FAST_FEED <= 0 or SLOW_FEED <= 0 then
+                error("Probe feeds must be positive")
+            end
+            return true
+        end
         
-        mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 Z%.4f", TOOL_CHANGE_Z))
+        validateProbeParams()
         
-        mc.mcCntlSetPoundVar(inst, 498, 1)
-        mc.mcSignalSetState(toolReleaseHandle, 0)
-        mc.mcCntlSetPoundVar(inst, 498, 0)
+        -- Initialize handles (make them accessible to cleanup)
+        handles = {
+            toolRelease = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT2),
+            dustBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3),
+            lowAir = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT6),
+            dustBootUp = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT7),
+            clampOpen = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT16),
+            toolPresent = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17),
+            laserDown = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT1),
+            probeDown = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7),
+            probe = mc.mcSignalGetHandle(inst, mc.ISIG_PROBE)
+        }
         
-        return true  -- BUG FIX: Added return value
-    end
-    
-    -- ============================================
-    -- MAIN M6 LOGIC STARTS HERE
-    -- ============================================
-    
-    -- Always check recovery first
-    recoverVirtualToolState()
-    
-    -- Get tool info
-    local toolPresentHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)
-    local requestedTool = mc.mcToolGetSelected(inst)
-    local currentTool = mc.mcToolGetCurrent(inst)
-    
-    -- VIRTUAL TOOL REQUEST
-    if requestedTool >= 90 and requestedTool <= 99 then
-        -- If physical tool loaded, return it first
-        if currentTool > 0 and currentTool < 90 then
-            mc.mcCntlSetPoundVar(inst, 351, currentTool)
+        -- If same tool requested, just update height offset
+        if requestedTool == currentTool then
+            if currentTool > 0 then
+                mc.mcCntlGcodeExecuteWait(inst, "G43 H" .. currentTool)
+            else
+                mc.mcCntlGcodeExecuteWait(inst, "G49")
+            end
+            return true, "Same tool"
+        end
+        
+        local function waitForSignal(handle, state, timeout)
+            local checks = 0
+            while checks < timeout * 5 do
+                if mc.mcSignalGetState(handle) == state then return true end
+                mc.mcCntlGcodeExecuteWait(inst, "G4 P0.2")
+                checks = checks + 1
+            end
+            return false
+        end
+        
+        local function getToolPosition(toolNum)
+            if toolNum < 1 or toolNum > 99 then
+                error("Invalid tool " .. toolNum)
+            end
             
-            if mc.mcSignalGetState(toolPresentHandle) == 1 then
-                if not returnPhysicalToolForVirtual(currentTool) then
-                    debugPrint("ERROR: Failed to return physical tool for virtual")
-                    return
-                end
-                mc.mcToolSetCurrent(inst, 0)
+            if toolNum >= 90 and toolNum <= 99 then
+                error("Virtual tool " .. toolNum .. " has no physical position")
+            end
+            
+            local x = mc.mcToolGetDataExDbl(inst, toolNum, "XToolChange") or 0
+            local y = mc.mcToolGetDataExDbl(inst, toolNum, "YToolChange") or 0
+            local z = mc.mcToolGetDataExDbl(inst, toolNum, "ZToolChange") or 0
+            
+            return {X = x, Y = y, Z = z}
+        end
+        
+        -- Validate tool numbers
+        if requestedTool < 0 or requestedTool > 99 then
+            error("Invalid tool " .. requestedTool)
+        end
+        
+        if requestedTool >= 90 and requestedTool <= 99 then
+            error("Virtual tool T" .. requestedTool .. " should have been handled earlier")
+        end
+        
+        local toolPos = nil
+        if requestedTool > 0 then
+            toolPos = getToolPosition(requestedTool)
+        end
+        
+        -- Safety checks
+        if mc.mcSpindleGetCommandRPM(inst) > 0 then
+            mc.mcSpindleSetDirection(inst, 0)
+        end
+        
+        mc.mcSignalSetState(handles.laserDown, 0)
+        mc.mcSignalSetState(handles.probeDown, 0)
+        
+        if mc.mcSignalGetState(handles.lowAir) == 1 then
+            error("Low air pressure")
+        end
+        
+        if not (mc.mcAxisIsHomed(inst, mc.X_AXIS) and mc.mcAxisIsHomed(inst, mc.Y_AXIS) and mc.mcAxisIsHomed(inst, mc.Z_AXIS)) then
+            error("Machine must be homed")
+        end
+        
+        -- Save current state (accessible to cleanup)
+        saved = {
+            fro = mc.mcCntlGetFRO(inst),
+            workOffset = mc.mcCntlGetPoundVar(inst, mc.SV_MOD_GROUP_14),
+            feedRate = mc.mcCntlGetPoundVar(inst, mc.SV_FEEDRATE),
+            toolComp = mc.mcCntlGetPoundVar(inst, mc.SV_MOD_GROUP_8),
+            dustBoot = mc.mcSignalGetState(handles.dustBoot),
+            plane = mc.mcCntlGetPoundVar(inst, 4002),
+            absInc = mc.mcCntlGetPoundVar(inst, 4003),  -- Save current mode
+            feedMode = mc.mcCntlGetPoundVar(inst, 4001),
+        }
+        
+        -- Set G90 for all the G53 moves in physical tool change
+        mc.mcCntlGcodeExecuteWait(inst, "G90")
+        
+        mc.mcCntlSetFRO(inst, 100)
+        mc.mcSignalSetState(handles.dustBoot, 0)
+        
+        if not waitForSignal(handles.dustBootUp, 1, 2) then
+            error("Dust boot failed to raise")
+        end
+        
+        mc.mcCntlGcodeExecuteWait(inst, "G20 G94 G40 G17")  -- G90 set separately above
+        mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
+        
+        -- Return current tool if needed
+        local currentPos = nil
+        if currentTool > 0 and currentTool < 90 then
+            currentPos = getToolPosition(currentTool)
+        end
+        
+        if currentTool > 0 and currentTool < 90 and mc.mcSignalGetState(handles.toolPresent) == 1 then
+            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
+            -- Direct move to tool position (no probe X detour)
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 X%.4f Y%.4f", 
+                currentPos.X, currentPos.Y - PULLOUT_DISTANCE))
+            mc.mcCntlGcodeExecuteWait(inst, "G53 G1 Z" .. currentPos.Z .. " F" .. APPROACH_FEED)
+            
+            mc.mcCntlGcodeExecuteWait(inst, "G53 G1 Y" .. currentPos.Y .. " F" .. APPROACH_FEED)
+            
+            mc.mcCntlSetPoundVar(inst, 498, 1)
+            mc.mcSignalSetState(handles.toolRelease, 1)
+            
+            if not waitForSignal(handles.clampOpen, 1, 5) then
+                mc.mcCntlSetPoundVar(inst, 498, 0)
+                mc.mcSignalSetState(handles.toolRelease, 0)
+                error("Clamp failed to open")
+            end
+            
+            local raiseZ = (requestedTool > 0) and TOOL_CHANGE_Z or SAFE_Z
+            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. raiseZ)
+            
+            mc.mcCntlSetPoundVar(inst, 498, 0)
+            
+            mc.mcToolSetCurrent(inst, 0)
+            mc.mcCntlGcodeExecuteWait(inst, "G49")
+            
+            if requestedTool == 0 then
+                mc.mcSignalSetState(handles.toolRelease, 0)
+                mc.mcCntlSetPoundVar(inst, 498, 0)
+            end
+        elseif currentTool > 0 and currentTool < 90 then
+            mc.mcToolSetCurrent(inst, 0)
+            mc.mcCntlGcodeExecuteWait(inst, "G49")
+        end
+        
+        -- If requested tool is T0, we're done
+        if requestedTool == 0 then
+            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
+            -- Saved state will be restored in cleanup
+            return true, "Tool returned to rack"
+        end
+        
+        -- Check spindle is empty
+        if mc.mcSignalGetState(handles.toolPresent) == 1 then
+            mc.mcCntlGcodeExecuteWait(inst, "G4 P0.5")
+            if mc.mcSignalGetState(handles.toolPresent) == 1 then
+                mc.mcSignalSetState(handles.toolRelease, 0)
+                error("Spindle not empty")
             end
         end
         
-        -- Deploy requested virtual tool
-        if deployVirtualTool(requestedTool) then
-            return
+        -- Move to new tool position
+        if currentTool > 0 and currentTool < 90 then
+            -- Tool-to-tool swap: move Y first for safety, then X
+            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Y" .. toolPos.Y)
+            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 X" .. toolPos.X)
         else
-            debugPrint("ERROR: Virtual tool deployment failed")
-            return
-        end
-    end
-    
-    -- RETRACT VIRTUAL TOOL (if active and physical tool requested)
-    if currentTool >= 90 and currentTool <= 99 then
-        retractVirtualTool()
-        currentTool = 0
-    end
-    
-    -- ============================================
-    -- PHYSICAL TOOL CHANGE LOGIC
-    -- ============================================
-    
-    local SAFE_Z = 0
-    local TOOL_CHANGE_Z = mc.mcCntlGetPoundVar(inst, 308) or -6.5
-    local PULLOUT_DISTANCE = mc.mcCntlGetPoundVar(inst, 309) or 1.75
-    local APPROACH_FEED = mc.mcCntlGetPoundVar(inst, 310) or 200
-    
-    local PROBE_X = mc.mcCntlGetPoundVar(inst, 311) or 2.4
-    local PROBE_Y = mc.mcCntlGetPoundVar(inst, 312) or 12.65
-    
-    local MAX_PROBE_DEPTH = mc.mcCntlGetPoundVar(inst, 314) or -9.0
-    local FAST_FEED = mc.mcCntlGetPoundVar(inst, 315) or 75
-    local SLOW_FEED = mc.mcCntlGetPoundVar(inst, 316) or 3
-    local RETRACT = mc.mcCntlGetPoundVar(inst, 317) or 0.1
-    
-    local function validateProbeParams()
-        if MAX_PROBE_DEPTH >= SAFE_Z then
-            debugPrint("ERROR: Max probe depth must be negative")
-            return false
-        end
-        if FAST_FEED <= 0 or SLOW_FEED <= 0 then
-            debugPrint("ERROR: Probe feeds must be positive")
-            return false
-        end
-        return true
-    end
-    
-    if not validateProbeParams() then
-        return
-    end
-    
-    local handles = {
-        toolRelease = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT2),
-        dustBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3),
-        lowAir = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT6),
-        dustBootUp = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT7),
-        clampOpen = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT16),
-        toolPresent = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17),
-        laserDown = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT1),
-        probeDown = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7),
-        probe = mc.mcSignalGetHandle(inst, mc.ISIG_PROBE)
-    }
-    
-    -- If same tool requested, just update height offset
-    if requestedTool == currentTool then
-        if currentTool > 0 then
-            mc.mcCntlGcodeExecuteWait(inst, "G43 H" .. currentTool)
-        else
-            mc.mcCntlGcodeExecuteWait(inst, "G49")
-        end
-        return
-    end
-    
-    local function waitForSignal(handle, state, timeout)
-        local checks = 0
-        while checks < timeout * 5 do
-            if mc.mcSignalGetState(handle) == state then return true end
-            mc.mcCntlGcodeExecuteWait(inst, "G4 P0.2")
-            checks = checks + 1
-        end
-        return false
-    end
-    
-    local function getToolPosition(toolNum)
-        if toolNum < 1 or toolNum > 99 then
-            debugPrint("ERROR: Invalid tool " .. toolNum)
-            return nil
+            -- Coming from no tool: direct XY move to new tool
+            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 X%.4f Y%.4f", toolPos.X, toolPos.Y))
         end
         
-        if toolNum >= 90 and toolNum <= 99 then
-            debugPrint("ERROR: Virtual tool " .. toolNum .. " has no physical position")
-            return nil
+        -- Open clamp if picking up from T0
+        if currentTool == 0 then
+            mc.mcCntlSetPoundVar(inst, 498, 1)
+            mc.mcSignalSetState(handles.toolRelease, 1)
+            
+            if not waitForSignal(handles.clampOpen, 1, 5) then
+                mc.mcCntlSetPoundVar(inst, 498, 0)
+                mc.mcSignalSetState(handles.toolRelease, 0)
+                error("Clamp failed to open for pickup")
+            end
+            mc.mcCntlSetPoundVar(inst, 498, 0)
         end
         
-        local x = mc.mcToolGetDataExDbl(inst, toolNum, "XToolChange") or 0
-        local y = mc.mcToolGetDataExDbl(inst, toolNum, "YToolChange") or 0
-        local z = mc.mcToolGetDataExDbl(inst, toolNum, "ZToolChange") or 0
-        
-        return {X = x, Y = y, Z = z}
-    end
-    
-    -- Validate tool numbers
-    if requestedTool < 0 or requestedTool > 99 then
-        debugPrint("ERROR: Invalid tool " .. requestedTool)
-        return
-    end
-    
-    if requestedTool >= 90 and requestedTool <= 99 then
-        debugPrint("ERROR: Virtual tool T" .. requestedTool .. " should have been handled earlier")
-        return
-    end
-    
-    local toolPos = nil
-    if requestedTool > 0 then
-        toolPos = getToolPosition(requestedTool)
-        if not toolPos then
-            return
+        -- Check spindle not running
+        local spindleOn = mc.mcSignalGetHandle(inst, mc.OSIG_SPINDLEON)
+        if spindleOn and mc.mcSignalGetState(spindleOn) == 1 then
+            mc.mcSignalSetState(handles.toolRelease, 0)
+            error("Spindle running - cannot grab tool")
         end
-    end
-    
-    -- Safety checks
-    if mc.mcSpindleGetCommandRPM(inst) > 0 then
-        mc.mcSpindleSetDirection(inst, 0)
-    end
-    
-    mc.mcSignalSetState(handles.laserDown, 0)
-    mc.mcSignalSetState(handles.probeDown, 0)
-    
-    if mc.mcSignalGetState(handles.lowAir) == 1 then
-        debugPrint("ERROR: Low air pressure")
-        return
-    end
-    
-    if not (mc.mcAxisIsHomed(inst, mc.X_AXIS) and mc.mcAxisIsHomed(inst, mc.Y_AXIS) and mc.mcAxisIsHomed(inst, mc.Z_AXIS)) then
-        debugPrint("ERROR: Machine must be homed")
-        return
-    end
-    
-    -- Save current state
-    local saved = {
-        fro = mc.mcCntlGetFRO(inst),
-        workOffset = mc.mcCntlGetPoundVar(inst, mc.SV_MOD_GROUP_14),
-        feedRate = mc.mcCntlGetPoundVar(inst, mc.SV_FEEDRATE),
-        toolComp = mc.mcCntlGetPoundVar(inst, mc.SV_MOD_GROUP_8),
-        dustBoot = mc.mcSignalGetState(handles.dustBoot),
-        plane = mc.mcCntlGetPoundVar(inst, 4002),
-        absInc = mc.mcCntlGetPoundVar(inst, 4003),
-        feedMode = mc.mcCntlGetPoundVar(inst, 4001),
-    }
-    
-    mc.mcCntlSetFRO(inst, 100)
-    mc.mcSignalSetState(handles.dustBoot, 0)
-    
-    if not waitForSignal(handles.dustBootUp, 1, 2) then
-        debugPrint("ERROR: Dust boot failed to raise")
-        mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
-        mc.mcCntlSetFRO(inst, saved.fro)
-        return
-    end
-    
-    mc.mcCntlGcodeExecuteWait(inst, "G20 G90 G94 G40 G17")
-    mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
-    
-    -- Return current tool if needed
-    local currentPos = nil
-    if currentTool > 0 and currentTool < 90 then
-        currentPos = getToolPosition(currentTool)
-        if not currentPos then
-            return
-        end
-    end
-    
-    if currentTool > 0 and currentTool < 90 and mc.mcSignalGetState(handles.toolPresent) == 1 then
-        mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
-        -- Direct move to tool position (no probe X detour)
-        mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 X%.4f Y%.4f", 
-            currentPos.X, currentPos.Y - PULLOUT_DISTANCE))
-        mc.mcCntlGcodeExecuteWait(inst, "G53 G1 Z" .. currentPos.Z .. " F" .. APPROACH_FEED)
         
-        mc.mcCntlGcodeExecuteWait(inst, "G53 G1 Y" .. currentPos.Y .. " F" .. APPROACH_FEED)
+        -- Grab tool
+        mc.mcCntlGcodeExecuteWait(inst, "G53 G1 Z" .. toolPos.Z .. " F" .. APPROACH_FEED)
+        mc.mcCntlGcodeExecuteWait(inst, "G0")
         
         mc.mcCntlSetPoundVar(inst, 498, 1)
-        mc.mcSignalSetState(handles.toolRelease, 1)
-        
-        if not waitForSignal(handles.clampOpen, 1, 5) then
-            mc.mcCntlSetPoundVar(inst, 498, 0)
-            debugPrint("ERROR: Clamp failed to open")
-            mc.mcSignalSetState(handles.toolRelease, 0)
-            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
-            mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
-            mc.mcCntlSetFRO(inst, saved.fro)
-            return
-        end
-        
-        local raiseZ = (requestedTool > 0) and TOOL_CHANGE_Z or SAFE_Z
-        mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. raiseZ)
-        
-        mc.mcCntlSetPoundVar(inst, 498, 0)
-        
-        mc.mcToolSetCurrent(inst, 0)
-        mc.mcCntlGcodeExecuteWait(inst, "G49")
-        
-        if requestedTool == 0 then
-            mc.mcSignalSetState(handles.toolRelease, 0)
-            mc.mcCntlSetPoundVar(inst, 498, 0)
-        end
-    elseif currentTool > 0 and currentTool < 90 then
-        mc.mcToolSetCurrent(inst, 0)
-        mc.mcCntlGcodeExecuteWait(inst, "G49")
-    end
-    
-    -- If requested tool is T0, we're done
-    if requestedTool == 0 then
-        mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
-        mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
-        mc.mcCntlSetFRO(inst, saved.fro)
-        
-        local restoreGcode = "G94\n"
-        if saved.workOffset >= 54 and saved.workOffset <= 59.3 then
-            restoreGcode = restoreGcode .. "G" .. saved.workOffset .. "\n"
-        end
-        if saved.feedRate and saved.feedRate > 0 and saved.feedRate < 1e308 then
-            restoreGcode = restoreGcode .. "F" .. saved.feedRate .. "\n"
-        else
-            restoreGcode = restoreGcode .. "F100\n"
-        end
-        mc.mcCntlGcodeExecuteWait(inst, restoreGcode)
-        
-        return
-    end
-    
-    -- Check spindle is empty
-    if mc.mcSignalGetState(handles.toolPresent) == 1 then
-        mc.mcCntlGcodeExecuteWait(inst, "G4 P0.5")
-        if mc.mcSignalGetState(handles.toolPresent) == 1 then
-            debugPrint("ERROR: Spindle not empty")
-            mc.mcSignalSetState(handles.toolRelease, 0)
-            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
-            mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
-            mc.mcCntlSetFRO(inst, saved.fro)
-            return
-        end
-    end
-    
-    -- Move to new tool position
-    if currentTool > 0 and currentTool < 90 then
-        -- Tool-to-tool swap: move Y first for safety, then X
-        mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Y" .. toolPos.Y)
-        mc.mcCntlGcodeExecuteWait(inst, "G53 G0 X" .. toolPos.X)
-    else
-        -- Coming from no tool: direct XY move to new tool
-        mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
-        mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 X%.4f Y%.4f", toolPos.X, toolPos.Y))
-    end
-    
-    -- Open clamp if picking up from T0
-    if currentTool == 0 then
-        mc.mcCntlSetPoundVar(inst, 498, 1)
-        mc.mcSignalSetState(handles.toolRelease, 1)
-        
-        if not waitForSignal(handles.clampOpen, 1, 5) then
-            mc.mcCntlSetPoundVar(inst, 498, 0)
-            debugPrint("ERROR: Clamp failed to open for pickup")
-            mc.mcSignalSetState(handles.toolRelease, 0)
-            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
-            mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
-            mc.mcCntlSetFRO(inst, saved.fro)
-            return
-        end
-        mc.mcCntlSetPoundVar(inst, 498, 0)
-    end
-    
-    -- Check spindle not running
-    local spindleOn = mc.mcSignalGetHandle(inst, mc.OSIG_SPINDLEON)
-    if spindleOn and mc.mcSignalGetState(spindleOn) == 1 then
-        debugPrint("ERROR: Spindle running - cannot grab tool")
         mc.mcSignalSetState(handles.toolRelease, 0)
-        mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
-        mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
-        mc.mcCntlSetFRO(inst, saved.fro)
-        return
-    end
-    
-    -- Grab tool
-    mc.mcCntlGcodeExecuteWait(inst, "G53 G1 Z" .. toolPos.Z .. " F" .. APPROACH_FEED)
-    mc.mcCntlGcodeExecuteWait(inst, "G0")
-    
-    mc.mcCntlSetPoundVar(inst, 498, 1)
-    mc.mcSignalSetState(handles.toolRelease, 0)
-    mc.mcCntlGcodeExecuteWait(inst, "G4 P.5")
-    mc.mcCntlSetPoundVar(inst, 498, 0)
-    
-    -- Verify tool grabbed
-    if mc.mcSignalGetState(handles.toolPresent) == 0 then
-        debugPrint("ERROR: Tool not detected after clamp")
-        mc.mcCntlSetPoundVar(inst, 498, 1)
-        mc.mcSignalSetState(handles.toolRelease, 1)
+        mc.mcCntlGcodeExecuteWait(inst, "G4 P.5")
         mc.mcCntlSetPoundVar(inst, 498, 0)
+        
+        -- Verify tool grabbed
+        if mc.mcSignalGetState(handles.toolPresent) == 0 then
+            mc.mcCntlSetPoundVar(inst, 498, 1)
+            mc.mcSignalSetState(handles.toolRelease, 1)
+            mc.mcCntlSetPoundVar(inst, 498, 0)
+            error("Tool not detected after clamp")
+        end
+        
+        -- Pull out and up
+        mc.mcCntlGcodeExecuteWait(inst, "G53 G1 Y" .. (toolPos.Y - PULLOUT_DISTANCE) .. " F" .. APPROACH_FEED)
+        
         mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
-        mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
-        mc.mcCntlSetFRO(inst, saved.fro)
-        return
+        
+        if mc.mcSignalGetState(handles.toolPresent) == 0 then
+            error("Tool lost during pickup")
+        end
+        
+        mc.mcToolSetCurrent(inst, requestedTool)
+        
+        mc.mcCntlGcodeExecuteWait(inst, "G49")
+        mc.mcCntlGcodeExecuteWait(inst, "G43 H" .. requestedTool)
+        
+        -- Skip measurement for configured tools
+        if NO_MEASURE_TOOLS[requestedTool] then
+            debugPrint(string.format("T%d loaded (no measurement - configured to skip)", requestedTool))
+            return true, "Tool loaded without measurement"
+        end
+        
+        -- ============================================
+        -- TOOL HEIGHT MEASUREMENT
+        -- ============================================
+        
+        if mc.mcSignalGetState(handles.probe) == 1 then
+            error("Probe already triggered")
+        end
+        
+        -- Move to probe station in single XY move
+        local rc = mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 X%.4f Y%.4f", PROBE_X, PROBE_Y))
+        if rc ~= mc.MERROR_NOERROR then
+            error("Failed to move to probe position")
+        end
+        
+        -- Fast probe
+        rc = mc.mcCntlGcodeExecuteWait(inst, "G53 G31 Z" .. MAX_PROBE_DEPTH .. " F" .. FAST_FEED)
+        if rc ~= mc.MERROR_NOERROR then
+            error("Fast probe failed")
+        end
+        
+        local currentZ = mc.mcAxisGetMachinePos(inst, mc.Z_AXIS)
+        if currentZ <= (MAX_PROBE_DEPTH + 0.1) then
+            error("No probe contact within travel distance")
+        end
+        
+        mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. (currentZ + RETRACT))
+        
+        -- Slow probe
+        mc.mcCntlGcodeExecuteWait(inst, "G53 G31 Z" .. MAX_PROBE_DEPTH .. " F" .. SLOW_FEED)
+        
+        mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
+        
+        -- Calculate and save tool height
+        local finalZ = mc.mcCntlGetPoundVar(inst, 5073)
+        if finalZ == 0 then
+            error("Could not read probe position")
+        end
+        
+        local toolHeight = finalZ - WORK_SURFACE_Z
+        
+        mc.mcToolSetData(inst, mc.MTOOL_MILL_HEIGHT, requestedTool, toolHeight)
+        
+        mc.mcCntlGcodeExecuteWait(inst, "G49")
+        mc.mcCntlGcodeExecuteWait(inst, "G43 H" .. requestedTool)
+        
+        debugPrint(string.format("T%d measured: %.3f\"", requestedTool, toolHeight))
+        
+        -- Success - saved state will be restored in cleanup
+        return true, "Tool change complete"
     end
     
-    -- Pull out and up
-    mc.mcCntlGcodeExecuteWait(inst, "G53 G1 Y" .. (toolPos.Y - PULLOUT_DISTANCE) .. " F" .. APPROACH_FEED)
+    -- ============================================
+    -- PROTECTED EXECUTION WITH CLEANUP
+    -- ============================================
     
-    mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
+    -- Run the main tool change in protected mode
+    local success, result, message = pcall(toolChangeMain)
     
-    if mc.mcSignalGetState(handles.toolPresent) == 0 then
-        debugPrint("ERROR: Tool lost during pickup")
-        mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
-        mc.mcCntlSetFRO(inst, saved.fro)
-        return
-    end
+    -- ============================================
+    -- CLEANUP - ALWAYS RUNS
+    -- ============================================
     
-    mc.mcToolSetCurrent(inst, requestedTool)
-    
-    mc.mcCntlGcodeExecuteWait(inst, "G49")
-    mc.mcCntlGcodeExecuteWait(inst, "G43 H" .. requestedTool)
-    
-    -- Skip measurement for configured tools
-    if NO_MEASURE_TOOLS[requestedTool] then
-        mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
+    -- Restore state if we saved it (physical tool path)
+    if saved then
+        -- Restore dust boot
+        if handles and handles.dustBoot then
+            mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
+        end
+        
+        -- Restore FRO
         mc.mcCntlSetFRO(inst, saved.fro)
         
+        -- Build restore G-code
         local restoreGcode = ""
         
+        -- Restore plane
         if saved.plane == 17 then
             restoreGcode = restoreGcode .. "G17\n"
         elseif saved.plane == 18 then
@@ -669,6 +724,7 @@ function m6()
             restoreGcode = restoreGcode .. "G19\n"
         end
         
+        -- Restore G90/G91
         if saved.absInc == 90 then
             restoreGcode = restoreGcode .. "G90\n"
         elseif saved.absInc == 91 then
@@ -677,10 +733,12 @@ function m6()
         
         restoreGcode = restoreGcode .. "G94\n"
         
+        -- Restore work offset
         if saved.workOffset >= 54 and saved.workOffset <= 59.3 then
             restoreGcode = restoreGcode .. "G" .. saved.workOffset .. "\n"
         end
         
+        -- Restore tool comp
         if saved.toolComp == 40 then
             restoreGcode = restoreGcode .. "G40\n"
         elseif saved.toolComp == 41 then
@@ -689,6 +747,7 @@ function m6()
             restoreGcode = restoreGcode .. "G42\n"
         end
         
+        -- Restore feed rate
         if saved.feedRate and saved.feedRate > 0 and saved.feedRate < 1e308 then
             restoreGcode = restoreGcode .. "F" .. saved.feedRate .. "\n"
         else
@@ -696,123 +755,31 @@ function m6()
         end
         
         mc.mcCntlGcodeExecuteWait(inst, restoreGcode)
-        
-        debugPrint(string.format("T%d loaded (no measurement - configured to skip)", requestedTool))
-        
-        mc.mcCntlSetPoundVar(inst, 498, 0)
-        return
     end
     
-    -- ============================================
-    -- TOOL HEIGHT MEASUREMENT
-    -- ============================================
-    
-    if mc.mcSignalGetState(handles.probe) == 1 then
-        debugPrint("ERROR: Probe already triggered")
-        mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
-        mc.mcCntlSetFRO(inst, saved.fro)
-        return
+    -- Restore virtual tool G90/G91 if we saved it
+    if savedVirtualMode and savedVirtualMode == 91 then
+        mc.mcCntlGcodeExecuteWait(inst, "G91")
     end
     
-    -- Move to probe station in single XY move
-    local rc = mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 X%.4f Y%.4f", PROBE_X, PROBE_Y))
-    if rc ~= mc.MERROR_NOERROR then
-        debugPrint("ERROR: Failed to move to probe position")
-        mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
-        mc.mcCntlSetFRO(inst, saved.fro)
-        return
-    end
-    
-    -- Fast probe
-    rc = mc.mcCntlGcodeExecuteWait(inst, "G53 G31 Z" .. MAX_PROBE_DEPTH .. " F" .. FAST_FEED)
-    if rc ~= mc.MERROR_NOERROR then
-        debugPrint("ERROR: Fast probe failed")
-        mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
-        mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
-        mc.mcCntlSetFRO(inst, saved.fro)
-        return
-    end
-    
-    local currentZ = mc.mcAxisGetMachinePos(inst, mc.Z_AXIS)
-    if currentZ <= (MAX_PROBE_DEPTH + 0.1) then
-        debugPrint("ERROR: No probe contact within travel distance")
-        mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
-        mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
-        mc.mcCntlSetFRO(inst, saved.fro)
-        return
-    end
-    
-    mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. (currentZ + RETRACT))
-    
-    -- Slow probe
-    mc.mcCntlGcodeExecuteWait(inst, "G53 G31 Z" .. MAX_PROBE_DEPTH .. " F" .. SLOW_FEED)
-    
-    mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
-    
-    -- Calculate and save tool height
-    local finalZ = mc.mcCntlGetPoundVar(inst, 5073)
-    if finalZ == 0 then
-        debugPrint("ERROR: Could not read probe position")
-        mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
-        mc.mcCntlSetFRO(inst, saved.fro)
-        return
-    end
-    
-    local toolHeight = finalZ - WORK_SURFACE_Z
-    
-    mc.mcToolSetData(inst, mc.MTOOL_MILL_HEIGHT, requestedTool, toolHeight)
-    
-    mc.mcCntlGcodeExecuteWait(inst, "G49")
-    mc.mcCntlGcodeExecuteWait(inst, "G43 H" .. requestedTool)
-    
-    -- ============================================
-    -- RESTORE STATE AND FINISH
-    -- ============================================
-    
-    mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
-    mc.mcCntlSetFRO(inst, saved.fro)
-    
-    local restoreGcode = ""
-    
-    if saved.plane == 17 then
-        restoreGcode = restoreGcode .. "G17\n"
-    elseif saved.plane == 18 then
-        restoreGcode = restoreGcode .. "G18\n"
-    elseif saved.plane == 19 then
-        restoreGcode = restoreGcode .. "G19\n"
-    end
-    
-    if saved.absInc == 90 then
-        restoreGcode = restoreGcode .. "G90\n"
-    elseif saved.absInc == 91 then
-        restoreGcode = restoreGcode .. "G91\n"
-    end
-    
-    restoreGcode = restoreGcode .. "G94\n"
-    
-    if saved.workOffset >= 54 and saved.workOffset <= 59.3 then
-        restoreGcode = restoreGcode .. "G" .. saved.workOffset .. "\n"
-    end
-    
-    if saved.toolComp == 40 then
-        restoreGcode = restoreGcode .. "G40\n"
-    elseif saved.toolComp == 41 then
-        restoreGcode = restoreGcode .. "G41\n"
-    elseif saved.toolComp == 42 then
-        restoreGcode = restoreGcode .. "G42\n"
-    end
-    
-    if saved.feedRate and saved.feedRate > 0 and saved.feedRate < 1e308 then
-        restoreGcode = restoreGcode .. "F" .. saved.feedRate .. "\n"
-    else
-        restoreGcode = restoreGcode .. "F100\n"
-    end
-    
-    mc.mcCntlGcodeExecuteWait(inst, restoreGcode)
-    
-    debugPrint(string.format("T%d measured: %.3f\"", requestedTool, toolHeight))
-    
+    -- Clear dialog suppression
     mc.mcCntlSetPoundVar(inst, 498, 0)
+    
+    -- Handle error
+    if not success then
+        debugPrint("ERROR: " .. tostring(result))
+        
+        -- Ensure critical safety items
+        -- Move to safe Z if possible
+        local currentZ = mc.mcAxisGetMachinePos(inst, mc.Z_AXIS)
+        if currentZ and currentZ < -0.5 then
+            -- Try to move to safe Z (might fail but worth trying)
+            pcall(function()
+                mc.mcCntlGcodeExecuteWait(inst, "G90")
+                mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z0")
+            end)
+        end
+    end
 end
 
 if (mc.mcInEditor() == 1) then m6() end

@@ -1,8 +1,9 @@
---[[ Tool Change M6 - Table-Based Virtual Tool System v2.0
+--[[ Tool Change M6 - Table-Based Virtual Tool System v2.1
 Delta tracking for user zero preservation
 Easy configuration via VIRTUAL_TOOLS table
 State: #406 = Active virtual tool (0=none, 90-99=virtual)
 Deltas: #407 = X offset applied, #408 = Y offset applied
+Dust Boot: #494 = Dust boot state before virtual tool (0=unknown, 1=was down, 2=was up)
 Physical Tools: Configurable which tools skip measurement
 #300-#302 = Probe params
 #308-#313 = Tool change params  
@@ -11,6 +12,8 @@ Physical Tools: Configurable which tools skip measurement
 #351 = Last physical tool (for virtual tool return)
 #353 = Work surface Z reference
 #389 = Probe contact Z
+#495 = Post-M6 spindle spinup flag (for PLC)
+#496 = Post-M6 spindle spinup dwell seconds
 #498 = Dialog suppression
 ]]--
 
@@ -167,6 +170,28 @@ function m6()
                 end
             end
             
+            -- Save dust boot state before raising it for virtual tool
+            local dustBootHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+            if dustBootHandle then
+                local dustBootState = mc.mcSignalGetState(dustBootHandle)
+                if dustBootState == 1 then
+                    mc.mcCntlSetPoundVar(inst, 494, 1)  -- Was down
+                    mc.mcSignalSetState(dustBootHandle, 0)  -- Raise it
+                    -- Wait for dust boot to raise
+                    local dustBootUpHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT7)
+                    if dustBootUpHandle then
+                        local checks = 0
+                        while checks < 10 do  -- 2 second timeout
+                            if mc.mcSignalGetState(dustBootUpHandle) == 1 then break end
+                            mc.mcCntlGcodeExecuteWait(inst, "G4 P0.2")
+                            checks = checks + 1
+                        end
+                    end
+                else
+                    mc.mcCntlSetPoundVar(inst, 494, 2)  -- Was up
+                end
+            end
+            
             -- Pre-deployment actions
             if config.needsSpindleStop and mc.mcSpindleGetCommandRPM(inst) > 0 then
                 mc.mcSpindleSetDirection(inst, 0)
@@ -221,15 +246,6 @@ function m6()
                 mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z0")
             end
             
-            -- Debug: Check what globals are available
-            debugPrint("Checking for Screen Load globals...")
-            debugPrint("RetractVirtualTool exists: " .. tostring(RetractVirtualTool ~= nil))
-            debugPrint("_G.RetractVirtualTool exists: " .. tostring(_G.RetractVirtualTool ~= nil))
-            debugPrint("Type of RetractVirtualTool: " .. (RetractVirtualTool and type(RetractVirtualTool) or "nil"))
-            -- Also check if other Screen Load functions are visible
-            debugPrint("PopulateTools exists: " .. tostring(PopulateTools ~= nil))
-            debugPrint("UpdateToolPreview exists: " .. tostring(UpdateToolPreview ~= nil))
-            
             -- Call the global retraction function for everything else
             if RetractVirtualTool then
                 local result = RetractVirtualTool()
@@ -266,7 +282,7 @@ function m6()
             local yDelta = mc.mcCntlGetPoundVar(inst, 408)
             
             -- Basic sanity check
-            if math.abs(xDelta) > 10 or math.abs(yDelta) > 10 then
+            if math.abs(xDelta) > 999 or math.abs(yDelta) > 999 then
                 debugPrint("WARNING: Offset deltas seem invalid, skipping offset recovery")
             else
                 -- Reverse the offsets
@@ -295,6 +311,7 @@ function m6()
             mc.mcCntlSetPoundVar(inst, 406, 0)
             mc.mcCntlSetPoundVar(inst, 407, 0)
             mc.mcCntlSetPoundVar(inst, 408, 0)
+            mc.mcCntlSetPoundVar(inst, 494, 0)  -- Clear dust boot memory
             mc.mcToolSetCurrent(inst, 0)
             mc.mcCntlGcodeExecuteWait(inst, "G49")
         end
@@ -308,6 +325,11 @@ function m6()
             local x = mc.mcToolGetDataExDbl(inst, toolNum, "XToolChange") or 0
             local y = mc.mcToolGetDataExDbl(inst, toolNum, "YToolChange") or 0
             local z = mc.mcToolGetDataExDbl(inst, toolNum, "ZToolChange") or 0
+            
+            -- Guard: (0,0) rack coordinates are invalid for physical tools
+            if (math.abs(x) < 1e-9) and (math.abs(y) < 1e-9) then
+                error("Tool T" .. toolNum .. " rack XY is (0,0); set XToolChange/YToolChange")
+            end
             
             mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z0")
             mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 X%.4f Y%.4f", x, y - PULLOUT_DISTANCE))
@@ -376,6 +398,20 @@ function m6()
             retractVirtualTool()
             currentTool = 0
             
+            -- Restore dust boot if it was down before virtual tool (and not going to T0)
+            if requestedTool > 0 then
+                local dustBootMemory = mc.mcCntlGetPoundVar(inst, 494)
+                if dustBootMemory == 1 then  -- Was down
+                    local dustBootHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+                    if dustBootHandle then
+                        mc.mcSignalSetState(dustBootHandle, 1)
+                        debugPrint("Dust boot restored to down position")
+                    end
+                end
+            end
+            -- Clear dust boot memory
+            mc.mcCntlSetPoundVar(inst, 494, 0)
+            
             -- Restore mode after retraction
             if savedMode == 91 then
                 mc.mcCntlGcodeExecuteWait(inst, "G91")
@@ -398,6 +434,10 @@ function m6()
         local FAST_FEED = mc.mcCntlGetPoundVar(inst, 315) or 75
         local SLOW_FEED = mc.mcCntlGetPoundVar(inst, 316) or 3
         local RETRACT = mc.mcCntlGetPoundVar(inst, 317) or 0.1
+        
+        -- Added: dwell settings (editable)
+        local SPINDLE_SPINDOWN_DWELL_S = 0.5   -- pause after spindle OFF before deposit
+        local SPINDLE_SPINUP_DWELL_S   = 0.7   -- one-shot pause after M6 when spindle turns ON (handled by PLC)
         
         local function validateProbeParams()
             if MAX_PROBE_DEPTH >= SAFE_Z then
@@ -457,6 +497,11 @@ function m6()
             local y = mc.mcToolGetDataExDbl(inst, toolNum, "YToolChange") or 0
             local z = mc.mcToolGetDataExDbl(inst, toolNum, "ZToolChange") or 0
             
+            -- Guard: (0,0) rack coordinates are invalid for physical tools
+            if (math.abs(x) < 1e-9) and (math.abs(y) < 1e-9) then
+                error("Tool T" .. toolNum .. " rack XY is (0,0); set XToolChange/YToolChange")
+            end
+            
             return {X = x, Y = y, Z = z}
         end
         
@@ -477,6 +522,10 @@ function m6()
         -- Safety checks
         if mc.mcSpindleGetCommandRPM(inst) > 0 then
             mc.mcSpindleSetDirection(inst, 0)
+            -- Added: allow coast-down before moving toward rack
+            if (SPINDLE_SPINDOWN_DWELL_S or 0) > 0 then
+                mc.mcCntlGcodeExecuteWait(inst, string.format("G4 P%.3f", SPINDLE_SPINDOWN_DWELL_S))
+            end
         end
         
         mc.mcSignalSetState(handles.laserDown, 0)
@@ -574,9 +623,8 @@ function m6()
         
         -- Move to new tool position
         if currentTool > 0 and currentTool < 90 then
-            -- Tool-to-tool swap: move Y first for safety, then X
-            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Y" .. toolPos.Y)
-            mc.mcCntlGcodeExecuteWait(inst, "G53 G0 X" .. toolPos.X)
+            -- Tool-to-tool swap: single combined XY rapid
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 X%.4f Y%.4f", toolPos.X, toolPos.Y))
         else
             -- Coming from no tool: direct XY move to new tool
             mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. SAFE_Z)
@@ -631,6 +679,9 @@ function m6()
         
         mc.mcToolSetCurrent(inst, requestedTool)
         
+        -- Arm one-shot spindle spin-up dwell for PLC
+        mc.mcCntlSetPoundVar(inst, 496, SPINDLE_SPINUP_DWELL_S)
+        mc.mcCntlSetPoundVar(inst, 495, 1)
         mc.mcCntlGcodeExecuteWait(inst, "G49")
         mc.mcCntlGcodeExecuteWait(inst, "G43 H" .. requestedTool)
         

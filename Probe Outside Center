@@ -1,6 +1,6 @@
 -- Outside Center Probe - Button Left-Down Script for Mach4
--- Version 2.0 - CORRECTED work offset mapping and spindle offset direction
---
+-- CORRECTED VERSION with state persistence fix, UI improvements, and better diagnostics
+
 -- Required Pound Variables:
 -- #301 = X offset from spindle center to probe tip
 -- #302 = Y offset from spindle center to probe tip  
@@ -8,14 +8,88 @@
 -- #304 = Slow feedrate for final probe
 -- #305 = Maximum probe travel distance
 -- #391 = M311 output: Edge position (adjusted for probe radius)
---
+
 -- Required Macro:
 -- m311.mcs must exist in your profile's Macros folder
--- IMPORTANT: M311 must have corrected probe radius compensation
 
 local inst = mc.mcGetInstance()
 if not inst then 
     return 
+end
+
+-- Check if T90 (probe) is active
+local currentTool = mc.mcToolGetCurrent(inst)
+-- Check if probe is physically deployed (output 7)
+local probeDownHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7)
+local probeDeployed = mc.mcSignalGetState(probeDownHandle)
+
+-- Check both conditions - T90 is current AND probe is deployed
+if currentTool ~= 90 or probeDeployed ~= 1 then
+    -- Determine parent window
+    local parent = wx.NULL
+    local app = wx.wxGetApp()
+    if app then
+        local ok, top = pcall(function() return app:GetTopWindow() end)
+        if ok and top then parent = top end
+    end
+    
+    -- Show error dialog
+    local dlgW, dlgH = 340, 200
+    local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
+    local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
+    local posX = math.floor((sw - dlgW) / 2)
+    local posY = math.floor((sh - dlgH) / 2)
+    
+    local errorDlg = wx.wxDialog(parent, wx.wxID_ANY,
+        "Probe Not Active",
+        wx.wxPoint(posX, posY), wx.wxSize(dlgW, dlgH),
+        wx.wxDEFAULT_DIALOG_STYLE)
+    
+    local panel = wx.wxPanel(errorDlg, wx.wxID_ANY)
+    local sizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    -- Error message
+    local msg = wx.wxStaticText(panel, wx.wxID_ANY,
+        "Please activate T90 (probe) before using outside center probe.\n\n" ..
+        "Click 'Change Tool to T90' to activate the probe,\n" ..
+        "or 'Cancel' to exit.")
+    msg:SetFont(wx.wxFont(10, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
+    sizer:Add(msg, 1, wx.wxALL + wx.wxALIGN_CENTER, 20)
+    
+    -- Button sizer
+    local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    
+    -- Change Tool button
+    local changeBtn = wx.wxButton(panel, wx.wxID_ANY, "Change Tool to T90")
+    changeBtn:SetMinSize(wx.wxSize(130, 28))
+    btnSizer:Add(changeBtn, 0, wx.wxRIGHT, 10)
+    
+    -- Cancel button
+    local cancelBtn = wx.wxButton(panel, wx.wxID_CANCEL, "Cancel")
+    cancelBtn:SetMinSize(wx.wxSize(90, 28))
+    btnSizer:Add(cancelBtn, 0, wx.wxLEFT, 0)
+    
+    sizer:Add(btnSizer, 0, wx.wxALIGN_CENTER + wx.wxBOTTOM, 15)
+    
+    -- Handle Change Tool button
+    changeBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function(event)
+        errorDlg:EndModal(wx.wxID_YES)  -- Use YES as indicator to change tool
+    end)
+    
+    panel:SetSizer(sizer)
+    errorDlg:Centre()
+    
+    local result = errorDlg:ShowModal()
+    errorDlg:Destroy()
+    
+    if result == wx.wxID_YES then
+        -- Execute tool change and exit - user will need to click probe again
+        mc.mcCntlGcodeExecuteWait(inst, "T90 M6")
+        mc.mcCntlSetLastError(inst, "T90 activated - click Outside Center Probe again to continue")
+        return
+    else
+        return  -- User cancelled
+    end
 end
 
 -- Helper functions for profile storage
@@ -43,20 +117,20 @@ local lastPlusXMin = ProfileGetFloat("OutsideCenter", "PlusXMin", 0.5)
 local lastMinusXMin = ProfileGetFloat("OutsideCenter", "MinusXMin", 0.5)
 local lastPlusYMin = ProfileGetFloat("OutsideCenter", "PlusYMin", 0.5)
 local lastMinusYMin = ProfileGetFloat("OutsideCenter", "MinusYMin", 0.5)
-local lastTolerance = ProfileGetFloat("OutsideCenter", "Tolerance", 1.0)
+-- Load auto-center dimensions separately
+local lastXWidth = ProfileGetFloat("OutsideCenter", "XWidth", 1.0)
+local lastYWidth = ProfileGetFloat("OutsideCenter", "YWidth", 1.0)
+local lastOffset = ProfileGetFloat("OutsideCenter", "Offset", 1.0)
 local lastZDrop = ProfileGetFloat("OutsideCenter", "ZDrop", 0.5)
 local lastAction = ProfileGetInt("OutsideCenter", "ActionMode", 1)
-local lastOffset = ProfileGetInt("OutsideCenter", "OffsetMode", 1)
 local lastAutoCenter = ProfileGetInt("OutsideCenter", "AutoCenter", 0)
+local lastZProbe = ProfileGetInt("OutsideCenter", "PerformZProbe", 0)
 
--- Declare saved value variables BEFORE any usage
+-- Saved values for mode switching
 local savedPlusX = lastPlusXMin
 local savedMinusX = lastMinusXMin
 local savedPlusY = lastPlusYMin
 local savedMinusY = lastMinusYMin
-
--- Declare UI elements that will be used in functions
-local xCenterRangeText, yCenterRangeText
 
 -- Determine parent window
 local parent = wx.NULL
@@ -67,7 +141,7 @@ if app then
 end
 
 -- Dialog dimensions
-local dlgW, dlgH = 560, 520
+local dlgW, dlgH = 560, 580
 local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
 local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
 local posX = math.floor((sw - dlgW) / 2)
@@ -83,20 +157,80 @@ local dlg = wx.wxDialog(parent, wx.wxID_ANY,
 local panel = wx.wxPanel(dlg, wx.wxID_ANY)
 local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
 
--- Instructions text (no box, just text at top)
-local instructText = wx.wxStaticText(panel, wx.wxID_ANY,
+-- Declare all UI elements that will be used in functions
+local datumText, instructText, axisRadio, actionRadio, zProbeCheck
+local autoCenterCheck, noteText
+local minusXLabel, minusXInput, plusXLabel, plusXInput, xMaxText
+local minusYLabel, minusYInput, plusYLabel, plusYInput, yMaxText
+local xWidthLabel, xWidthInput, xCenterRangeText
+local yWidthLabel, yWidthInput, yCenterRangeText
+local offsetLabel, offsetInput, dropLabel, dropInput
+
+-- Create controls
+datumText = wx.wxStaticText(panel, wx.wxID_ANY, "")
+datumText:SetFont(wx.wxFont(9, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
+
+instructText = wx.wxStaticText(panel, wx.wxID_ANY,
     "Position the probe above the rectangular feature before starting:\n" ..
-    "• Probe will move outward, descend, then probe inward")
+    "• Probe will move outward, descend, then probe inward\n" ..
+    "• Ensure adequate clearance for probe movements")
 instructText:SetFont(wx.wxFont(9, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
+
+local axisChoices = {"X Axis Only", "Y Axis Only", "Both Axes"}
+axisRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
+    "Probe Axes", wx.wxDefaultPosition, wx.wxDefaultSize,
+    axisChoices, 3, wx.wxRA_SPECIFY_COLS)
+axisRadio:SetSelection(lastAxisMode - 1)
+
+zProbeCheck = wx.wxCheckBox(panel, wx.wxID_ANY, "Perform Z Probe")
+zProbeCheck:SetValue(lastZProbe == 1)
+zProbeCheck:SetToolTip("Also probe the top surface to set Z datum")
+
+local actionChoices = {"Set Datum", "Print Coords"}
+actionRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
+    "Action", wx.wxDefaultPosition, wx.wxDefaultSize,
+    actionChoices, 2, wx.wxRA_SPECIFY_COLS)
+actionRadio:SetSelection(lastAction - 1)
+
+-- Function to update datum description
+local function UpdateDatumDescription()
+    local action = actionRadio:GetSelection() + 1
+    local zProbe = zProbeCheck:GetValue()
+    local axisSel = axisRadio:GetSelection() + 1
+    
+    local axisStr = ""
+    if axisSel == 1 then
+        axisStr = "X"
+    elseif axisSel == 2 then
+        axisStr = "Y"
+    else
+        axisStr = "X Y"
+    end
+    
+    local description = ""
+    if action == 1 then  -- Set Datum
+        if zProbe then
+            description = "Datum will be set to:\n• " .. axisStr .. " at rectangle center\n• Z0 at top surface"
+        else
+            description = "Datum will be set to:\n• " .. axisStr .. " at rectangle center\n• Z unchanged"
+        end
+    else  -- Print Coords
+        if zProbe then
+            description = "Will print machine coordinates of:\n• Rectangle center (" .. axisStr .. ")\n• Top surface (Z)"
+        else
+            description = "Will print machine coordinates of:\n• Rectangle center (" .. axisStr .. ") only"
+        end
+    end
+    datumText:SetLabel(description)
+    panel:Layout()
+end
+
+-- Build the UI layout
+-- Instructions (plain text, no box)
 mainSizer:Add(instructText, 0, wx.wxALL, 10)
 
 -- Axis selection
 local axisBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Axis Selection")
-local axisChoices = {"X Axis Only", "Y Axis Only", "Both Axes"}
-local axisRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
-    "Probe Axes", wx.wxDefaultPosition, wx.wxDefaultSize,
-    axisChoices, 3, wx.wxRA_SPECIFY_COLS)
-axisRadio:SetSelection(lastAxisMode - 1)
 axisBox:Add(axisRadio, 0, wx.wxEXPAND + wx.wxALL, 5)
 mainSizer:Add(axisBox, 0, wx.wxALL + wx.wxEXPAND, 10)
 
@@ -105,12 +239,12 @@ local paramBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Distance Parameters"
 local paramSizer = wx.wxBoxSizer(wx.wxVERTICAL)
 
 -- Auto-center checkbox
-local autoCenterCheck = wx.wxCheckBox(panel, wx.wxID_ANY, "Start From Center Mode (enter total width/height)")
+autoCenterCheck = wx.wxCheckBox(panel, wx.wxID_ANY, "Start From Center Mode (enter total width)")
 autoCenterCheck:SetValue(lastAutoCenter == 1)
 paramSizer:Add(autoCenterCheck, 0, wx.wxALL, 5)
 
 -- Note about distances
-local noteText = wx.wxStaticText(panel, wx.wxID_ANY, 
+noteText = wx.wxStaticText(panel, wx.wxID_ANY, 
     "Min distances: starting search distance from current position")
 noteText:SetFont(wx.wxFont(8, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
 paramSizer:Add(noteText, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, 5)
@@ -118,39 +252,39 @@ paramSizer:Add(noteText, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, 5)
 -- X axis inputs on one line
 local xSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
 
-local minusXLabel = wx.wxStaticText(panel, wx.wxID_ANY, "-X Travel:")
+minusXLabel = wx.wxStaticText(panel, wx.wxID_ANY, "-X Travel:")
 xSizer:Add(minusXLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
-local minusXInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastMinusXMin),
-                                 wx.wxDefaultPosition, wx.wxSize(70, -1))
+minusXInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastMinusXMin),
+                           wx.wxDefaultPosition, wx.wxSize(70, -1))
 minusXInput:SetToolTip("Minimum distance to move in -X")
 xSizer:Add(minusXInput, 0, wx.wxRIGHT, 10)
 
-local plusXLabel = wx.wxStaticText(panel, wx.wxID_ANY, "+X Travel:")
+plusXLabel = wx.wxStaticText(panel, wx.wxID_ANY, "+X Travel:")
 xSizer:Add(plusXLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
-local plusXInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastPlusXMin), 
-                                wx.wxDefaultPosition, wx.wxSize(70, -1))
+plusXInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastPlusXMin), 
+                          wx.wxDefaultPosition, wx.wxSize(70, -1))
 plusXInput:SetToolTip("Minimum distance to move in +X")
 xSizer:Add(plusXInput, 0, wx.wxRIGHT, 10)
 
 paramSizer:Add(xSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
 
 -- X range display (below the inputs)
-local xMaxText = wx.wxStaticText(panel, wx.wxID_ANY, "")
+xMaxText = wx.wxStaticText(panel, wx.wxID_ANY, "")
 xMaxText:SetForegroundColour(wx.wxColour(64, 64, 64))
 xMaxText:SetFont(wx.wxFont(8, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
 paramSizer:Add(xMaxText, 0, wx.wxLEFT + wx.wxRIGHT, 10)
 
 -- X width input for center mode (initially hidden)
 local xWidthSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
-local xWidthLabel = wx.wxStaticText(panel, wx.wxID_ANY, "X Width:")
+xWidthLabel = wx.wxStaticText(panel, wx.wxID_ANY, "X Width:")
 xWidthSizer:Add(xWidthLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
-local xWidthInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastPlusXMin + lastMinusXMin),
-                                 wx.wxDefaultPosition, wx.wxSize(100, -1))
+xWidthInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastXWidth),
+                           wx.wxDefaultPosition, wx.wxSize(100, -1))
 xWidthInput:SetToolTip("Total width of the feature in X")
 xWidthSizer:Add(xWidthInput, 0, wx.wxRIGHT, 10)
 xWidthSizer:AddStretchSpacer()  -- Push content to the left
 
--- Initially hide the width sizer
+-- Initially hide the width controls
 xWidthLabel:Hide()
 xWidthInput:Hide()
 
@@ -166,45 +300,45 @@ paramSizer:Add(xCenterRangeText, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, 10)
 -- Y axis inputs on one line
 local ySizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
 
-local minusYLabel = wx.wxStaticText(panel, wx.wxID_ANY, "-Y Travel:")
+minusYLabel = wx.wxStaticText(panel, wx.wxID_ANY, "-Y Travel:")
 ySizer:Add(minusYLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
-local minusYInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastMinusYMin),
-                                 wx.wxDefaultPosition, wx.wxSize(70, -1))
+minusYInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastMinusYMin),
+                           wx.wxDefaultPosition, wx.wxSize(70, -1))
 minusYInput:SetToolTip("Minimum distance to move in -Y")
 ySizer:Add(minusYInput, 0, wx.wxRIGHT, 10)
 
-local plusYLabel = wx.wxStaticText(panel, wx.wxID_ANY, "+Y Travel:")
+plusYLabel = wx.wxStaticText(panel, wx.wxID_ANY, "+Y Travel:")
 ySizer:Add(plusYLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
-local plusYInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastPlusYMin),
-                                wx.wxDefaultPosition, wx.wxSize(70, -1))
+plusYInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastPlusYMin),
+                          wx.wxDefaultPosition, wx.wxSize(70, -1))
 plusYInput:SetToolTip("Minimum distance to move in +Y")
 ySizer:Add(plusYInput, 0, wx.wxRIGHT, 10)
 
 paramSizer:Add(ySizer, 0, wx.wxEXPAND + wx.wxALL, 5)
 
 -- Y range display (below the inputs)
-local yMaxText = wx.wxStaticText(panel, wx.wxID_ANY, "")
+yMaxText = wx.wxStaticText(panel, wx.wxID_ANY, "")
 yMaxText:SetForegroundColour(wx.wxColour(64, 64, 64))
 yMaxText:SetFont(wx.wxFont(8, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
 paramSizer:Add(yMaxText, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, 10)
 
--- Y height input for center mode (initially hidden)
-local yHeightSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
-local yHeightLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Y Height:")
-yHeightSizer:Add(yHeightLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
-local yHeightInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastPlusYMin + lastMinusYMin),
-                                  wx.wxDefaultPosition, wx.wxSize(100, -1))
-yHeightInput:SetToolTip("Total height of the feature in Y")
-yHeightSizer:Add(yHeightInput, 0, wx.wxRIGHT, 10)
-yHeightSizer:AddStretchSpacer()  -- Push content to the left
+-- Y width input for center mode (changed from Height to Width)
+local yWidthSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+yWidthLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Y Width:")  -- Changed from "Y Height"
+yWidthSizer:Add(yWidthLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+yWidthInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastYWidth),
+                            wx.wxDefaultPosition, wx.wxSize(100, -1))
+yWidthInput:SetToolTip("Total width of the feature in Y")  -- Changed tooltip
+yWidthSizer:Add(yWidthInput, 0, wx.wxRIGHT, 10)
+yWidthSizer:AddStretchSpacer()  -- Push content to the left
 
--- Initially hide the height sizer
-yHeightLabel:Hide()
-yHeightInput:Hide()
+-- Initially hide the width controls
+yWidthLabel:Hide()
+yWidthInput:Hide()
 
-paramSizer:Add(yHeightSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
+paramSizer:Add(yWidthSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
 
--- Y range display for center mode (below the height input)
+-- Y range display for center mode (below the width input)
 yCenterRangeText = wx.wxStaticText(panel, wx.wxID_ANY, "")
 yCenterRangeText:SetForegroundColour(wx.wxColour(64, 64, 64))
 yCenterRangeText:SetFont(wx.wxFont(8, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
@@ -215,15 +349,15 @@ paramSizer:Add(yCenterRangeText, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, 10)
 local commonGrid = wx.wxFlexGridSizer(2, 2, 5, 10)
 
 -- Offset input
-local offsetLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Offset:")
-local offsetInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastTolerance))
+offsetLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Offset:")
+offsetInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastOffset))
 offsetInput:SetToolTip("Added to all min distances to get max search distance")
 commonGrid:Add(offsetLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxALIGN_RIGHT)
 commonGrid:Add(offsetInput, 0, wx.wxEXPAND)
 
 -- Z drop input
-local dropLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Z Drop:")
-local dropInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastZDrop))
+dropLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Z Drop:")
+dropInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastZDrop))
 dropInput:SetToolTip("How far to descend before probing")
 commonGrid:Add(dropLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxALIGN_RIGHT)
 commonGrid:Add(dropInput, 0, wx.wxEXPAND)
@@ -234,30 +368,16 @@ paramSizer:Add(commonGrid, 0, wx.wxEXPAND + wx.wxALL, 5)
 paramBox:Add(paramSizer, 0, wx.wxEXPAND + wx.wxALL, 0)
 mainSizer:Add(paramBox, 0, wx.wxALL + wx.wxEXPAND, 10)
 
--- Options section - Action and Datum side by side
-local optionsBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Probe Options")
-local optionsSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+-- Options section
+local optionsBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Options")
 
--- Action on the left
-local actionChoices = {"Set Datum", "Print Coords"}
-local actionRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
-    "Action", wx.wxDefaultPosition, wx.wxDefaultSize,
-    actionChoices, 2, wx.wxRA_SPECIFY_COLS)
-actionRadio:SetSelection(lastAction - 1)
-optionsSizer:Add(actionRadio, 1, wx.wxEXPAND + wx.wxRIGHT, 10)
+-- Add Z Probe checkbox
+optionsBox:Add(zProbeCheck, 0, wx.wxALL, 5)
 
--- Datum position on the right
-local datumChoices = {"Probe", "Spindle"}
-local datumRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
-    "Datum Position", wx.wxDefaultPosition, wx.wxDefaultSize,
-    datumChoices, 2, wx.wxRA_SPECIFY_COLS)
-datumRadio:SetSelection(lastOffset - 1)
-optionsSizer:Add(datumRadio, 1, wx.wxEXPAND)
+-- Add Action radio box
+optionsBox:Add(actionRadio, 0, wx.wxEXPAND + wx.wxALL, 5)
 
-optionsBox:Add(optionsSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
 mainSizer:Add(optionsBox, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM + wx.wxEXPAND, 10)
-
--- Define functions before using them in event connections
 
 -- Function to update max distance display
 local function UpdateMaxDisplay()
@@ -266,23 +386,23 @@ local function UpdateMaxDisplay()
     if autoCenterCheck:GetValue() then
         -- Auto-center mode - show ranges from center
         local xWidth = tonumber(xWidthInput:GetValue()) or 0
-        local yHeight = tonumber(yHeightInput:GetValue()) or 0
+        local yWidth = tonumber(yWidthInput:GetValue()) or 0
         local axisSel = axisRadio:GetSelection() + 1
         
         -- Update X range for center mode
         if (axisSel == 1 or axisSel == 3) and xWidth > 0 and offset > 0 then
             local halfX = xWidth / 2
             xCenterRangeText:SetLabel(string.format("X Range: ±%.3f to ±%.3f from center", 
-                                   halfX, halfX + offset))
+                                                   halfX, halfX + offset))
         else
             xCenterRangeText:SetLabel("")
         end
         
         -- Update Y range for center mode
-        if (axisSel == 2 or axisSel == 3) and yHeight > 0 and offset > 0 then
-            local halfY = yHeight / 2
+        if (axisSel == 2 or axisSel == 3) and yWidth > 0 and offset > 0 then
+            local halfY = yWidth / 2
             yCenterRangeText:SetLabel(string.format("Y Range: ±%.3f to ±%.3f from center", 
-                                               halfY, halfY + offset))
+                                                   halfY, halfY + offset))
         else
             yCenterRangeText:SetLabel("")
         end
@@ -298,9 +418,9 @@ local function UpdateMaxDisplay()
         local plusXMin = tonumber(plusXInput:GetValue()) or 0
         local minusXMin = tonumber(minusXInput:GetValue()) or 0
         if plusXMin >= 0 and minusXMin >= 0 and offset > 0 then
-            xMaxText:SetLabel(string.format("Range: ±X %.3f-%.3f, ±X %.3f-%.3f", 
-                             plusXMin, plusXMin + offset,
-                             minusXMin, minusXMin + offset))
+            xMaxText:SetLabel(string.format("Range: +X %.3f-%.3f, -X %.3f-%.3f", 
+                                          plusXMin, plusXMin + offset,
+                                          minusXMin, minusXMin + offset))
         else
             xMaxText:SetLabel("")
         end
@@ -308,9 +428,9 @@ local function UpdateMaxDisplay()
         local plusYMin = tonumber(plusYInput:GetValue()) or 0
         local minusYMin = tonumber(minusYInput:GetValue()) or 0
         if plusYMin >= 0 and minusYMin >= 0 and offset > 0 then
-            yMaxText:SetLabel(string.format("Range: ±Y %.3f-%.3f, ±Y %.3f-%.3f", 
-                             plusYMin, plusYMin + offset,
-                             minusYMin, minusYMin + offset))
+            yMaxText:SetLabel(string.format("Range: +Y %.3f-%.3f, -Y %.3f-%.3f", 
+                                          plusYMin, plusYMin + offset,
+                                          minusYMin, minusYMin + offset))
         else
             yMaxText:SetLabel("")
         end
@@ -330,12 +450,12 @@ local function UpdateVisibility()
     minusXInput:Show(showX and not isAutoCenter)
     plusXLabel:Show(showX and not isAutoCenter)
     plusXInput:Show(showX and not isAutoCenter)
-    xMaxText:Show(showX and not isAutoCenter)  -- Show range below inputs in individual mode
+    xMaxText:Show(showX and not isAutoCenter)
     
     -- Center mode controls
     xWidthLabel:Show(showX and isAutoCenter)
     xWidthInput:Show(showX and isAutoCenter)
-    xCenterRangeText:Show(showX and isAutoCenter)  -- Show X range for center mode
+    xCenterRangeText:Show(showX and isAutoCenter)
     
     -- Show/hide Y inputs
     local showY = (axisSel == 2 or axisSel == 3)
@@ -345,12 +465,12 @@ local function UpdateVisibility()
     minusYInput:Show(showY and not isAutoCenter)
     plusYLabel:Show(showY and not isAutoCenter)
     plusYInput:Show(showY and not isAutoCenter)
-    yMaxText:Show(showY and not isAutoCenter)  -- Show range below inputs in individual mode
+    yMaxText:Show(showY and not isAutoCenter)
     
     -- Center mode controls
-    yHeightLabel:Show(showY and isAutoCenter)
-    yHeightInput:Show(showY and isAutoCenter)
-    yCenterRangeText:Show(showY and isAutoCenter)  -- Show Y range for center mode
+    yWidthLabel:Show(showY and isAutoCenter)
+    yWidthInput:Show(showY and isAutoCenter)
+    yCenterRangeText:Show(showY and isAutoCenter)
     
     -- Update max displays
     UpdateMaxDisplay()
@@ -361,36 +481,28 @@ local function UpdateVisibility()
 end
 
 -- Function to handle auto-center mode
+-- IMPORTANT: This maintains separate state for individual and auto-center modes
+-- Individual values are preserved in savedPlusX/savedMinusX variables and in the profile
+-- Auto-center widths are stored separately and never overwrite individual values
 local function UpdateAutoCenter()
     local isChecked = autoCenterCheck:GetValue()
     
     if isChecked then
-        -- Save current individual values before hiding
-        savedPlusX = tonumber(plusXInput:GetValue()) or 0
-        savedMinusX = tonumber(minusXInput:GetValue()) or 0
-        savedPlusY = tonumber(plusYInput:GetValue()) or 0
-        savedMinusY = tonumber(minusYInput:GetValue()) or 0
+        -- Save current individual values before switching to auto-center
+        savedPlusX = tonumber(plusXInput:GetValue()) or savedPlusX
+        savedMinusX = tonumber(minusXInput:GetValue()) or savedMinusX
+        savedPlusY = tonumber(plusYInput:GetValue()) or savedPlusY
+        savedMinusY = tonumber(minusYInput:GetValue()) or savedMinusY
         
-        -- Update width/height fields with totals
-        xWidthInput:SetValue(string.format("%.4f", savedPlusX + savedMinusX))
-        yHeightInput:SetValue(string.format("%.4f", savedPlusY + savedMinusY))
+        -- Set width fields to saved auto-center values (not calculated from individual)
+        xWidthInput:SetValue(string.format("%.4f", lastXWidth))
+        yWidthInput:SetValue(string.format("%.4f", lastYWidth))
     else
         -- Restore individual values when unchecking
-        if savedPlusX and savedMinusX and savedPlusY and savedMinusY then
-            plusXInput:SetValue(string.format("%.4f", savedPlusX))
-            minusXInput:SetValue(string.format("%.4f", savedMinusX))
-            plusYInput:SetValue(string.format("%.4f", savedPlusY))
-            minusYInput:SetValue(string.format("%.4f", savedMinusY))
-        else
-            -- Fallback: split width/height evenly if no saved values
-            local xWidth = tonumber(xWidthInput:GetValue()) or 0
-            local yHeight = tonumber(yHeightInput:GetValue()) or 0
-            
-            plusXInput:SetValue(string.format("%.4f", xWidth / 2))
-            minusXInput:SetValue(string.format("%.4f", xWidth / 2))
-            plusYInput:SetValue(string.format("%.4f", yHeight / 2))
-            minusYInput:SetValue(string.format("%.4f", yHeight / 2))
-        end
+        plusXInput:SetValue(string.format("%.4f", savedPlusX))
+        minusXInput:SetValue(string.format("%.4f", savedMinusX))
+        plusYInput:SetValue(string.format("%.4f", savedPlusY))
+        minusYInput:SetValue(string.format("%.4f", savedMinusY))
     end
     
     UpdateVisibility()
@@ -398,7 +510,10 @@ end
 
 -- If auto-center was previously checked, set up the UI accordingly
 if lastAutoCenter == 1 then
-    -- Width/height fields already have the correct values from initialization
+    -- Keep the width fields with their saved values
+    xWidthInput:SetValue(string.format("%.4f", lastXWidth))
+    yWidthInput:SetValue(string.format("%.4f", lastYWidth))
+    
     local axisSel = axisRadio:GetSelection() + 1
     local showX = (axisSel == 1 or axisSel == 3)
     local showY = (axisSel == 2 or axisSel == 3)
@@ -415,29 +530,45 @@ if lastAutoCenter == 1 then
     xMaxText:Hide()
     yMaxText:Hide()
     
-    -- Show the width/height fields based on axis selection
+    -- Show the width fields based on axis selection
     xWidthLabel:Show(showX)
     xWidthInput:Show(showX)
     xCenterRangeText:Show(showX)
-    yHeightLabel:Show(showY)
-    yHeightInput:Show(showY)
+    yWidthLabel:Show(showY)
+    yWidthInput:Show(showY)
     yCenterRangeText:Show(showY)
 end
 
 -- Connect events
-axisRadio:Connect(wx.wxEVT_COMMAND_RADIOBOX_SELECTED, UpdateVisibility)
 plusXInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateMaxDisplay)
 minusXInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateMaxDisplay)
 plusYInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateMaxDisplay)
 minusYInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateMaxDisplay)
 xWidthInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateMaxDisplay)
-yHeightInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateMaxDisplay)
+yWidthInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateMaxDisplay)
 offsetInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateMaxDisplay)
 autoCenterCheck:Connect(wx.wxEVT_COMMAND_CHECKBOX_CLICKED, UpdateAutoCenter)
 
--- Initial visibility update
+zProbeCheck:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_CHECKBOX_CLICKED, function(event)
+    UpdateDatumDescription()
+end)
+
+actionRadio:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_RADIOBOX_SELECTED, function(event)
+    UpdateDatumDescription()
+end)
+
+axisRadio:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_RADIOBOX_SELECTED, function(event)
+    UpdateDatumDescription()
+    UpdateVisibility()
+end)
+
+-- Initial updates
 UpdateVisibility()
 UpdateMaxDisplay()
+UpdateDatumDescription()
+
+-- Add datum text at bottom (no box, just text)
+mainSizer:Add(datumText, 0, wx.wxALL + wx.wxALIGN_CENTER, 10)
 
 -- Spacer - Add fixed size spacer instead of stretch spacer to prevent button squishing
 mainSizer:Add(0, 20, 0, wx.wxEXPAND)
@@ -466,23 +597,27 @@ dlg:Centre()
 if dlg:ShowModal() == wx.wxID_OK then
     -- Get values
     local axisSel = axisRadio:GetSelection() + 1
-    local isAutoCenter = autoCenterCheck:GetValue()  -- CAPTURE THIS BEFORE DESTROYING DIALOG
+    local isAutoCenter = autoCenterCheck:GetValue()
     local offset = tonumber(offsetInput:GetValue())
     local zDrop = tonumber(dropInput:GetValue())
-    local offsetSel = datumRadio:GetSelection() + 1
     local actionSel = actionRadio:GetSelection() + 1
+    local performZProbe = zProbeCheck:GetValue()
     
     -- Handle auto-center mode
     local plusXMin, minusXMin, plusYMin, minusYMin
     
     if isAutoCenter then
-        -- In auto-center mode, the input is total width/height
+        -- In auto-center mode, the input is total width
         local xWidth = tonumber(xWidthInput:GetValue()) or 0
-        local yHeight = tonumber(yHeightInput:GetValue()) or 0
+        local yWidth = tonumber(yWidthInput:GetValue()) or 0
         plusXMin = xWidth / 2
         minusXMin = xWidth / 2
-        plusYMin = yHeight / 2
-        minusYMin = yHeight / 2
+        plusYMin = yWidth / 2
+        minusYMin = yWidth / 2
+        
+        -- Save auto-center dimensions separately
+        ProfileSetFloat("OutsideCenter", "XWidth", xWidth)
+        ProfileSetFloat("OutsideCenter", "YWidth", yWidth)
     else
         -- Normal mode - read all values
         plusXMin = tonumber(plusXInput:GetValue())
@@ -533,25 +668,20 @@ if dlg:ShowModal() == wx.wxID_OK then
     -- Save settings
     ProfileSetInt("OutsideCenter", "AxisMode", axisSel)
     ProfileSetInt("OutsideCenter", "AutoCenter", isAutoCenter and 1 or 0)
+    ProfileSetInt("OutsideCenter", "PerformZProbe", performZProbe and 1 or 0)
     
-    -- Always save the actual min values (not the converted width/height)
-    if savedPlusX and savedMinusX and savedPlusY and savedMinusY and isAutoCenter then
-        -- If in auto-center mode, save the stored individual values
-        ProfileSetFloat("OutsideCenter", "PlusXMin", savedPlusX)
-        ProfileSetFloat("OutsideCenter", "MinusXMin", savedMinusX)
-        ProfileSetFloat("OutsideCenter", "PlusYMin", savedPlusY)
-        ProfileSetFloat("OutsideCenter", "MinusYMin", savedMinusY)
-    else
-        -- Otherwise save the current values
+    -- CRITICAL FIX: Only save individual values when NOT in auto-center mode
+    -- This preserves the original individual values when using auto-center
+    if not isAutoCenter then
         ProfileSetFloat("OutsideCenter", "PlusXMin", plusXMin or 0.5)
         ProfileSetFloat("OutsideCenter", "MinusXMin", minusXMin or 0.5)
         ProfileSetFloat("OutsideCenter", "PlusYMin", plusYMin or 0.5)
         ProfileSetFloat("OutsideCenter", "MinusYMin", minusYMin or 0.5)
     end
+    -- Auto-center dimensions are already saved separately above (lines 449-450)
     
-    ProfileSetFloat("OutsideCenter", "Tolerance", offset)  -- Keep as Tolerance for backward compatibility
+    ProfileSetFloat("OutsideCenter", "Offset", offset)
     ProfileSetFloat("OutsideCenter", "ZDrop", zDrop)
-    ProfileSetInt("OutsideCenter", "OffsetMode", offsetSel)
     ProfileSetInt("OutsideCenter", "ActionMode", actionSel)
     
     dlg:Destroy()
@@ -637,22 +767,24 @@ if dlg:ShowModal() == wx.wxID_OK then
         
         if axisSel == 1 or axisSel == 3 then  -- X or Both
             table.insert(directions, {name = "+X", x = 1, y = 0, probe = "S2 M311",  -- Move +X, probe -X inward
-                                    minDist = plusXMin, maxDist = plusXMin + offset})
+                                     minDist = plusXMin, maxDist = plusXMin + offset})
             table.insert(directions, {name = "-X", x = -1, y = 0, probe = "S1 M311",  -- Move -X, probe +X inward
-                                    minDist = minusXMin, maxDist = minusXMin + offset})
+                                     minDist = minusXMin, maxDist = minusXMin + offset})
         end
         
         if axisSel == 2 or axisSel == 3 then  -- Y or Both
             table.insert(directions, {name = "+Y", x = 0, y = 1, probe = "S4 M311",  -- Move +Y, probe -Y inward
-                                    minDist = plusYMin, maxDist = plusYMin + offset})
+                                     minDist = plusYMin, maxDist = plusYMin + offset})
             table.insert(directions, {name = "-Y", x = 0, y = -1, probe = "S3 M311",  -- Move -Y, probe +Y inward
-                                    minDist = minusYMin, maxDist = minusYMin + offset})
+                                     minDist = minusYMin, maxDist = minusYMin + offset})
         end
         
         -- Probe each direction
         for i, dir in ipairs(directions) do
             local currentDist = dir.minDist
             local success = false
+            local attemptNum = 0
+            local maxAttempts = math.ceil((dir.maxDist - dir.minDist) / stepIncrement) + 1
             
             -- For Y-axis probes, start from X center if we already have X measurements
             local probeStartX = startX
@@ -670,6 +802,8 @@ if dlg:ShowModal() == wx.wxID_OK then
             end
             
             while not success and currentDist <= dir.maxDist do
+                attemptNum = attemptNum + 1
+                
                 -- 1. Move to distance position (RAPID)
                 local targetX = probeStartX + (dir.x * currentDist)
                 local targetY = probeStartY + (dir.y * currentDist)
@@ -684,11 +818,16 @@ if dlg:ShowModal() == wx.wxID_OK then
                 -- Check if we hit something during Z drop
                 local actualZ = mc.mcAxisGetPos(inst, mc.Z_AXIS)
                 if math.abs(actualZ - targetZ) > 0.001 then
-                    -- Hit something - log the Z collision
+                    -- Hit something - log the Z collision with attempt info
                     LogProbeEvent("G31.1-Z", 
                         mc.mcAxisGetPos(inst, mc.X_AXIS),
                         mc.mcAxisGetPos(inst, mc.Y_AXIS),
                         actualZ)
+                    
+                    -- Show retry status
+                    mc.mcCntlSetLastError(inst, string.format(
+                        "Z collision at %s - retrying at %.3f (attempt %d/%d)", 
+                        dir.name, currentDist, attemptNum, maxAttempts))
                     
                     -- Return to safe height
                     mc.mcCntlGcodeExecuteWait(inst, string.format("G0 Z%.4f", startZ))
@@ -803,6 +942,51 @@ if dlg:ShowModal() == wx.wxID_OK then
             mc.mcCntlGcodeExecuteWait(inst, moveCmd)
         end
         
+        -- 6.5 Perform Z probe if requested
+        local topZ = nil
+        if performZProbe then
+            -- Save current Z position (should be at safe height)
+            local safeZ = mc.mcAxisGetPos(inst, mc.Z_AXIS)
+            
+            -- Perform Z probe using S5 M311
+            local rc = mc.mcCntlGcodeExecuteWait(inst, "S5 M311")
+            
+            if rc ~= mc.MERROR_NOERROR then
+                mc.mcCntlSetLastError(inst, "ERROR: Z probe failed")
+                -- Return to safe height
+                mc.mcCntlGcodeExecuteWait(inst, string.format("G0 Z%.4f", safeZ))
+                return false
+            end
+            
+            -- Get the probed Z position (edge position from M311)
+            topZ = mc.mcCntlGetPoundVar(inst, 391)
+            if type(topZ) ~= "number" or topZ < -1e300 then
+                mc.mcCntlSetLastError(inst, "ERROR: Z probe no contact")
+                mc.mcCntlGcodeExecuteWait(inst, string.format("G0 Z%.4f", safeZ))
+                return false
+            end
+            
+            -- Log the Z probe
+            LogProbeEvent("S5 M311", centerX or startX, centerY or startY, topZ)
+            
+            -- Return to safe height after Z probe
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G0 Z%.4f", safeZ))
+            
+            -- Update status with Z info
+            if widthX and widthY then
+                mc.mcCntlSetLastError(inst, string.format("Rectangle: X=%.4f Y=%.4f, Top Z=%.4f", 
+                                                          widthX, widthY, topZ))
+            elseif widthX then
+                mc.mcCntlSetLastError(inst, string.format("Rectangle: X=%.4f, Top Z=%.4f", 
+                                                          widthX, topZ))
+            elseif widthY then
+                mc.mcCntlSetLastError(inst, string.format("Rectangle: Y=%.4f, Top Z=%.4f", 
+                                                          widthY, topZ))
+            else
+                mc.mcCntlSetLastError(inst, string.format("Top Z=%.4f", topZ))
+            end
+        end
+        
         -- 7. Set datum or print results
         if actionSel == 1 then  -- Set Datum
             -- Get current work offset
@@ -812,54 +996,72 @@ if dlg:ShowModal() == wx.wxID_OK then
                 currentOffset = math.floor(modalOffset + 0.5)
             end
             
-            -- CORRECTED Work offset variable mapping (verified by tests)
+            -- Work offset variable mapping
             local workOffsetVars = {
-                [54] = {x = 5221, y = 5222, z = 5223},  -- G54 CORRECT
-                [55] = {x = 5241, y = 5242, z = 5243},  -- G55 CORRECT
-                [56] = {x = 5261, y = 5262, z = 5263},  -- G56 CORRECT
-                [57] = {x = 5281, y = 5282, z = 5283},  -- G57 CORRECT
-                [58] = {x = 5301, y = 5302, z = 5303},  -- G58 CORRECT
-                [59] = {x = 5321, y = 5322, z = 5323}   -- G59 CORRECT
+                [54] = {x = 5221, y = 5222, z = 5223},  -- G54
+                [55] = {x = 5241, y = 5242, z = 5243},  -- G55
+                [56] = {x = 5261, y = 5262, z = 5263},  -- G56
+                [57] = {x = 5281, y = 5282, z = 5283},  -- G57
+                [58] = {x = 5301, y = 5302, z = 5303},  -- G58
+                [59] = {x = 5321, y = 5322, z = 5323}   -- G59
             }
             
             local offsets = workOffsetVars[currentOffset]
             if offsets then
-                -- Get ACTUAL machine position where we want work zero to be
+                -- Calculate ALL machine positions BEFORE modifying any pound vars
                 local centerMachX = nil
                 local centerMachY = nil
+                local topMachZ = nil
                 
-                -- Only set machine coordinates for axes that were probed
+                -- Calculate X machine position if probed
                 if probePoints.xPlus and probePoints.xMinus then
                     centerMachX = mc.mcAxisGetMachinePos(inst, mc.X_AXIS)
-                    -- If spindle offset is selected, adjust for spindle position
-                    -- Probe offset is FROM spindle TO probe, so add to get spindle position
-                    if offsetSel == 2 then
-                        centerMachX = centerMachX + xProbeOffset
-                    end
                 end
                 
+                -- Calculate Y machine position if probed
                 if probePoints.yPlus and probePoints.yMinus then
                     centerMachY = mc.mcAxisGetMachinePos(inst, mc.Y_AXIS)
-                    -- If spindle offset is selected, adjust for spindle position
-                    -- Probe offset is FROM spindle TO probe, so add to get spindle position
-                    if offsetSel == 2 then
-                        centerMachY = centerMachY + yProbeOffset
-                    end
                 end
                 
-                -- Set new work offset values for probed axes only
+                -- Calculate Z machine position if probed
+                if performZProbe and topZ then
+                    -- Calculate the machine position of the surface
+                    local currentMachZ = mc.mcAxisGetMachinePos(inst, mc.Z_AXIS)
+                    local currentWorkZ = mc.mcAxisGetPos(inst, mc.Z_AXIS)
+                    topMachZ = currentMachZ + (topZ - currentWorkZ)
+                    
+                    -- Debug output for Z calculation
+                    mc.mcCntlSetLastError(inst, string.format(
+                        "DEBUG: topZ=%.4f, currentWorkZ=%.4f, currentMachZ=%.4f, calculated=%.4f",
+                        topZ, currentWorkZ, currentMachZ, topMachZ))
+                end
+                
+                -- NOW set the pound variables (after all calculations are done)
                 if centerMachX then
                     mc.mcCntlSetPoundVar(inst, offsets.x, centerMachX)
+                else
+                    -- Keep X unchanged if not probed
+                    local currentXOffset = mc.mcCntlGetPoundVar(inst, offsets.x)
+                    mc.mcCntlSetPoundVar(inst, offsets.x, currentXOffset)
                 end
+                
                 if centerMachY then
                     mc.mcCntlSetPoundVar(inst, offsets.y, centerMachY)
+                else
+                    -- Keep Y unchanged if not probed
+                    local currentYOffset = mc.mcCntlGetPoundVar(inst, offsets.y)
+                    mc.mcCntlSetPoundVar(inst, offsets.y, currentYOffset)
                 end
                 
-                -- Keep the Z offset unchanged
-                local currentZOffset = mc.mcCntlGetPoundVar(inst, offsets.z)
-                mc.mcCntlSetPoundVar(inst, offsets.z, currentZOffset)
+                if topMachZ then
+                    mc.mcCntlSetPoundVar(inst, offsets.z, topMachZ)
+                else
+                    -- Keep Z unchanged if not probed
+                    local currentZOffset = mc.mcCntlGetPoundVar(inst, offsets.z)
+                    mc.mcCntlSetPoundVar(inst, offsets.z, currentZOffset)
+                end
                 
-                -- Force work offset update by executing G10 L2
+                -- Build G10 L2 command using the SAME pre-calculated values
                 local offsetP = currentOffset - 53  -- G54=P1, G55=P2, etc.
                 local g10Command = string.format("G10 L2 P%d", offsetP)
                 
@@ -868,6 +1070,9 @@ if dlg:ShowModal() == wx.wxID_OK then
                 end
                 if centerMachY then
                     g10Command = g10Command .. string.format(" Y%.4f", centerMachY)
+                end
+                if topMachZ then
+                    g10Command = g10Command .. string.format(" Z%.4f", topMachZ)
                 end
                 
                 mc.mcCntlGcodeExecuteWait(inst, g10Command)
@@ -885,6 +1090,9 @@ if dlg:ShowModal() == wx.wxID_OK then
                 elseif centerMachY then
                     setMsg = setMsg .. " Y0"
                 end
+                if performZProbe and topZ then
+                    setMsg = setMsg .. " Z0"
+                end
                 mc.mcCntlSetLastError(inst, setMsg)
             else
                 mc.mcCntlSetLastError(inst, "ERROR: Invalid work offset")
@@ -898,19 +1106,18 @@ if dlg:ShowModal() == wx.wxID_OK then
             local coordMsg = "Rectangle center (machine):"
             
             if probePoints.xPlus and probePoints.xMinus then
-                local displayX = machX
-                if offsetSel == 2 then  -- Adjust for spindle if needed
-                    displayX = machX - xProbeOffset
-                end
-                coordMsg = coordMsg .. string.format(" X%.4f", displayX)
+                coordMsg = coordMsg .. string.format(" X%.4f", machX)
             end
             
             if probePoints.yPlus and probePoints.yMinus then
-                local displayY = machY
-                if offsetSel == 2 then  -- Adjust for spindle if needed
-                    displayY = machY - yProbeOffset
-                end
-                coordMsg = coordMsg .. string.format(" Y%.4f", displayY)
+                coordMsg = coordMsg .. string.format(" Y%.4f", machY)
+            end
+            
+            if performZProbe and topZ then
+                -- Calculate machine Z for the top surface
+                local currentZ = mc.mcAxisGetPos(inst, mc.Z_AXIS)
+                local machZ = mc.mcAxisGetMachinePos(inst, mc.Z_AXIS) + (topZ - currentZ)
+                coordMsg = coordMsg .. string.format(", Top: Z%.4f", machZ)
             end
             
             mc.mcCntlSetLastError(inst, coordMsg)

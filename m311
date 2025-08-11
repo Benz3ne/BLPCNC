@@ -1,4 +1,5 @@
---[[ M311: Multi-Direction Double-Tap Probe
+--[[ M311: Multi-Direction Double-Tap Probe with Z Offset Support
+Version: 1.3 (Simplified - Mach4 handles soft limits automatically)
 
 Usage: SN M311 where N is direction (1-5)
   S1 M311  ; Probe +X
@@ -11,6 +12,7 @@ REQUIRED POUND VARIABLES:
 #300 = Probe tip diameter
 #301 = X offset from spindle center to probe tip
 #302 = Y offset from spindle center to probe tip
+#320 = Z offset for probe calibration
 #303 = Fast feedrate for probing
 #304 = Slow feedrate for final probe
 #305 = Maximum travel distance
@@ -19,21 +21,20 @@ REQUIRED POUND VARIABLES:
 
 OUTPUT VARIABLES:
 #389 = Machine coordinate of final probe contact
-#390 = Final probe contact position
-#391 = Edge position (adjusted for probe radius on X/Y, raw contact for Z)
+#390 = Final probe contact position (raw)
+#391 = Edge position (adjusted for probe radius on X/Y, Z offset on Z)
 #392 = Spindle position (adjusted for probe offset)
 
-IMPORTANT: Z-axis probing does NOT apply radius compensation because touch probes
-are calibrated so their trigger point represents the actual surface location.
-Only X/Y axes need radius compensation for side probing.
-
+IMPORTANT: 
+- X/Y axes: Apply radius compensation for side probing
+- Z axis: Apply Z offset calibration from #320
 ]]--
 
 function m311()
     local inst = mc.mcGetInstance()
     
     local function LOG(msg)
-      --  mc.mcCntlSetLastError(inst, "[PROBE] " .. tostring(msg))
+        mc.mcCntlSetLastError(inst, "[PROBE] " .. tostring(msg))
     end
     
     -- Get direction from S value
@@ -44,14 +45,12 @@ function m311()
     end
     
     -- Define probe directions
-    -- dir: direction of probe travel (+1 or -1)
-    -- For boss probing: probe moves TOWARD center (inward)
     local directions = {
-        [1] = {axis = mc.X_AXIS, dir = 1, name = "+X"},   -- Probe moving in +X direction
-        [2] = {axis = mc.X_AXIS, dir = -1, name = "-X"},  -- Probe moving in -X direction
-        [3] = {axis = mc.Y_AXIS, dir = 1, name = "+Y"},   -- Probe moving in +Y direction
-        [4] = {axis = mc.Y_AXIS, dir = -1, name = "-Y"},  -- Probe moving in -Y direction
-        [5] = {axis = mc.Z_AXIS, dir = -1, name = "-Z"}   -- Probe moving in -Z direction
+        [1] = {axis = mc.X_AXIS, dir = 1, name = "+X"},
+        [2] = {axis = mc.X_AXIS, dir = -1, name = "-X"},
+        [3] = {axis = mc.Y_AXIS, dir = 1, name = "+Y"},
+        [4] = {axis = mc.Y_AXIS, dir = -1, name = "-Y"},
+        [5] = {axis = mc.Z_AXIS, dir = -1, name = "-Z"}
     }
     
     local probeInfo = directions[math.floor(direction)]
@@ -67,6 +66,7 @@ function m311()
     local probeDiameter = mc.mcCntlGetPoundVar(inst, 300)
     local xOffset = mc.mcCntlGetPoundVar(inst, 301)
     local yOffset = mc.mcCntlGetPoundVar(inst, 302)
+    local zOffset = mc.mcCntlGetPoundVar(inst, 320)  -- Z calibration offset
     local fastFeed = mc.mcCntlGetPoundVar(inst, 303)
     local slowFeed = mc.mcCntlGetPoundVar(inst, 304)
     local maxTravel = mc.mcCntlGetPoundVar(inst, 305)
@@ -75,11 +75,17 @@ function m311()
     
     -- Validate parameters with sensible defaults
     if type(probeDiameter) ~= "number" or probeDiameter < 0 then 
-        probeDiameter = 0  -- Default to 0 (no compensation)
+        probeDiameter = 0
         LOG("WARNING: Using default probe diameter of 0 (no radius compensation). Set #300 for accurate edge detection.")
     end
     if type(xOffset) ~= "number" then xOffset = 0 end
     if type(yOffset) ~= "number" then yOffset = 0 end
+    if type(zOffset) ~= "number" then 
+        zOffset = 0
+        LOG("INFO: No Z offset calibration (#320 not set)")
+    elseif zOffset ~= 0 then
+        LOG(string.format("INFO: Using Z calibration offset of %.4f\"", zOffset))
+    end
     if type(fastFeed) ~= "number" or fastFeed <= 0 then fastFeed = 20 end
     if type(slowFeed) ~= "number" or slowFeed <= 0 then slowFeed = 3 end
     if type(maxTravel) ~= "number" or maxTravel <= 0 then maxTravel = 1 end
@@ -89,6 +95,10 @@ function m311()
     -- Get starting position in work coordinates
     local startPos = mc.mcAxisGetPos(inst, probeInfo.axis)
     
+    -- =====================================================
+    -- PROBING SEQUENCE
+    -- =====================================================
+    
     -- Ensure absolute positioning and feed per minute mode
     mc.mcCntlGcodeExecuteWait(inst, "G90 G94")
     
@@ -96,12 +106,14 @@ function m311()
     local fastTarget = startPos + (maxTravel * probeInfo.dir)
     local probeCmd = string.format("G31.1 %s%.4f F%.1f", 
                                    axisName, fastTarget, fastFeed)
+    
+    LOG(string.format("Fast probe to %s=%.4f", axisName, fastTarget))
     mc.mcCntlGcodeExecuteWait(inst, probeCmd)
     
     -- Get first contact position
     local contact1 = mc.mcCntlGetPoundVar(inst, poundVarMap[axisName])
     
-    -- Verify probe made contact (didn't reach full travel)
+    -- Verify probe made contact
     local currentPos = mc.mcAxisGetPos(inst, probeInfo.axis)
     if math.abs(currentPos - fastTarget) < 0.001 then
         LOG("ERROR: No probe contact within travel distance")
@@ -130,30 +142,31 @@ function m311()
     -- Get machine coordinate of final position
     local machinePos = mc.mcAxisGetMachinePos(inst, probeInfo.axis)
     
-    -- CALCULATE EDGE POSITION WITH PROBE RADIUS COMPENSATION
+    -- CALCULATE EDGE POSITION WITH APPROPRIATE COMPENSATION
     local edgePosition = finalContact
     local probeRadius = probeDiameter / 2.0
     
-    -- CRITICAL FIX: Z-axis touch probes do NOT need radius compensation
-    -- Touch probes are calibrated so the trigger point IS the surface
     if axisName == "Z" then
-        -- NO compensation for Z - touch probe trigger point represents the actual surface
-        edgePosition = finalContact
-        LOG(string.format("Z probe: contact=%.4f (no radius compensation for touch probe)",
-                          finalContact))
+        -- Apply Z calibration offset for Z-axis probing
+        -- Positive offset moves the measured surface UP (adds to contact position)
+        -- Negative offset moves the measured surface DOWN (subtracts from contact position)
+        edgePosition = finalContact + zOffset
+        
+        if zOffset ~= 0 then
+            LOG(string.format("Z probe: contact=%.4f, Z offset=%.4f, calibrated surface=%.4f",
+                              finalContact, zOffset, edgePosition))
+        else
+            LOG(string.format("Z probe: contact=%.4f (no Z calibration offset)",
+                              finalContact))
+        end
     else
-        -- Apply probe radius compensation for X/Y axes only
-        -- For side probing, we need to account for the probe ball radius
+        -- Apply probe radius compensation for X/Y axes
         edgePosition = finalContact + (probeRadius * probeInfo.dir)
         
         if axisName == "X" then
-            -- When probing +X (dir=1): right edge = contact + radius
-            -- When probing -X (dir=-1): left edge = contact - radius
             LOG(string.format("X probe: contact=%.4f, radius=%.4f, dir=%d, edge=%.4f",
                               finalContact, probeRadius, probeInfo.dir, edgePosition))
         elseif axisName == "Y" then
-            -- When probing +Y (dir=1): top edge = contact + radius
-            -- When probing -Y (dir=-1): bottom edge = contact - radius
             LOG(string.format("Y probe: contact=%.4f, radius=%.4f, dir=%d, edge=%.4f",
                               finalContact, probeRadius, probeInfo.dir, edgePosition))
         end
@@ -162,18 +175,19 @@ function m311()
     -- CALCULATE SPINDLE POSITION (compensate for probe offset from spindle)
     local spindlePosition = edgePosition
     if axisName == "X" then
-        -- X offset is from spindle TO probe, so subtract to get spindle position
         spindlePosition = edgePosition - xOffset
     elseif axisName == "Y" then
-        -- Y offset is from spindle TO probe, so subtract to get spindle position
         spindlePosition = edgePosition - yOffset
+    elseif axisName == "Z" then
+        -- Z axis typically doesn't have spindle offset for touch probes
+        -- The Z offset is already applied as calibration above
+        spindlePosition = edgePosition
     end
-    -- Note: Z axis typically doesn't have spindle offset
     
     -- Store results in pound variables
     mc.mcCntlSetPoundVar(inst, 389, machinePos)      -- Machine coordinate
-    mc.mcCntlSetPoundVar(inst, 390, finalContact)    -- Probe contact position
-    mc.mcCntlSetPoundVar(inst, 391, edgePosition)    -- Edge position (radius compensated for X/Y, raw for Z)
+    mc.mcCntlSetPoundVar(inst, 390, finalContact)    -- Probe contact position (raw)
+    mc.mcCntlSetPoundVar(inst, 391, edgePosition)    -- Edge position (compensated)
     mc.mcCntlSetPoundVar(inst, 392, spindlePosition) -- Spindle position (offset compensated)
     
     -- Final backoff if specified

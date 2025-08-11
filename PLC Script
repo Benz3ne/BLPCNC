@@ -144,41 +144,149 @@ if not _G.toolPLCInit then
     mc.mcToolSetCurrent(inst, 0)
 end
 
+
+
+
+
 -- Function to prompt tool selection
 local function promptToolSelection(isStartup)
     -- CHECK M6 PROTECTION FLAG FIRST
-    local m6Running = mc.mcCntlGetPoundVar(inst, 499) == 1
+    local virtualToolActive = mc.mcCntlGetPoundVar(inst, 406) >= 90
     local suppressPrompt = mc.mcCntlGetPoundVar(inst, 498) == 1
-    
-    if m6Running or suppressPrompt then
-        -- M6 is running - DO NOT prompt
+
+    if virtualToolActive or suppressPrompt then
         return
     end
     
-    if not _G.toolChoices then
-        mc.mcCntlSetLastError(inst, "ERROR: Tool list not populated")
+    -- Build filtered tool list (exclude T0 and virtual tools)
+    local filteredChoices = {}
+    local filteredNumbers = {}
+    
+    if _G.toolChoices and _G.toolNumbers then
+        for i, toolNum in ipairs(_G.toolNumbers) do
+            -- Exclude T0 and virtual tools (90-99)
+            if toolNum > 0 and toolNum < 90 then
+                table.insert(filteredChoices, _G.toolChoices[i])
+                table.insert(filteredNumbers, toolNum)
+            end
+        end
+    end
+    
+    if #filteredChoices == 0 then
+        mc.mcCntlSetLastError(inst, "ERROR: No physical tools configured")
+        -- Set to T1 by default if no tools available
+        mc.mcToolSetCurrent(inst, 1)
+        mc.mcCntlGcodeExecuteWait(inst, "G49")
+        wx.wxMilliSleep(100)
+        mc.mcCntlGcodeExecuteWait(inst, "G43 H1")
         return
     end
     
     local message = isStartup and 
-        "Tool detected in spindle but active tool is T0.\nSelect the actual tool:" or
-        "Tool detected in spindle but active tool is T0.\nSelect the actual tool:"
+        "Tool detected in spindle at startup.\nSelect the actual tool:" or
+        "Tool inserted manually.\nSelect the tool number:"
     
+    -- Create dialog with filtered choices
     local dlg = wx.wxSingleChoiceDialog(wx.NULL, 
         message, 
-        "Tool Mismatch Detected", 
-        _G.toolChoices)
+        isStartup and "Tool Mismatch Detected" or "Tool Confirmation", 
+        filteredChoices)
     
-    if dlg:ShowModal() == wx.wxID_OK then
-    local selection = dlg:GetSelection()  -- 0-based
-    local newTool = _G.toolNumbers[selection + 1]
+    -- Create a timer to handle spindle button while dialog is open
+    local timerPanel = wx.wxPanel(dlg, wx.wxID_ANY)
+    local timer = wx.wxTimer(timerPanel)
+    local spindleCancelled = false
     
-    -- Force PLC to see a change even if same tool selected
-    _G.lastTool = -999
+    -- Get handles for Input 8 and Output 2
+    local input8Handle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT8)
+    local out2Handle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT2)
     
-    mc.mcToolSetCurrent(inst, newTool)
-    wx.wxMilliSleep(50)
-		
+    -- Store initial Input 8 state
+    local lastInput8 = 0
+    if input8Handle and input8Handle > 0 then
+        lastInput8 = mc.mcSignalGetState(input8Handle)
+    end
+    
+    -- Debounce variables
+    local buttonPressStart = 0
+    local buttonHoldRequired = 0.5  -- Require 500ms hold to trigger
+    local buttonHeld = false
+    
+    -- Timer event - runs every 50ms while dialog is open
+    timerPanel:Connect(wx.wxEVT_TIMER, function(event)
+        if not input8Handle or input8Handle <= 0 then
+            return
+        end
+        
+        local currentInput8 = mc.mcSignalGetState(input8Handle)
+        
+        -- ALWAYS mirror Input 8 to Output 2 (this is what PLC normally does)
+        if out2Handle and out2Handle > 0 then
+            mc.mcSignalSetState(out2Handle, currentInput8)
+        end
+        
+        -- Check for button press with debounce
+        if currentInput8 == 1 and lastInput8 == 0 then
+            -- Button just pressed - start timing
+            buttonPressStart = os.clock()
+            buttonHeld = false
+        elseif currentInput8 == 1 and lastInput8 == 1 then
+            -- Button still held - check if held long enough
+            if not buttonHeld and (os.clock() - buttonPressStart) >= buttonHoldRequired then
+                -- Button held long enough - trigger action
+                buttonHeld = true
+                spindleCancelled = true
+                
+                -- Close the dialog immediately
+                dlg:EndModal(wx.wxID_CANCEL)
+                timer:Stop()
+            end
+        elseif currentInput8 == 0 and lastInput8 == 1 then
+            -- Button released - reset
+            buttonPressStart = 0
+            buttonHeld = false
+        end
+        
+        lastInput8 = currentInput8
+    end)
+    
+    -- Start timer (check every 50ms)
+    timer:Start(50)
+    
+    -- Show dialog (this blocks PLC until closed)
+    local result = dlg:ShowModal()
+    
+    -- Stop timer
+    timer:Stop()
+    
+    -- Check how dialog was closed
+    if spindleCancelled then
+        -- Dialog closed by spindle button - user is removing tool
+        -- Set tool to T0
+        mc.mcToolSetCurrent(inst, 0)
+        mc.mcCntlGcodeExecuteWait(inst, "G49")  -- Cancel H offset
+        
+        -- Update display
+        if UpdateToolPreview then
+            UpdateToolPreview()
+        end
+        
+        mc.mcCntlSetLastError(inst, "Tool removed - T0 set")
+        
+        -- DO NOT set any flag to skip next check
+        -- Let the normal PLC flow handle what happens when clamp closes again
+        
+    elseif result == wx.wxID_OK then
+        -- User selected a tool
+        local selection = dlg:GetSelection()  -- 0-based
+        local newTool = filteredNumbers[selection + 1]  -- Use filtered list
+        
+        -- Force PLC to see a change even if same tool selected
+        _G.lastTool = -999
+        
+        mc.mcToolSetCurrent(inst, newTool)
+        wx.wxMilliSleep(50)
+        
         -- SYNC H OFFSET
         mc.mcCntlGcodeExecuteWait(inst, "G49")  -- Cancel first
         wx.wxMilliSleep(100)
@@ -193,44 +301,32 @@ local function promptToolSelection(isStartup)
             -- Verify
             local activeH = mc.mcCntlGetPoundVar(inst, 4120)
             local desc = mc.mcToolGetDesc(inst, newTool) or "Unnamed"
-            if activeH == newTool then
-             --   mc.mcCntlSetLastError(inst, string.format("Tool set to T%d - %s (H%d active)", newTool, desc, newTool))
-            else
-             --   mc.mcCntlSetLastError(inst, string.format("Tool set to T%d - %s (H%.0f WARNING!)", newTool, desc, activeH))
-            end
         else
-         --   mc.mcCntlSetLastError(inst, "Tool set to T0 - No Tool (H offset cancelled)")
             _G.hOffsetLastSync = os.clock()
         end
-        
-        
         
         if UpdateToolPreview then
             UpdateToolPreview()
         end
     else
-        
-        mc.mcToolSetCurrent(inst, 1)
-        
-        
-        mc.mcCntlGcodeExecuteWait(inst, "G49")
-        wx.wxMilliSleep(100)
-        mc.mcCntlGcodeExecuteWait(inst, "G43 H1")
-        
-        -- Record when dialog set the H offset
-        _G.hOffsetLastSync = os.clock()
-        
-        wx.wxMessageBox("Tool selection cancelled.\n\nTool has been set to T1 by default.\nPlease verify the correct tool number.", 
-                       "Tool Set to T1", wx.wxOK + wx.wxICON_WARNING)
-        
-      
-        local activeH = mc.mcCntlGetPoundVar(inst, 4120)
-        if activeH == 1 then
-         --   mc.mcCntlSetLastError(inst, "Tool set to T1 by default (H1 active)")
+        -- User clicked Cancel or closed with X
+        if isStartup then
+            -- At startup, default to T1 for safety
+            mc.mcToolSetCurrent(inst, 1)
+            
+            mc.mcCntlGcodeExecuteWait(inst, "G49")
+            wx.wxMilliSleep(100)
+            mc.mcCntlGcodeExecuteWait(inst, "G43 H1")
+            
+            -- Record when dialog set the H offset
+            _G.hOffsetLastSync = os.clock()
+            
+            wx.wxMessageBox("Tool selection cancelled.\n\nTool has been set to T1 by default.\nPlease verify the correct tool number.", 
+                           "Tool Set to T1", wx.wxOK + wx.wxICON_WARNING)
         else
-         --   mc.mcCntlSetLastError(inst, string.format("Tool set to T1 by default (H%.0f WARNING!)", activeH))
+            -- Manual insertion cancelled - leave at T0
+            wx.wxMessageBox("Tool change cancelled. Tool not updated.", "Info", wx.wxOK + wx.wxICON_INFORMATION)
         end
-     
         
         -- Update the preview label
         if UpdateToolPreview then
@@ -240,6 +336,10 @@ local function promptToolSelection(isStartup)
     
     dlg:Destroy()  -- Always destroy dialog
 end
+
+
+
+
 
 -- Check for enable condition (tool present but T0 active) - ONLY when machine is enabled
 if machEnabled == 1 and not _G.enablePromptDone and _G.toolPresentHandle then
@@ -265,26 +365,7 @@ if currentTool ~= _G.lastTool then
     local toolChangeTime = os.clock()
     _G.lastTool = currentTool
 	
-	--[[
-	-- Virtual Tool Offset Protection  
-    if _G.lastTool >= 90 and currentTool < 90 and mc.mcCntlGetPoundVar(inst, 410) == 1 then
-        -- Restore offsets from saved values
-        for i = 0, 5 do
-            local baseVar = 5221 + (i * 20)
-            local storageBase = 411 + (i * 2)
-            mc.mcCntlSetPoundVar(inst, baseVar, mc.mcCntlGetPoundVar(inst, storageBase))
-            mc.mcCntlSetPoundVar(inst, baseVar + 1, mc.mcCntlGetPoundVar(inst, storageBase + 1))
-        end
-        
-        -- Clear saved flag
-        mc.mcCntlSetPoundVar(inst, 410, 0)
-        
-        -- Safety: ensure hardware is off
-        mc.mcSignalSetState(mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7), 0)  -- Probe
-        mc.mcSignalSetState(mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT1), 0)  -- Laser
-    end
-	]]--
-    
+	
     -- Only sync H offset if machine is idle, no M6 running, and enough time has passed
     local machState = mc.mcCntlGetState(inst)
     local m6Running = mc.mcCntlGetPoundVar(inst, 499) == 1
@@ -582,44 +663,48 @@ end
 -- ============================================
 -- SOFT LIMITS STATE MONITORING
 -- Keeps button synchronized with actual state
+-- FIXED: Now checks actual per-axis states
 -- ============================================
 
--- Get current soft limits state from signal
-local softLimitsHandle = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON)
-
-if softLimitsHandle and softLimitsHandle > 0 then
-    local softLimitsEnabled = mc.mcSignalGetState(softLimitsHandle)
-    
-    -- Check if state has changed
-    if softLimitsEnabled ~= _G.lastSoftLimitsState then
-        -- State changed - update button
-        if softLimitsEnabled == 1 then
-            scr.SetProperty("btnSoftLimits", "Bg Color", "#00FF00")  -- Green
-            scr.SetProperty("btnSoftLimits", "Label", "Soft Limits\nENABLED")
-            
-            -- Only log if this was a change (not initialization)
-            if _G.lastSoftLimitsState ~= nil then
-                mc.mcCntlSetLastError(inst, "Soft limits ENABLED")
-            end
-        else
-            scr.SetProperty("btnSoftLimits", "Bg Color", "#FF0000")  -- Red
-            scr.SetProperty("btnSoftLimits", "Label", "Soft Limits\nDISABLED")
-            
-            -- Only log if this was a change (not initialization)
-            if _G.lastSoftLimitsState ~= nil then
-                mc.mcCntlSetLastError(inst, "WARNING: Soft limits DISABLED")
+-- Function to check if ANY axis has soft limits enabled
+local function getActualSoftLimitsEnabled()
+    for axis = 0, 5 do
+        if mc.mcAxisIsEnabled(inst, axis) == 1 then
+            local state = mc.mcSoftLimitGetState(inst, axis)
+            if state and state == 1 then
+                return 1  -- At least one axis enabled
             end
         end
-		
-        -- Update tracking variable
-        _G.lastSoftLimitsState = softLimitsEnabled
     end
-elseif _G.lastSoftLimitsState ~= -1 then
-    -- Handle error state only once
-    scr.SetProperty("btnSoftLimits", "Bg Color", "#808080")  -- Gray
-    scr.SetProperty("btnSoftLimits", "Label", "Soft Limits\nERROR")
-    mc.mcCntlSetLastError(inst, "ERROR: Cannot read soft limits state")
-    _G.lastSoftLimitsState = -1
+    return 0  -- All disabled
+end
+
+-- Get current actual state (from axes, not signal)
+local softLimitsEnabled = getActualSoftLimitsEnabled()
+
+-- Check if state has changed
+if softLimitsEnabled ~= _G.lastSoftLimitsState then
+    -- State changed - update button
+    if softLimitsEnabled == 1 then
+        scr.SetProperty("btnSoftLimits", "Bg Color", "#00FF00")  -- Green
+        scr.SetProperty("btnSoftLimits", "Label", "Soft Limits\nENABLED")
+        
+        -- Only log if this was a change (not initialization)
+        if _G.lastSoftLimitsState ~= nil then
+            mc.mcCntlSetLastError(inst, "Soft limits ENABLED")
+        end
+    else
+        scr.SetProperty("btnSoftLimits", "Bg Color", "#FF0000")  -- Red
+        scr.SetProperty("btnSoftLimits", "Label", "Soft Limits\nDISABLED")
+        
+        -- Only log if this was a change (not initialization)
+        if _G.lastSoftLimitsState ~= nil then
+            mc.mcCntlSetLastError(inst, "WARNING: Soft limits DISABLED")
+        end
+    end
+    
+    -- Update tracking variable
+    _G.lastSoftLimitsState = softLimitsEnabled
 end
 
 
@@ -653,6 +738,33 @@ if output7Handle and output7Handle > 0 then
     end
 end
 
+-- ============================================
+-- LASER BUTTON STATE MONITORING
+-- ============================================
+-- Monitor Output 1 for btnLaserDown button state
+if not _G.lastLaserOutputState then 
+    _G.lastLaserOutputState = -1 
+end
+
+local output1Handle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT1)
+if output1Handle and output1Handle > 0 then
+    local laserActive = mc.mcSignalGetState(output1Handle)
+    
+    -- Only update if state CHANGED
+    if laserActive ~= _G.lastLaserOutputState then
+        if laserActive == 1 then
+            -- Laser is DOWN (T91 active)
+            scr.SetProperty("btnLaserDown", "Bg Color", "#00FF00")  -- Green
+            scr.SetProperty("btnLaserDown", "Label", "Deactivate Laser\nChange to T0")
+        else
+            -- Laser is UP (T91 not active)
+            scr.SetProperty("btnLaserDown", "Bg Color", "#FF0000")  -- Red
+            scr.SetProperty("btnLaserDown", "Label", "Activate Laser\nChange to T91")
+        end
+        _G.lastLaserOutputState = laserActive
+    end
+end
+
 
 
 
@@ -665,7 +777,8 @@ if not _G.lastInput8State then
     _G.lastInput8State = -1 
     _G.toolCheckPending = false
     _G.toolCheckTime = 0
-    _G.lastToolSensorState = -1  -- Track tool sensor state
+    _G.toolCheckStartTime = nil  -- Track when check started
+    _G.lastToolSensorState = -1
 end
 
 -- Get Input 8 state
@@ -686,22 +799,38 @@ if input8Handle and input8Handle > 0 then
             -- Schedule tool check for 1 second later
             _G.toolCheckPending = true
             _G.toolCheckTime = os.clock() + 1.0
-        --    mc.mcCntlSetLastError(inst, "PLC: Tool check scheduled for 1s delay")
         end
         
         _G.lastInput8State = input8State
     end
 end
 
+
+
+
+
 -- Handle pending tool check after delay
 if _G.toolCheckPending and os.clock() >= _G.toolCheckTime then
     
+    -- Track when we started trying (NEW!)
+    if not _G.toolCheckStartTime then
+        _G.toolCheckStartTime = os.clock()
+    end
+    
+    -- Check for timeout (NEW!)
+    if os.clock() - _G.toolCheckStartTime > 30 then  -- 30 second timeout
+        mc.mcCntlSetLastError(inst, "Tool check cancelled - machine stayed busy for 30 seconds")
+        _G.toolCheckPending = false
+        _G.toolCheckStartTime = nil
+        _G.lastToolSensorState = mc.mcSignalGetState(mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17))
+        return  -- Exit without prompting
+    end
     
     -- CHECK IF MACHINE IS IN CYCLE OR BUSY
     local machState = mc.mcCntlGetState(inst)
     local inCycle = mc.mcCntlIsInCycle(inst)
-	
-	-- ADD THIS: Check if we're in a macro
+    
+    -- Check if we're in a macro
     local inMacro = (machState == mc.MC_STATE_MRUN_MACRO) or 
                     (machState == mc.MC_STATE_MRUN_MACRO_HOLD) or
                     (machState == mc.MC_STATE_MRUN_MACROH)
@@ -714,151 +843,291 @@ if _G.toolCheckPending and os.clock() >= _G.toolCheckTime then
         return
     end
     
+    -- Machine is idle, proceed with check
+    _G.toolCheckPending = false
+    _G.toolCheckStartTime = nil  -- Reset for next time (NEW!)
+    
     -- Check Input #17 (tool present)
     local toolPresentHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)
     if not toolPresentHandle or toolPresentHandle <= 0 then
-		_G.toolCheckPending = false
         return
     end
-	
-	_G.toolCheckPending = false
     
     local toolPresent = mc.mcSignalGetState(toolPresentHandle)
     local currentTool = mc.mcToolGetCurrent(inst)
     
     -- Check if tool sensor state CHANGED from 0 to 1 (tool inserted)
-    if toolPresent == 1 and _G.lastToolSensorState == 0 then
+    if toolPresent == 1 and (_G.lastToolSensorState == 0 or _G.lastToolSensorState == -1) then
         
-        -- ADDITIONAL CHECK: Skip if current tool is in virtual range (90-99)
-        if currentTool >= 90 then
-            _G.lastToolSensorState = toolPresent
-            return
-        end
+        -- Check if virtual tool is active
+        local virtualToolActive = mc.mcCntlGetPoundVar(inst, 406) >= 90
         
-        -- Only show dialog if we have tool choices
-        if not _G.toolChoices then
-            return
-        end
-            
-         --   mc.mcCntlSetLastError(inst, "PLC: Showing tool selection dialog...")
-            
-            -- Show tool selection dialog
-            local dlg = wx.wxSingleChoiceDialog(wx.NULL, "Select Tool:", "Tool Confirmation", _G.toolChoices)
-            if dlg:ShowModal() == wx.wxID_OK then
-                local selection = dlg:GetSelection()  -- 0-based
-                local newTool = _G.toolNumbers[selection + 1]
-                
-                -- Set tool
-                mc.mcToolSetCurrent(inst, newTool)
-                
-                -- Sync H offset
-                mc.mcCntlGcodeExecuteWait(inst, "G49")  -- Cancel first
-                wx.wxMilliSleep(100)
-                
-                if newTool > 0 then
-                    mc.mcCntlGcodeExecuteWait(inst, string.format("G43 H%d", newTool))
-                    wx.wxMilliSleep(100)
-                    
-                    -- Verify it worked
-                    local activeH = mc.mcCntlGetPoundVar(inst, 4120)
-                    if activeH == newTool then
-                     --   mc.mcCntlSetLastError(inst, string.format("Tool changed to T%d (H%d active)", newTool, newTool))
-                    else
-                     --   mc.mcCntlSetLastError(inst, string.format("Tool changed to T%d but H%.0f active - CHECK!", newTool, activeH))
-                    end
-                else
-                 --   mc.mcCntlSetLastError(inst, "Tool changed to T0 (H offset cancelled)")
-                end
+        if virtualToolActive then
+            -- MUST retract virtual tool to restore offsets!
+            if RetractVirtualTool then
+                RetractVirtualTool()
+                mc.mcCntlSetLastError(inst, "Virtual tool retracted for manual change")
             else
-                wx.wxMessageBox("Tool change cancelled. Tool not updated.", "Info", wx.wxOK + wx.wxICON_INFORMATION)
+                mc.mcCntlSetLastError(inst, "ERROR: RetractVirtualTool function not found!")
             end
-            dlg:Destroy()
-            
-            -- Update preview if function exists
-            if UpdateToolPreview then
-                UpdateToolPreview()
-            end
+            -- Update current tool after retraction
+            currentTool = mc.mcToolGetCurrent(inst)
         end
+        
+        -- CALL THE UPDATED FUNCTION WITH TIMER
+        promptToolSelection(false)  -- false = not startup, manual insertion
     end
     
     -- Update the last tool sensor state
     _G.lastToolSensorState = toolPresent
+end
 
 
 
 
 
---[[
 -- ============================================
--- PROBE OVERTRAVEL SAFETY SYSTEM
+-- LOW AIR PRESSURE MONITORING
 -- ============================================
--- E-stop protection for probe overtravel on inputs 3 & 4
+-- Initialize tracking on first run
+if not _G.lowAirInit then
+    _G.lowAirInit = true
+    _G.lastLowAirState = -1  -- Force first check
+    _G.lowAirDisabled = false  -- Track if we disabled the machine
+    _G.lowAirDialogShown = false  -- Prevent multiple dialogs
+    _G.lowAirDebounceCount = 0  -- Debounce counter
+    _G.restoredDialogShown = false  -- Track restore dialog
+end
 
-if not _G.probeOvertravelInit then
-    _G.probeOvertravelInit = true
-    _G.lastProbeX = 0
-    _G.lastProbeY = 0
-    _G.overtravelTriggered = false
+-- Get low air pressure sensor state (Input 6)
+local lowAirHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT6)
+
+if lowAirHandle and lowAirHandle > 0 then
+    local rawAirState = mc.mcSignalGetState(lowAirHandle)
     
-    -- Cache handles for efficiency
-    _G.probeXHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT3)
-    _G.probeYHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT4)
-    
-    -- Verify system is active
-    local status = "Probe safety: "
-    if _G.probeXHandle and _G.probeXHandle > 0 then
-        status = status .. "X-OK "
+    -- Debounce the signal (must be stable for 3 PLC cycles = 60ms)
+    if rawAirState ~= _G.lastLowAirState then
+        _G.lowAirDebounceCount = _G.lowAirDebounceCount + 1
+        
+        if _G.lowAirDebounceCount < 3 then
+            -- Not stable yet, keep monitoring
+            return  -- Exit this section, don't process yet
+        end
+        
+        -- Signal is stable, process the change
+        _G.lowAirDebounceCount = 0  -- Reset counter
+        
+        if rawAirState == 1 then  -- LOW AIR PRESSURE DETECTED!
+            -- Only process if not already disabled by us
+            if not _G.lowAirDisabled then
+                -- Get current machine state before disabling
+                local machState = mc.mcCntlGetState(inst)
+                local inCycle = mc.mcCntlIsInCycle(inst)
+                
+                -- Stop everything in proper sequence
+                if inCycle == 1 then
+                    -- Try feed hold first
+                    mc.mcCntlFeedHold(inst)
+                    
+                    -- Small delay to let feed hold take effect
+                    local waitCount = 0
+                    while mc.mcCntlIsInCycle(inst) == 1 and waitCount < 5 do
+                        waitCount = waitCount + 1
+                        -- Note: Can't use wxMilliSleep in PLC, just count cycles
+                    end
+                    
+                    -- Now stop the cycle
+                    mc.mcCntlCycleStop(inst)
+                end
+                
+                -- Stop spindle
+                local spindleOn = mc.mcSpindleGetCommandRPM(inst) > 0
+                if spindleOn then
+                    mc.mcSpindleSetDirection(inst, 0)
+                end
+                
+                -- Disable machine
+                mc.mcCntlEnable(inst, 0)
+                _G.lowAirDisabled = true
+                _G.restoredDialogShown = false  -- Reset for next restoration
+                
+                -- Log critical error
+                mc.mcCntlSetLastError(inst, "*** MACHINE DISABLED: LOW AIR PRESSURE DETECTED ***")
+                
+                -- Show alert dialog only once per event
+                if not _G.lowAirDialogShown then
+                    _G.lowAirDialogShown = true
+                    
+                    -- Use a coroutine to show dialog without blocking PLC
+                    coroutine.create(function()
+                        wx.wxMessageBox(
+                            "LOW AIR PRESSURE DETECTED!\n\n" ..
+                            "Machine has been disabled for safety.\n" ..
+                            "1. Check air compressor\n" ..
+                            "2. Check for air leaks\n" ..
+                            "3. Restore air pressure above minimum\n" ..
+                            "4. Re-enable machine when pressure is normal",
+                            "CRITICAL: Low Air Pressure",
+                            wx.wxOK + wx.wxICON_ERROR
+                        )
+                    end)
+                end
+            end
+            
+        else  -- Air pressure restored
+            if _G.lowAirDisabled then
+                mc.mcCntlSetLastError(inst, "Air pressure restored - machine can be re-enabled")
+                _G.lowAirDisabled = false
+                _G.lowAirDialogShown = false  -- Reset for next event
+                
+                -- Show restore message only once
+                if not _G.restoredDialogShown then
+                    _G.restoredDialogShown = true
+                    
+                    -- Use coroutine for non-blocking dialog
+                    coroutine.create(function()
+                        wx.wxMessageBox(
+                            "Air pressure has been restored.\n\n" ..
+                            "Please verify system is safe before re-enabling machine.",
+                            "Air Pressure Restored",
+                            wx.wxOK + wx.wxICON_INFORMATION
+                        )
+                    end)
+                end
+            end
+        end
+        
+        _G.lastLowAirState = rawAirState
     else
-        status = status .. "X-MISSING "
+        -- Signal unchanged, reset debounce counter
+        _G.lowAirDebounceCount = 0
     end
-    if _G.probeYHandle and _G.probeYHandle > 0 then
-        status = status .. "Y-OK"
-    else
-        status = status .. "Y-MISSING"
-    end
-    mc.mcCntlSetLastError(inst, status)
-end
-
--- Monitor X-axis probe overtravel (Input 3)
-if _G.probeXHandle and _G.probeXHandle > 0 then
-    local probeXState = mc.mcSignalGetState(_G.probeXHandle)
     
-    -- Rising edge triggers E-stop
-    if probeXState == 1 and _G.lastProbeX == 0 and not _G.overtravelTriggered then
-        _G.overtravelTriggered = true
-        mc.mcCntlEStop(inst)
-        mc.mcCntlSetLastError(inst, "*** PROBE OVERTRAVEL X - E-STOP ***")
+    -- Continuous protection: Prevent enabling while air is low
+    -- This runs every cycle regardless of state changes
+    if rawAirState == 1 then
+        -- Check if someone tried to enable the machine
+        local machEnabledHandle = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED)
+        if machEnabledHandle and machEnabledHandle > 0 then
+            local currentlyEnabled = mc.mcSignalGetState(machEnabledHandle)
+            
+            if currentlyEnabled == 1 and _G.lowAirDisabled then
+                -- Machine was somehow re-enabled while air is still low - disable again!
+                mc.mcCntlEnable(inst, 0)
+                mc.mcCntlSetLastError(inst, "*** CANNOT ENABLE: Air pressure still too low! ***")
+                
+                -- Flash a warning every 2 seconds (100 PLC cycles)
+                if testcount % 100 == 0 then
+                    mc.mcCntlSetLastError(inst, "*** WARNING: Fix air pressure before enabling! ***")
+                end
+            end
+        end
     end
-    _G.lastProbeX = probeXState
-end
-
--- Monitor Y-axis probe overtravel (Input 4)
-if _G.probeYHandle and _G.probeYHandle > 0 then
-    local probeYState = mc.mcSignalGetState(_G.probeYHandle)
     
-    -- Rising edge triggers E-stop
-    if probeYState == 1 and _G.lastProbeY == 0 and not _G.overtravelTriggered then
-        _G.overtravelTriggered = true
-        mc.mcCntlEStop(inst)
-        mc.mcCntlSetLastError(inst, "*** PROBE OVERTRAVEL Y - E-STOP ***")
+    -- Update visual indicators if they exist (button or LED)
+    -- Only update every 10 cycles to reduce overhead
+    if testcount % 10 == 0 then
+        if scr.GetProperty("btnAirPressure", "Bg Color") ~= nil then
+            if rawAirState == 1 then
+                scr.SetProperty("btnAirPressure", "Bg Color", "#FF0000")  -- Red
+                scr.SetProperty("btnAirPressure", "Label", "Air Pressure\nLOW!")
+            else
+                scr.SetProperty("btnAirPressure", "Bg Color", "#00FF00")  -- Green
+                scr.SetProperty("btnAirPressure", "Label", "Air Pressure\nNORMAL")
+            end
+        end
+        
+        if scr.GetProperty("ledAirPressure", "Value") ~= nil then
+            scr.SetProperty("ledAirPressure", "Value", rawAirState == 1 and "0" or "1")
+        end
     end
-    _G.lastProbeY = probeYState
-end
-
--- Reset flag when both sensors clear AND machine is idle
-if _G.overtravelTriggered then
-    local xClear = (not _G.probeXHandle) or (mc.mcSignalGetState(_G.probeXHandle) == 0)
-    local yClear = (not _G.probeYHandle) or (mc.mcSignalGetState(_G.probeYHandle) == 0)
-    local machState = mc.mcCntlGetState(inst)
     
-    -- Only reset if sensors clear AND machine returns to idle (operator acknowledged)
-    if xClear and yClear and machState == mc.MC_STATE_IDLE then
-        _G.overtravelTriggered = false
-        mc.mcCntlSetLastError(inst, "Probe safety reset - ready")
+elseif _G.lastLowAirState ~= -2 then
+    -- Log error once if handle is invalid
+    mc.mcCntlSetLastError(inst, "WARNING: Cannot monitor air pressure - Input 6 not configured")
+    _G.lastLowAirState = -2
+end
+
+
+
+
+
+-- ================================
+-- Spindle Spin-UP Dwell
+-- ================================
+local inst = mc.mcGetInstance()
+
+-- Initialize on first run
+if not _G.spinUpDwell then
+    _G.spinUpDwell = {
+        armed = false,
+        delaySeconds = 0,
+        startTime = 0,
+        pauseActive = false,
+        lastSpindleState = 0
+    }
+end
+
+-- Check if M6 armed the dwell
+local spinUpFlag = mc.mcCntlGetPoundVar(inst, 495)
+if spinUpFlag == 1 then
+    _G.spinUpDwell.armed = true
+    _G.spinUpDwell.delaySeconds = mc.mcCntlGetPoundVar(inst, 496) or 0.7
+    mc.mcCntlSetPoundVar(inst, 495, 0)  -- Clear flag immediately
+    
+    if _G.spinUpDwell.delaySeconds > 0 then
+        mc.mcCntlSetLastError(inst, string.format("Spindle dwell armed: %.1fs", _G.spinUpDwell.delaySeconds))
     end
 end
-]]--
 
+-- Get machine state
+local machState = mc.mcCntlGetState(inst)
+
+-- Only process if armed and machine is running
+if _G.spinUpDwell.armed and machState == mc.MC_STATE_FRUN then
+    -- Get spindle state (0=off, 1=CW, 2=CCW)
+    local spindleState = mc.mcSpindleGetState(inst)
+    local spindleOn = (spindleState ~= 0) and 1 or 0
+    
+    -- Detect spindle start (rising edge from off to on)
+    if _G.spinUpDwell.lastSpindleState == 0 and spindleOn == 1 and not _G.spinUpDwell.pauseActive then
+        -- Start the dwell
+        _G.spinUpDwell.pauseActive = true
+        _G.spinUpDwell.startTime = os.clock()
+        
+        -- Use feed hold to pause motion
+        mc.mcCntlFeedHold(inst)
+        mc.mcCntlSetLastError(inst, string.format("Spindle spin-up pause: %.1fs", _G.spinUpDwell.delaySeconds))
+    end
+    
+    -- Check if dwell is complete
+    if _G.spinUpDwell.pauseActive then
+        local elapsed = os.clock() - _G.spinUpDwell.startTime
+        
+        if elapsed >= _G.spinUpDwell.delaySeconds then
+            -- Resume motion
+            mc.mcCntlCycleStart(inst)
+            
+            -- Reset everything
+            _G.spinUpDwell.armed = false
+            _G.spinUpDwell.pauseActive = false
+            _G.spinUpDwell.delaySeconds = 0
+            
+            mc.mcCntlSetLastError(inst, "Spindle at speed - resuming")
+        end
+    end
+    
+    _G.spinUpDwell.lastSpindleState = spindleOn
+end
+
+-- Reset if machine stops
+if machState == mc.MC_STATE_IDLE then
+    if _G.spinUpDwell.pauseActive then
+        _G.spinUpDwell.pauseActive = false
+        _G.spinUpDwell.armed = false
+        mc.mcCntlSetLastError(inst, "Spindle dwell cancelled - machine idle")
+    end
+end
 
 
 

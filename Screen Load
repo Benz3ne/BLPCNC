@@ -18,6 +18,12 @@ Tframe = nil --TouchFrame handle
 SigLib = {
 	
 [mc.OSIG_MACHINE_ENABLED] = function (state)
+    -- PREVENT RE-ENTRANCY
+    if _G.processingMachineEnable then
+        return  -- Already processing, avoid re-entrancy
+    end
+    _G.processingMachineEnable = true
+    
     machEnabled = state;
     ButtonEnable()
     
@@ -27,31 +33,82 @@ SigLib = {
         if _G.HOMING_WARNING_IGNORED then
             _G.HOMING_WARNING_IGNORED = false
             local inst = mc.mcGetInstance()
-        --    mc.mcCntlSetLastError(inst, "Machine disabled - homing protection restored")
         end
         
         -- Clear tool selection on disable
         _G.selectedToolIndex = nil
         
+        -- Clear M6 automation flags for dust boot
+        mc.mcCntlSetPoundVar(inst, 481, 0)  -- Clear completion signal
+        _G.waitingForMotionAfterToolChange = false
+        _G.motionHasStarted = false
+        
+        -- IMMEDIATE virtual tool output shutdown on ANY disable
+        -- This prevents Mach4 from remembering them as "on"
+        local inst = mc.mcGetInstance()
+        local virtualState = mc.mcCntlGetPoundVar(inst, 406)
+        if virtualState >= 90 and virtualState <= 99 then
+            -- Turn off outputs immediately to prevent restore issues
+            local h7 = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7)
+            if h7 and h7 > 0 then mc.mcSignalSetState(h7, 0) end
+            
+            local h1 = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT1)
+            if h1 and h1 > 0 then mc.mcSignalSetState(h1, 0) end
+            
+            -- Don't clear state yet - we need it for proper recovery
+            mc.mcCntlSetLastError(inst, "Disable: Virtual tool outputs secured")
+        end
+        
     elseif state == 1 then
-        -- Machine enabled - refresh tool dropdown
+        -- Machine enabled
+        local inst = mc.mcGetInstance()
+        
+        -- Refresh tool dropdown
         if PopulateTools then
             PopulateTools()
         end
         
-        -- CHECK H OFFSET STATE
-        local inst = mc.mcGetInstance()
+        -- Cancel any rotation on enable
+        mc.mcCntlGcodeExecuteWait(inst, "G69")
+        
+        -- CHECK AND FIX H OFFSET STATE
         local currentTool = mc.mcToolGetCurrent(inst)
         local activeH = mc.mcCntlGetPoundVar(inst, 4120)
         local compMode = mc.mcCntlGetPoundVar(inst, 4008)
         
-        if currentTool > 0 and compMode == 43 and activeH ~= currentTool then
-      --      mc.mcCntlSetLastError(inst, string.format("WARNING: Machine enabled with T%d but H%.0f active!", currentTool, activeH))
+        -- Cancel H offset first to ensure clean state
+        mc.mcCntlGcodeExecuteWait(inst, "G49")
+        
+        -- If there's a physical tool loaded, re-apply its H offset
+        if currentTool > 0 and currentTool < 90 then
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G43 H%d", currentTool))
         end
         
-        -- Check if we should show warning
-        local anyUnhomed = false
+        -- CHECK FOR ORPHANED VIRTUAL TOOL (E-stop/crash recovery)
+        -- Let the virtual tool system manage its own outputs
+        local virtualState = mc.mcCntlGetPoundVar(inst, 406)
+        if virtualState >= 90 and virtualState <= 99 then
+            -- Virtual tool was left active - need to clean up
+            mc.mcCntlSetLastError(inst, "Recovery: Virtual tool was active, retracting...")
+            
+            -- Use the global retraction function
+            if RetractVirtualTool then
+                RetractVirtualTool()  -- This properly handles outputs and offsets
+                mc.mcCntlSetLastError(inst, "Virtual tool retracted after recovery")
+            else
+                -- Fallback if global function missing
+                -- Just clear the state, outputs already turned off in disable
+                mc.mcCntlSetPoundVar(inst, 406, 0)  -- Clear virtual tool state
+                mc.mcCntlSetPoundVar(inst, 407, 0)  -- Clear X delta
+                mc.mcCntlSetPoundVar(inst, 408, 0)  -- Clear Y delta
+                mc.mcToolSetCurrent(inst, 0)
+                mc.mcCntlGcodeExecuteWait(inst, "G49")
+                mc.mcCntlSetLastError(inst, "WARNING: Virtual tool state cleared (RetractVirtualTool not found)")
+            end
+        end
         
+        -- Check if homing warning needed
+        local anyUnhomed = false
         for axis = 0, 5 do
             local enabled = mc.mcAxisIsEnabled(inst, axis)
             local homed = mc.mcAxisIsHomed(inst, axis)
@@ -66,6 +123,9 @@ SigLib = {
             mc.mcCntlSetLastError(inst, "Machine enabled - axes not homed, jog protection active")
         end
     end
+    
+    -- CLEAR RE-ENTRANCY FLAG
+    _G.processingMachineEnable = false
 end,
 
 
@@ -538,16 +598,149 @@ PopulateTools()
 local inst = mc.mcGetInstance()
 mc.mcToolSetCurrent(inst, 0)  -- Set to T0
 mc.mcCntlGcodeExecuteWait(inst, "G49")  -- CRITICAL: Cancel any stale H offset
---mc.mcCntlSetLastError(inst, "Startup: T0 set, H offset cancelled")
+
 
 _G.hOffsetSyncPending = false
 _G.hOffsetLastSync = 0
+_G.hOffsetSyncPending = false
+_G.hOffsetLastSync = 0
+_G.lastHSync = {}  -- Initialize as empty table to prevent nil errors
 
 
 
 
--- ===== SCREEN LOAD SCRIPT =====
--- REPLACE the existing ShowHomingRequiredDialog function with this enhanced version
+
+-- ============================================
+-- Global Virtual Tool Retraction Function
+-- Called by: PLC, M6 (optional), Recovery, Manual buttons
+-- Single source of truth for virtual tool retraction
+-- ============================================
+function RetractVirtualTool()
+    local inst = mc.mcGetInstance()
+    local state = mc.mcCntlGetPoundVar(inst, 406)
+    
+    -- Only retract if virtual tool active (90-99)
+    if state < 90 or state > 99 then
+        return false  -- No virtual tool active
+    end
+    
+    -- Get stored delta values
+    local xDelta = mc.mcCntlGetPoundVar(inst, 407)
+    local yDelta = mc.mcCntlGetPoundVar(inst, 408)
+    
+    -- VALIDATE DELTAS BEFORE USING (NEW!)
+    if xDelta < -1e300 or yDelta < -1e300 then
+        mc.mcCntlSetLastError(inst, "WARNING: Virtual tool deltas lost - clearing state only")
+        
+        -- Still turn off hardware based on tool type
+        if state == 90 then
+            local h = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7)
+            if h and h > 0 then mc.mcSignalSetState(h, 0) end
+        elseif state == 91 then
+            local h = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT1)
+            if h and h > 0 then mc.mcSignalSetState(h, 0) end
+        end
+        
+        -- Clear state variables
+        mc.mcCntlSetPoundVar(inst, 406, 0)
+        mc.mcCntlSetPoundVar(inst, 407, 0)
+        mc.mcCntlSetPoundVar(inst, 408, 0)
+        mc.mcToolSetCurrent(inst, 0)
+        mc.mcCntlGcodeExecuteWait(inst, "G49")
+        
+        return false  -- Couldn't fully recover offsets
+    end
+    
+    -- Log what we're doing
+    local toolName = "virtual tool"
+    if state == 90 then 
+        toolName = "probe"
+    elseif state == 91 then 
+        toolName = "laser"
+    end
+    
+    -- Restore work offsets by adding deltas back
+    if math.abs(xDelta) > 0.0001 or math.abs(yDelta) > 0.0001 then
+        for i = 0, 5 do
+            local baseVar = 5221 + (i * 20)  -- G54-G59 base addresses
+            local currentX = mc.mcCntlGetPoundVar(inst, baseVar)
+            local currentY = mc.mcCntlGetPoundVar(inst, baseVar + 1)
+            
+            -- Only apply if values look reasonable (sanity check)
+            if math.abs(currentX) < 1000 and math.abs(currentY) < 1000 then
+                mc.mcCntlSetPoundVar(inst, baseVar, currentX + xDelta)
+                mc.mcCntlSetPoundVar(inst, baseVar + 1, currentY + yDelta)
+            end
+        end
+    end
+    
+    -- Turn off hardware based on tool type
+    if state == 90 then
+        -- Turn off probe (Output 7)
+        local h = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7)
+        if h and h > 0 then 
+            mc.mcSignalSetState(h, 0) 
+        end
+    elseif state == 91 then
+        -- Turn off laser (Output 1)
+        local h = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT1)
+        if h and h > 0 then 
+            mc.mcSignalSetState(h, 0) 
+        end
+    end
+    
+    -- Clear all state variables
+    mc.mcCntlSetPoundVar(inst, 406, 0)  -- Clear virtual tool state
+    mc.mcCntlSetPoundVar(inst, 407, 0)  -- Clear X delta
+    mc.mcCntlSetPoundVar(inst, 408, 0)  -- Clear Y delta
+    
+    -- Set tool to 0 and cancel height offset
+    mc.mcToolSetCurrent(inst, 0)
+    mc.mcCntlGcodeExecuteWait(inst, "G49")
+    
+    mc.mcCntlSetLastError(inst, string.format("Virtual %s retracted", toolName))
+    
+    return true  -- Successfully retracted
+end
+
+-- CRITICAL: Make it globally accessible
+_G.RetractVirtualTool = RetractVirtualTool
+
+
+
+
+
+
+-- ============================================
+-- Virtual Tool Recovery Function
+-- Uses the global RetractVirtualTool() function
+-- ============================================
+do
+    local inst = mc.mcGetInstance()
+    
+    -- Function to recover virtual tool state on startup
+    local function recoverVirtualToolState()
+        local state = mc.mcCntlGetPoundVar(inst, 406)
+        
+        -- Only recover if virtual tool was active (90-99)
+        if state >= 90 and state <= 99 then
+            mc.mcCntlSetLastError(inst, "Recovering from virtual tool deployment")
+            
+            -- Use the global retraction function
+            RetractVirtualTool()
+        end
+    end
+    
+    -- Call recovery on startup
+    recoverVirtualToolState()
+end
+
+
+
+
+
+
+
 function ShowHomingRequiredDialog()
     local inst = mc.mcGetInstance()
     
@@ -857,7 +1050,6 @@ end
 function SetH(h)
     local inst = mc.mcGetInstance()
     if not h or h < 0 or h > 99 then
-     --   mc.mcCntlSetLastError(inst, "SetH: Invalid H value")
         return
     end
     
@@ -865,9 +1057,9 @@ function SetH(h)
     if currentH ~= h then
         mc.mcCntlSetPoundVar(inst, 4120, h)
         mc.mcCntlSetPoundVar(inst, 4008, 43)
-      --  mc.mcCntlSetLastError(inst, "H offset = " .. h)
         
         -- Clear sync tracking since manual override
+        _G.lastHSync = _G.lastHSync or {}  -- INITIALIZE TABLE IF NIL
         _G.lastHSync.tool = -1
         _G.lastHSync.h = h
     end
@@ -883,7 +1075,7 @@ end
 
 -- ============================================
 -- ShowProbeSettingsDialog() Function - ENHANCED VERSION
--- Includes Work Surface Reference and Laser Offsets
+-- Includes Work Surface Reference, Laser Offsets, and Touch Probe Z Offset
 -- Ready to paste into Screen Load Script
 -- ============================================
 function ShowProbeSettingsDialog()
@@ -895,6 +1087,7 @@ function ShowProbeSettingsDialog()
         PROBE_DIAMETER     = {var = 300,  default = 0.250,  desc = "Probe Diameter"},
         PROBE_X_OFFSET     = {var = 301,  default = 0.000,  desc = "X Offset (Probe)"},
         PROBE_Y_OFFSET     = {var = 302,  default = 0.000,  desc = "Y Offset (Probe)"},
+        PROBE_Z_OFFSET     = {var = 320,  default = 0.000,  desc = "Z Offset (Probe)"},  -- NEW!
         PROBE_FAST_FEED    = {var = 303,  default = 20.000, desc = "Fast Feed (Probe)"},
         PROBE_SLOW_FEED    = {var = 304,  default = 5.000,  desc = "Slow Feed (Probe)"},
         PROBE_MAX_TRAVEL   = {var = 305,  default = 0.100,  desc = "Max Travel (Probe)"},
@@ -915,7 +1108,7 @@ function ShowProbeSettingsDialog()
         PROBE_STATION_Y    = {var = 312,  default = 12.650, desc = "Probe Station Y"},
         WORK_SURFACE_Z     = {var = 353,  default = -7.800, desc = "Work Surface Z Ref"},
         
-        -- Tool Height Probing
+        -- Tool Height Measurement
         MAX_PROBE_DEPTH    = {var = 314,  default = -9.000, desc = "Max Probe Depth"},
         FAST_TOOL_FEED     = {var = 315,  default = 75.000, desc = "Fast Feed (Height)"},
         SLOW_TOOL_FEED     = {var = 316,  default = 3.000,  desc = "Slow Feed (Height)"},
@@ -935,7 +1128,7 @@ function ShowProbeSettingsDialog()
     
     -- Create dialog with adjusted size for better centering
     local dialog = wx.wxDialog(wx.NULL, wx.wxID_ANY, "Probe, Laser & Tool-Change Settings",
-                              wx.wxDefaultPosition, wx.wxSize(500, 520),
+                              wx.wxDefaultPosition, wx.wxSize(500, 540),
                               wx.wxDEFAULT_DIALOG_STYLE)
     
     -- Center the dialog on screen
@@ -1037,6 +1230,9 @@ function ShowProbeSettingsDialog()
          "in"},
         {PROBE_VARS.PROBE_Y_OFFSET, 
          "Pound Variable #302: The Y-axis distance from the spindle centerline to the probe tip centerline when deployed. Positive values mean probe is forward of spindle. Used to automatically shift work offsets when probe is active. Set to 0.000 if probe mounts concentrically in spindle.", 
+         "in"},
+        {PROBE_VARS.PROBE_Z_OFFSET, 
+         "Pound Variable #320: The Z-axis calibration offset for the probe trigger point. Positive values move the measured surface UP (probe triggers before actual surface). Negative values move the measured surface DOWN (probe triggers after surface). Use this to calibrate if probe measurements are consistently off from actual surface by a fixed amount. Typical: 0.000\" for properly calibrated probes.", 
          "in"},
         {PROBE_VARS.PROBE_FAST_FEED, 
          "Pound Variable #303: Initial fast approach speed for XYZ probing operations. This is the speed used for the first touch to quickly find the surface. Typical range: 10-30 ipm. Higher speeds save time but may reduce accuracy.", 
@@ -1201,6 +1397,7 @@ do
         {300, 0.250},   -- Probe diameter
         {301, 0.000},   -- Probe X offset
         {302, 0.000},   -- Probe Y offset
+        {320, 0.000},   -- Probe Z offset (NEW!)
         {303, 20.000},  -- Probe fast feed
         {304, 5.000},   -- Probe slow feed
         {305, 0.100},   -- Probe max travel
@@ -1222,11 +1419,11 @@ do
         {316, 3.000},   -- Slow tool feed
         {317, 0.100},   -- Retract distance
         
-        -- Laser offsets (NEW)
+        -- Laser offsets
         {318, 0.000},   -- Laser X offset
         {319, 0.000},   -- Laser Y offset
         
-        -- Work surface reference (NEW)
+        -- Work surface reference
         {353, -7.800}   -- Work surface Z reference
     }
     
@@ -1660,20 +1857,16 @@ end
 do
     local inst = mc.mcGetInstance()
     
-    -- Get soft limits enabled state
+    -- Enable soft limits for ALL enabled axes
+    for axis = 0, 5 do
+        if mc.mcAxisIsEnabled(inst, axis) == 1 then
+            mc.mcSoftLimitSetState(inst, axis, 1)
+        end
+    end
+	
     local softLimitsHandle = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON)
     if softLimitsHandle and softLimitsHandle > 0 then
-        -- Enable soft limits
         mc.mcSignalSetState(softLimitsHandle, 1)
-    else
-        mc.mcCntlSetLastError(inst, "WARNING: Could not enable soft limits - invalid handle")
-    end
-end
-
-do
-    -- Simply sync the button - PLC will handle logging
-    if SyncSoftLimitsButton then
-        SyncSoftLimitsButton()
     end
 end
 
@@ -1753,5 +1946,90 @@ do
     
     if scr.GetProperty("btnVacuumAuto", "Bg Color") ~= nil then
         scr.SetProperty("btnVacuumAuto", "Bg Color", "#FF0000")
+    end
+end
+
+
+
+
+
+-- ============================================
+-- GLOBAL ROTATION CHECK FUNCTIONS
+-- For use in all probing and positioning scripts
+-- ============================================
+function IsG68Active()
+    local inst = mc.mcGetInstance()
+    -- Group 16 (rotation) modal code: 68 = G68, 69 = G69
+    local MOD_ROT = 4016
+    local v = mc.mcCntlGetPoundVar(inst, MOD_ROT)
+    if type(v) ~= "number" then return false end
+    return (math.floor(v + 0.5) == 68)
+end
+
+function CheckRotationWithPrompt(customMessage)
+    local inst = mc.mcGetInstance()
+    if IsG68Active() then
+        local message = customMessage or 
+            "Warning: This operation will reset all coordinate rotations (G68→G69).\nProceed?"
+        
+        local parent = wx.NULL
+        local app = wx.wxGetApp()
+        if app then pcall(function() parent = app:GetTopWindow() or wx.NULL end) end
+        
+        local res = wx.wxMessageBox(message, "Rotation Active", 
+                                   wx.wxYES_NO + wx.wxICON_WARNING, parent)
+        if res ~= wx.wxYES then
+            mc.mcCntlSetLastError(inst, "Operation cancelled (G68 active)")
+            return false
+        end
+        -- User approved: clear rotation
+        mc.mcCntlGcodeExecuteWait(inst, "G69")
+        return true
+    else
+        return true
+    end
+end
+
+_G.CheckRotationWithPrompt = CheckRotationWithPrompt
+
+
+
+
+
+-- ============================================
+-- M6 FLAG RECOVERY FOR DUST BOOT AUTOMATION
+-- ============================================
+-- This clears any stale flags from crashes or E-stops
+-- Must be at the end of Screen Load Script
+do
+    local inst = mc.mcGetInstance()
+    
+    -- Clear any stale M6 flags from crash/E-stop
+    mc.mcCntlSetPoundVar(inst, 499, 0)  -- M6 not running
+    mc.mcCntlSetPoundVar(inst, 481, 0)  -- No pending completion
+    
+    -- Clear motion tracking flags
+    _G.waitingForMotionAfterToolChange = false
+    _G.motionHasStarted = false
+    
+    -- Check current tool and notify user if needed
+    local currentTool = mc.mcToolGetCurrent(inst)
+    if currentTool > 0 and currentTool < 90 then
+        -- Physical tool loaded - user needs to run program for boot automation
+        if mc.mcCntlGetPoundVar(inst, 402) == 1 then  -- If boot auto enabled
+            mc.mcCntlSetLastError(inst, string.format("T%d loaded - dust boot will lower on first cut", currentTool))
+        end
+    elseif currentTool >= 90 and currentTool <= 99 then
+        -- Virtual tool loaded - ensure boot is up
+        local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+        if hBoot and hBoot > 0 then
+            mc.mcSignalSetState(hBoot, 0)  -- Raise boot
+        end
+        mc.mcCntlSetLastError(inst, string.format("Virtual T%d active - dust boot raised", currentTool))
+    end
+    
+    -- Log that dust boot automation is ready
+    if mc.mcCntlGetPoundVar(inst, 402) == 1 then
+        mc.mcCntlSetLastError(inst, "Dust boot automation ready")
     end
 end

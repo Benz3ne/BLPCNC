@@ -15,10 +15,46 @@ Physical Tools: Configurable which tools skip measurement
 #495 = Post-M6 spindle spinup flag (for PLC)
 #496 = Post-M6 spindle spinup dwell seconds
 #498 = Dialog suppression
+#499 = M6 running flag (1=running, 0=done)
+#481 = M6 completion signal (1=success, 0=not complete)
 ]]--
 
 function m6()
     local inst = mc.mcGetInstance()
+    
+    -- EMERGENCY DEBUG - Using direct SetLastError since debugPrint not defined yet
+    mc.mcCntlSetLastError(inst, "M6 START: Function entered")
+    
+    -- Check if M6 is already running (re-entry guard)
+    local m6Already = mc.mcCntlGetPoundVar(inst, 499)
+    mc.mcCntlSetLastError(inst, string.format("M6 CHECK: #499 = %d", m6Already))
+    
+    if m6Already == 1 then
+        mc.mcCntlSetLastError(inst, "ERROR: M6 already running! Aborting.")
+        return
+    end
+    
+    -- Check timing
+    local lastM6Time = mc.mcCntlGetPoundVar(inst, 483) or 0
+    local currentTime = os.clock()
+    local timeSinceLast = currentTime - lastM6Time
+    
+    mc.mcCntlSetLastError(inst, string.format("M6 TIMING: %.3f seconds since last call", timeSinceLast))
+    
+    -- Store this call time
+    mc.mcCntlSetPoundVar(inst, 483, currentTime)
+    
+    -- Log M6 entry
+    local selected = mc.mcToolGetSelected(inst)
+    local current = mc.mcToolGetCurrent(inst)
+    mc.mcCntlSetLastError(inst, string.format("M6 TOOLS: T%d -> T%d", current, selected))
+    
+    -- NOW continue with the rest of the macro...
+	
+	
+	
+	
+	
     
     -- ============================================
     -- CONFIGURATION SECTION
@@ -79,7 +115,9 @@ function m6()
     -- ============================================
     local function toolChangeMain()
         -- Initialize flags
-        mc.mcCntlSetPoundVar(inst, 498, 0)  -- Dialog suppression off
+        mc.mcCntlSetPoundVar(inst, 498, 1)  -- Dialog suppression ON for entire M6
+        mc.mcCntlSetPoundVar(inst, 499, 1)  -- M6 running flag ON
+        mc.mcCntlSetPoundVar(inst, 481, 0)  -- Clear any stale completion signal
         
         local WORK_SURFACE_Z = -7.8
         mc.mcCntlSetPoundVar(inst, 353, WORK_SURFACE_Z)
@@ -312,6 +350,7 @@ function m6()
             mc.mcCntlSetPoundVar(inst, 407, 0)
             mc.mcCntlSetPoundVar(inst, 408, 0)
             mc.mcCntlSetPoundVar(inst, 494, 0)  -- Clear dust boot memory
+            mc.mcCntlSetPoundVar(inst, 498, 0)  -- Clear dialog suppression
             mc.mcToolSetCurrent(inst, 0)
             mc.mcCntlGcodeExecuteWait(inst, "G49")
         end
@@ -337,15 +376,11 @@ function m6()
             mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G1 Y%.4f F%.1f", y, APPROACH_FEED))
             
             local toolReleaseHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT2)
-            mc.mcCntlSetPoundVar(inst, 498, 1)
             mc.mcSignalSetState(toolReleaseHandle, 1)
-            mc.mcCntlSetPoundVar(inst, 498, 0)
             
             mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 Z%.4f", TOOL_CHANGE_Z))
             
-            mc.mcCntlSetPoundVar(inst, 498, 1)
             mc.mcSignalSetState(toolReleaseHandle, 0)
-            mc.mcCntlSetPoundVar(inst, 498, 0)
             
             return true
         end
@@ -579,11 +614,9 @@ function m6()
             
             mc.mcCntlGcodeExecuteWait(inst, "G53 G1 Y" .. currentPos.Y .. " F" .. APPROACH_FEED)
             
-            mc.mcCntlSetPoundVar(inst, 498, 1)
             mc.mcSignalSetState(handles.toolRelease, 1)
             
             if not waitForSignal(handles.clampOpen, 1, 5) then
-                mc.mcCntlSetPoundVar(inst, 498, 0)
                 mc.mcSignalSetState(handles.toolRelease, 0)
                 error("Clamp failed to open")
             end
@@ -591,14 +624,11 @@ function m6()
             local raiseZ = (requestedTool > 0) and TOOL_CHANGE_Z or SAFE_Z
             mc.mcCntlGcodeExecuteWait(inst, "G53 G0 Z" .. raiseZ)
             
-            mc.mcCntlSetPoundVar(inst, 498, 0)
-            
             mc.mcToolSetCurrent(inst, 0)
             mc.mcCntlGcodeExecuteWait(inst, "G49")
             
             if requestedTool == 0 then
                 mc.mcSignalSetState(handles.toolRelease, 0)
-                mc.mcCntlSetPoundVar(inst, 498, 0)
             end
         elseif currentTool > 0 and currentTool < 90 then
             mc.mcToolSetCurrent(inst, 0)
@@ -633,15 +663,12 @@ function m6()
         
         -- Open clamp if picking up from T0
         if currentTool == 0 then
-            mc.mcCntlSetPoundVar(inst, 498, 1)
             mc.mcSignalSetState(handles.toolRelease, 1)
             
             if not waitForSignal(handles.clampOpen, 1, 5) then
-                mc.mcCntlSetPoundVar(inst, 498, 0)
                 mc.mcSignalSetState(handles.toolRelease, 0)
                 error("Clamp failed to open for pickup")
             end
-            mc.mcCntlSetPoundVar(inst, 498, 0)
         end
         
         -- Check spindle not running
@@ -651,20 +678,22 @@ function m6()
             error("Spindle running - cannot grab tool")
         end
         
+        -- Final safety check: dust boot must be up before descending
+        if mc.mcSignalGetState(handles.dustBootUp) ~= 1 then
+            mc.mcSignalSetState(handles.toolRelease, 0)
+            error("Dust boot not up - cannot safely grab tool")
+        end
+        
         -- Grab tool
         mc.mcCntlGcodeExecuteWait(inst, "G53 G1 Z" .. toolPos.Z .. " F" .. APPROACH_FEED)
         mc.mcCntlGcodeExecuteWait(inst, "G0")
         
-        mc.mcCntlSetPoundVar(inst, 498, 1)
         mc.mcSignalSetState(handles.toolRelease, 0)
         mc.mcCntlGcodeExecuteWait(inst, "G4 P.5")
-        mc.mcCntlSetPoundVar(inst, 498, 0)
         
         -- Verify tool grabbed
         if mc.mcSignalGetState(handles.toolPresent) == 0 then
-            mc.mcCntlSetPoundVar(inst, 498, 1)
             mc.mcSignalSetState(handles.toolRelease, 1)
-            mc.mcCntlSetPoundVar(inst, 498, 0)
             error("Tool not detected after clamp")
         end
         
@@ -815,6 +844,15 @@ function m6()
     
     -- Clear dialog suppression
     mc.mcCntlSetPoundVar(inst, 498, 0)
+    mc.mcCntlSetPoundVar(inst, 499, 0)  -- M6 running flag OFF
+    
+    -- Signal M6 completion to PLC for dust boot automation
+    if success then
+        mc.mcCntlSetPoundVar(inst, 481, 1)  -- Signal successful completion
+        debugPrint("M6 complete - signaling PLC for dust boot management")
+    else
+        mc.mcCntlSetPoundVar(inst, 481, 0)  -- No completion on error
+    end
     
     -- Handle error
     if not success then
@@ -831,6 +869,67 @@ function m6()
             end)
         end
     end
+	
+	
+	
+	
+	
+	-- Clear dialog suppression
+mc.mcCntlSetPoundVar(inst, 498, 0)
+
+-- DEBUG: Check if #481 is already set before we set it
+local existing481 = mc.mcCntlGetPoundVar(inst, 481)
+if existing481 == 1 then
+    debugPrint("WARNING: #481 already = 1 before M6 sets it!")
+end
+
+-- DEBUG: Add a unique marker to detect multiple M6 calls
+local callCount = mc.mcCntlGetPoundVar(inst, 480) or 0
+callCount = callCount + 1
+mc.mcCntlSetPoundVar(inst, 480, callCount)
+debugPrint(string.format("M6 execution #%d completing", callCount))
+
+-- Signal M6 completion to PLC for dust boot automation
+if success then
+    -- DEBUG: Set completion with timestamp
+    local timestamp = os.clock()
+    mc.mcCntlSetPoundVar(inst, 482, timestamp)  -- Store when we set it
+    
+    debugPrint(string.format("M6 setting #481=1 at time %.3f", timestamp))
+    mc.mcCntlSetPoundVar(inst, 481, 1)  -- Signal successful completion
+    
+    -- DEBUG: Verify it was actually set
+    wx.wxMilliSleep(1)
+    local verify = mc.mcCntlGetPoundVar(inst, 481)
+    if verify ~= 1 then
+        debugPrint(string.format("ERROR: Set #481=1 but reads as %d!", verify))
+    else
+        debugPrint("M6 complete - #481 set successfully")
+    end
+    
+    -- DEBUG: Wait a moment to see if PLC clears it
+    wx.wxMilliSleep(50)  -- Wait 50ms (2.5 PLC cycles)
+    local afterWait = mc.mcCntlGetPoundVar(inst, 481)
+    if afterWait == 0 then
+        debugPrint("GOOD: PLC cleared #481 quickly")
+    else
+        debugPrint(string.format("WARNING: #481 still = %d after 50ms", afterWait))
+    end
+else
+    mc.mcCntlSetPoundVar(inst, 481, 0)  -- No completion on error
+    debugPrint("M6 failed - #481 set to 0")
+end
+
+-- IMPORTANT: Clear M6 running flag LAST (after setting #481)
+debugPrint("M6 clearing #499 (running flag)")
+mc.mcCntlSetPoundVar(inst, 499, 0)  -- M6 running flag OFF
+
+debugPrint(string.format("M6 macro exiting (call #%d)", callCount))
+	
+	
+	
+	
+	
 end
 
 if (mc.mcInEditor() == 1) then m6() end

@@ -428,12 +428,14 @@ end
 
 
 
--- DUST/VACUUM/BOOT AUTOMATION - POUND VARIABLE VERSION
+-- DUST/VACUUM/BOOT AUTOMATION - ENHANCED VERSION WITH M6 COMPLETION
 
 -- Initialize on first run
 if not _G.dustAutoInit then
     _G.dustAutoInit = true
     _G.lastMachineState = mc.mcCntlGetState(inst)
+    _G.waitingForMotionAfterToolChange = false  -- Flag for boot lowering
+    _G.motionHasStarted = false  -- Latches when motion detected
     
     -- Initialize pound variables if they're uninitialized (will be -1.79e308)
     if mc.mcCntlGetPoundVar(inst, 400) < -1e300 then
@@ -445,52 +447,94 @@ if not _G.dustAutoInit then
     if mc.mcCntlGetPoundVar(inst, 402) < -1e300 then
         mc.mcCntlSetPoundVar(inst, 402, 0)  -- Dust boot auto
     end
+    if mc.mcCntlGetPoundVar(inst, 481) < -1e300 then
+        mc.mcCntlSetPoundVar(inst, 481, 0)  -- M6 completion signal
+    end
     if mc.mcCntlGetPoundVar(inst, 499) < -1e300 then
         mc.mcCntlSetPoundVar(inst, 499, 0)  -- M6 running flag
     end
     if mc.mcCntlGetPoundVar(inst, 496) < -1e300 then
         mc.mcCntlSetPoundVar(inst, 496, 0)  -- Probe flag
     end
-    
 end
 
 -- Get current machine state
 local currentState = mc.mcCntlGetState(inst)
+local inCycle = mc.mcCntlIsInCycle(inst)
+
+-- Define state constants
+local STATE_IDLE = 0
+local STATE_FRUN = 100
 
 -- Check M6 protection flags
 local m6Flag = mc.mcCntlGetPoundVar(inst, 499)
 local probeFlag = mc.mcCntlGetPoundVar(inst, 496)
+local m6Completed = mc.mcCntlGetPoundVar(inst, 481)  -- M6 completion signal
+
+-- DEBUG: Log #481 value every 10 cycles
+if testcount % 10 == 0 then
+    local val481 = mc.mcCntlGetPoundVar(inst, 481)
+    mc.mcCntlSetLastError(inst, string.format("DEBUG: #481 = %d", val481))
+end
+
+-- CHECK FOR M6 COMPLETION - This is our primary trigger
+if m6Completed == 1 then
+    mc.mcCntlSetPoundVar(inst, 481, 0)  -- Clear flag immediately
+    
+    local currentTool = mc.mcToolGetCurrent(inst)
+    
+    -- Decide about dust boot based on tool type
+    if mc.mcCntlGetPoundVar(inst, 402) == 1 then  -- Boot auto enabled
+        if currentTool > 0 and currentTool < 90 then
+            -- Physical tool - wait for motion to lower boot
+            _G.waitingForMotionAfterToolChange = true
+            _G.motionHasStarted = false
+            mc.mcCntlSetLastError(inst, string.format("T%d ready - boot will lower on first cut", currentTool))
+            
+        elseif currentTool >= 90 and currentTool <= 99 then
+            -- Virtual tool - ensure boot is UP immediately
+            local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+            if hBoot and hBoot > 0 then
+                mc.mcSignalSetState(hBoot, 0)  -- Raise boot
+            end
+            _G.waitingForMotionAfterToolChange = false
+            _G.motionHasStarted = false
+            mc.mcCntlSetLastError(inst, string.format("Virtual T%d active - boot raised", currentTool))
+            
+        elseif currentTool == 0 then
+            -- No tool - boot stays up
+            _G.waitingForMotionAfterToolChange = false
+            _G.motionHasStarted = false
+        end
+    end
+end
 
 -- Only process on state changes
 if currentState ~= _G.lastMachineState then
     
-    -- Define state constants
-    local STATE_IDLE = 0
-    local STATE_FRUN = 100
-    
     -- PROGRAM START: Idle -> Feed Run
     if _G.lastMachineState == STATE_IDLE and currentState == STATE_FRUN then
         
-        -- Check dust collection auto (#400)
+        -- Check dust collection auto (#400) - always start immediately
         if mc.mcCntlGetPoundVar(inst, 400) == 1 then
             local hDust = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT4)
             if hDust and hDust > 0 then
                 mc.mcSignalSetState(hDust, 1)  -- Turn ON
+                mc.mcCntlSetLastError(inst, "AUTO: Dust collection ON")
             end
         end
         
-        -- Check dust boot auto (#402)
-        if mc.mcCntlGetPoundVar(inst, 402) == 1 then
-            local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
-            if hBoot and hBoot > 0 then
-                mc.mcSignalSetState(hBoot, 1)  -- Lower boot
+        -- Check if we should prepare for boot lowering (handles no-M6 case)
+        -- Only if not already waiting from M6
+        if not _G.waitingForMotionAfterToolChange then
+            local currentTool = mc.mcToolGetCurrent(inst)
+            if currentTool > 0 and currentTool < 90 and mc.mcCntlGetPoundVar(inst, 402) == 1 then
+                -- Physical tool loaded and boot auto enabled - prepare for motion
+                _G.waitingForMotionAfterToolChange = true
+                _G.motionHasStarted = false
+                mc.mcCntlSetLastError(inst, string.format("T%d active - boot will lower on first cut", currentTool))
             end
         end
-        
-        -- Log what's enabled
-        local dustOn = mc.mcCntlGetPoundVar(inst, 400) == 1
-        local bootOn = mc.mcCntlGetPoundVar(inst, 402) == 1
-      
         
     -- PROGRAM END: Feed Run -> Idle
     elseif _G.lastMachineState == STATE_FRUN and currentState == STATE_IDLE then
@@ -500,20 +544,17 @@ if currentState ~= _G.lastMachineState then
             -- M6/Probe is running, skip auto stop
         else
             -- Normal auto stop behavior
-            local msg = "AUTO STOP: "
             
             -- Always turn off dust collection
             local hDust = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT4)
             if hDust and hDust > 0 then
                 mc.mcSignalSetState(hDust, 0)  -- Turn OFF
-                msg = msg .. "Dust OFF, "
             end
             
             -- Always raise dust boot
             local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
             if hBoot and hBoot > 0 then
                 mc.mcSignalSetState(hBoot, 0)  -- Raise boot
-                msg = msg .. "Boot UP, "
             end
             
             -- Check vacuum auto shutdown (#401)
@@ -527,17 +568,155 @@ if currentState ~= _G.lastMachineState then
                 if hVac2 and hVac2 > 0 then
                     mc.mcSignalSetState(hVac2, 0)  -- Turn OFF
                 end
-                msg = msg .. "Vacuums OFF"
+                mc.mcCntlSetLastError(inst, "AUTO STOP: Dust OFF, Boot UP, Vacuums per setting")
             else
-                msg = msg .. "Vacuums unchanged"
+                mc.mcCntlSetLastError(inst, "AUTO STOP: Dust OFF, Boot UP")
             end
             
-            mc.mcCntlSetLastError(inst, msg)
+            -- Clear motion flags
+            _G.waitingForMotionAfterToolChange = false
+            _G.motionHasStarted = false
         end
     end
     
     -- Update last state for next cycle
     _G.lastMachineState = currentState
+end
+
+
+
+-- HANDLE BOOT LOWERING ON MOTION (DEBUG VERSION)
+-- This version will catch and report errors without crashing PLC
+
+-- Wrap everything in protected call to catch errors
+local success, err = pcall(function()
+    
+    -- DEBUG: Check if spinUpDwell exists
+    local spinUpDwellStatus = "not initialized"
+    if _G.spinUpDwell == nil then
+        spinUpDwellStatus = "NIL"
+    elseif type(_G.spinUpDwell) ~= "table" then
+        spinUpDwellStatus = "NOT A TABLE: " .. type(_G.spinUpDwell)
+    else
+        spinUpDwellStatus = string.format("armed=%s, active=%s", 
+            tostring(_G.spinUpDwell.armed), 
+            tostring(_G.spinUpDwell.pauseActive))
+    end
+    
+    -- Log status every 50 cycles (1 second)
+    if testcount % 50 == 0 then
+        mc.mcCntlSetLastError(inst, "DEBUG: spinUpDwell = " .. spinUpDwellStatus)
+    end
+    
+    -- Only manage boot if M6 is NOT running and in cycle
+    local m6Running = mc.mcCntlGetPoundVar(inst, 499) == 1
+    
+    -- SAFE CHECK FOR SPINDLE DWELL
+    local skipForSpindleDwell = false
+    if _G.spinUpDwell ~= nil and type(_G.spinUpDwell) == "table" then
+        if _G.spinUpDwell.armed == true or _G.spinUpDwell.pauseActive == true then
+            skipForSpindleDwell = true
+            -- DEBUG: Log when we skip
+            if testcount % 10 == 0 then
+                mc.mcCntlSetLastError(inst, "DEBUG: Skipping dust boot - spindle dwell active")
+            end
+        end
+    end
+    
+    if skipForSpindleDwell then
+        -- Spindle dwell is active, skip dust boot processing
+        return  -- Exit the pcall function
+        
+    elseif inCycle == 1 and mc.mcCntlGetPoundVar(inst, 402) == 1 and not m6Running then
+        -- Now safe to process dust boot automation
+        
+        -- Get current tool and boot state
+        local currentTool = mc.mcToolGetCurrent(inst)
+        
+        -- DEBUG: Check if handle operations might fail
+        local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+        if not hBoot or hBoot <= 0 then
+            mc.mcCntlSetLastError(inst, "ERROR: Invalid dust boot handle!")
+            return
+        end
+        
+        local bootIsDown = mc.mcSignalGetState(hBoot)
+        
+        -- Only check motion if explicitly waiting
+        if _G.waitingForMotionAfterToolChange then
+            
+            -- DEBUG: Log that we're checking motion
+            if testcount % 20 == 0 then
+                mc.mcCntlSetLastError(inst, "DEBUG: Checking for motion...")
+            end
+            
+            -- Get motion mode with error checking
+            local motionMode = mc.mcCntlGetPoundVar(inst, 4000)  -- 0=G0, 1=G1, 2=G2, 3=G3
+            
+            -- Check for feed motion (G1/G2/G3 only, not G0)
+            if motionMode >= 1 and motionMode <= 3 then  -- G1, G2, or G3
+                
+                -- DEBUG: Wrap velocity checks in protected call
+                local velSuccess, xVel, yVel = pcall(function()
+                    local x = mc.mcAxisGetVel(inst, 0)
+                    local y = mc.mcAxisGetVel(inst, 1)
+                    return x, y
+                end)
+                
+                if not velSuccess then
+                    mc.mcCntlSetLastError(inst, "ERROR: Failed to get axis velocities!")
+                    return
+                end
+                
+                -- Adjust threshold based on your units
+                local threshold = 1.0
+                
+                if math.abs(xVel) > threshold or math.abs(yVel) > threshold then
+                    _G.motionHasStarted = true  -- Latch that motion occurred
+                    mc.mcCntlSetLastError(inst, "DEBUG: Motion detected!")
+                end
+            end
+            
+            -- Lower boot if motion detected
+            if _G.motionHasStarted and bootIsDown == 0 then
+                -- Verify we still have a physical tool
+                if currentTool > 0 and currentTool < 90 then
+                    -- Try to set signal with error checking
+                    local setSuccess = pcall(function()
+                        mc.mcSignalSetState(hBoot, 1)  -- Lower boot
+                    end)
+                    
+                    if setSuccess then
+                        mc.mcCntlSetLastError(inst, string.format("Dust boot lowered for T%d", currentTool))
+                        _G.waitingForMotionAfterToolChange = false
+                        _G.motionHasStarted = false
+                    else
+                        mc.mcCntlSetLastError(inst, "ERROR: Failed to lower dust boot!")
+                    end
+                end
+            end
+        end
+        
+        -- Safety check: Ensure boot is UP for virtual tools
+        if currentTool >= 90 and currentTool <= 99 and bootIsDown == 1 then
+            local raiseSuccess = pcall(function()
+                mc.mcSignalSetState(hBoot, 0)  -- Raise boot
+            end)
+            if raiseSuccess then
+                mc.mcCntlSetLastError(inst, "Safety: Boot raised for virtual tool")
+            else
+                mc.mcCntlSetLastError(inst, "ERROR: Failed to raise boot for virtual tool!")
+            end
+        end
+    end
+end)
+
+-- Report any errors that occurred
+if not success then
+    mc.mcCntlSetLastError(inst, "*** DUST BOOT CRASH: " .. tostring(err) .. " ***")
+    -- Clear flags to prevent stuck state
+    _G.waitingForMotionAfterToolChange = false
+    _G.motionHasStarted = false
 end
 
 
@@ -619,6 +798,16 @@ if not _G.lastWorkOffset then
     _G.lastWorkOffset = -1  -- Force first update
 end
 
+-- Initialize tab monitor with 100ms check interval
+if not _G.tabMonitor then
+    _G.tabMonitor = {
+        lastTab = -1,
+        checkCounter = 0,
+        checkInterval = 5,  -- Check every 5 cycles (100ms)
+        needsRefresh = false
+    }
+end
+
 -- Get current work offset
 local currentOffset = mc.mcCntlGetPoundVar(inst, mc.SV_MOD_GROUP_14 or 5220)
 
@@ -646,6 +835,45 @@ if currentOffset ~= _G.lastWorkOffset then
     
     -- Update tracking variable
     _G.lastWorkOffset = currentOffset
+end
+
+-- TAB CHANGE DETECTION (100ms interval)
+-- Only check tab every 5 cycles to reduce overhead
+_G.tabMonitor.checkCounter = _G.tabMonitor.checkCounter + 1
+if _G.tabMonitor.checkCounter >= _G.tabMonitor.checkInterval then
+    _G.tabMonitor.checkCounter = 0
+    
+    -- Check current tab
+    local ok, tabStr = pcall(scr.GetProperty, "MainTabs", "Current Tab")
+    if ok and tabStr then
+        local currentTab = tonumber(tabStr) or -1
+        
+        -- Only update if changed
+        if currentTab ~= _G.tabMonitor.lastTab and currentTab >= 0 then
+            _G.tabMonitor.needsRefresh = true
+            _G.tabMonitor.lastTab = currentTab
+        end
+    end
+end
+
+-- Perform refresh if needed
+if _G.tabMonitor.needsRefresh then
+    _G.tabMonitor.needsRefresh = false
+    
+    -- Refresh work offset buttons
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+    
+    -- Also refresh soft limits button
+    if SyncSoftLimitsButton then
+        SyncSoftLimitsButton()
+    end
+    
+    -- Refresh dust collection buttons if they exist
+    if SyncDustButtons then
+        SyncDustButtons()
+    end
 end
 
 
@@ -1053,80 +1281,164 @@ end
 
 
 -- ================================
--- Spindle Spin-UP Dwell
+-- Spindle Spin-UP Dwell (DEBUG VERSION)
 -- ================================
 local inst = mc.mcGetInstance()
 
--- Initialize on first run
-if not _G.spinUpDwell then
-    _G.spinUpDwell = {
-        armed = false,
-        delaySeconds = 0,
-        startTime = 0,
-        pauseActive = false,
-        lastSpindleState = 0
-    }
-end
-
--- Check if M6 armed the dwell
-local spinUpFlag = mc.mcCntlGetPoundVar(inst, 495)
-if spinUpFlag == 1 then
-    _G.spinUpDwell.armed = true
-    _G.spinUpDwell.delaySeconds = mc.mcCntlGetPoundVar(inst, 496) or 0.7
-    mc.mcCntlSetPoundVar(inst, 495, 0)  -- Clear flag immediately
+-- Wrap entire spindle dwell in protected call
+local success, err = pcall(function()
     
-    if _G.spinUpDwell.delaySeconds > 0 then
-        mc.mcCntlSetLastError(inst, string.format("Spindle dwell armed: %.1fs", _G.spinUpDwell.delaySeconds))
+    -- Initialize on first run
+    if not _G.spinUpDwell then
+        _G.spinUpDwell = {
+            armed = false,
+            delaySeconds = 0,
+            startTime = 0,
+            pauseActive = false,
+            lastSpindleState = 0,
+            waitingForMotion = false
+        }
+        mc.mcCntlSetLastError(inst, "DEBUG: spinUpDwell initialized")
     end
-end
 
--- Get machine state
-local machState = mc.mcCntlGetState(inst)
-
--- Only process if armed and machine is running
-if _G.spinUpDwell.armed and machState == mc.MC_STATE_FRUN then
-    -- Get spindle state (0=off, 1=CW, 2=CCW)
-    local spindleState = mc.mcSpindleGetState(inst)
-    local spindleOn = (spindleState ~= 0) and 1 or 0
-    
-    -- Detect spindle start (rising edge from off to on)
-    if _G.spinUpDwell.lastSpindleState == 0 and spindleOn == 1 and not _G.spinUpDwell.pauseActive then
-        -- Start the dwell
-        _G.spinUpDwell.pauseActive = true
-        _G.spinUpDwell.startTime = os.clock()
+    -- Check if M6 armed the dwell
+    local spinUpFlag = mc.mcCntlGetPoundVar(inst, 495)
+    if spinUpFlag == 1 then
+        _G.spinUpDwell.armed = true
+        _G.spinUpDwell.delaySeconds = mc.mcCntlGetPoundVar(inst, 496) or 0.7
+        _G.spinUpDwell.waitingForMotion = false
+        mc.mcCntlSetPoundVar(inst, 495, 0)
         
-        -- Use feed hold to pause motion
-        mc.mcCntlFeedHold(inst)
-        mc.mcCntlSetLastError(inst, string.format("Spindle spin-up pause: %.1fs", _G.spinUpDwell.delaySeconds))
-    end
-    
-    -- Check if dwell is complete
-    if _G.spinUpDwell.pauseActive then
-        local elapsed = os.clock() - _G.spinUpDwell.startTime
-        
-        if elapsed >= _G.spinUpDwell.delaySeconds then
-            -- Resume motion
-            mc.mcCntlCycleStart(inst)
-            
-            -- Reset everything
-            _G.spinUpDwell.armed = false
-            _G.spinUpDwell.pauseActive = false
-            _G.spinUpDwell.delaySeconds = 0
-            
-            mc.mcCntlSetLastError(inst, "Spindle at speed - resuming")
+        if _G.spinUpDwell.delaySeconds > 0 then
+            mc.mcCntlSetLastError(inst, string.format("Spindle dwell armed: %.1fs", _G.spinUpDwell.delaySeconds))
         end
     end
-    
-    _G.spinUpDwell.lastSpindleState = spindleOn
-end
 
--- Reset if machine stops
-if machState == mc.MC_STATE_IDLE then
-    if _G.spinUpDwell.pauseActive then
-        _G.spinUpDwell.pauseActive = false
-        _G.spinUpDwell.armed = false
-        mc.mcCntlSetLastError(inst, "Spindle dwell cancelled - machine idle")
+    -- Get machine state (with error checking)
+    local stateSuccess, machState = pcall(function()
+        return mc.mcCntlGetState(inst)
+    end)
+    
+    if not stateSuccess then
+        mc.mcCntlSetLastError(inst, "ERROR: Failed to get machine state")
+        return
     end
+
+    -- Only process if armed and machine is running
+    if _G.spinUpDwell.armed and machState == mc.MC_STATE_FRUN then
+        
+        -- Get spindle state (with error checking)
+        local spindleSuccess, spindleState = pcall(function()
+            return mc.mcSpindleGetState(inst)
+        end)
+        
+        if not spindleSuccess then
+            mc.mcCntlSetLastError(inst, "ERROR: Failed to get spindle state")
+            return
+        end
+        
+        local spindleOn = (spindleState ~= 0) and 1 or 0
+        
+        -- Detect spindle start (rising edge from off to on)
+        if _G.spinUpDwell.lastSpindleState == 0 and spindleOn == 1 and not _G.spinUpDwell.pauseActive then
+            mc.mcCntlSetLastError(inst, "DEBUG: Spindle started - checking for motion...")
+            _G.spinUpDwell.waitingForMotion = true
+        end
+        
+        -- If waiting for motion, check if axes are moving
+        if _G.spinUpDwell.waitingForMotion and not _G.spinUpDwell.pauseActive then
+            
+            -- Check mcCntlIsInCycle (this might be the problem!)
+            local cycleSuccess, inCycle = pcall(function()
+                return mc.mcCntlIsInCycle(inst)
+            end)
+            
+            if not cycleSuccess then
+                mc.mcCntlSetLastError(inst, "ERROR: mcCntlIsInCycle failed!")
+                return
+            end
+            
+            -- Check velocities (this might also fail!)
+            local velSuccess, xVel, yVel, zVel = pcall(function()
+                local x = mc.mcAxisGetVel(inst, 0)
+                local y = mc.mcAxisGetVel(inst, 1) 
+                local z = mc.mcAxisGetVel(inst, 2)
+                return x, y, z
+            end)
+            
+            if not velSuccess then
+                mc.mcCntlSetLastError(inst, "ERROR: mcAxisGetVel failed!")
+                return
+            end
+            
+            local threshold = 0.1
+            
+            -- If motion detected AND in cycle, pause
+            if inCycle == 1 and (math.abs(xVel) > threshold or 
+                                  math.abs(yVel) > threshold or 
+                                  math.abs(zVel) > threshold) then
+                
+                mc.mcCntlSetLastError(inst, "DEBUG: Motion detected, attempting feed hold...")
+                
+                -- Try feed hold (THIS might be the crash!)
+                local holdSuccess = pcall(function()
+                    mc.mcCntlFeedHold(inst)
+                end)
+                
+                if holdSuccess then
+                    _G.spinUpDwell.waitingForMotion = false
+                    _G.spinUpDwell.pauseActive = true
+                    _G.spinUpDwell.startTime = os.clock()
+                    mc.mcCntlSetLastError(inst, string.format("Spindle spin-up pause: %.1fs", _G.spinUpDwell.delaySeconds))
+                else
+                    mc.mcCntlSetLastError(inst, "ERROR: Feed hold FAILED!")
+                end
+            end
+        end
+        
+        -- Check if dwell is complete
+        if _G.spinUpDwell.pauseActive then
+            local elapsed = os.clock() - _G.spinUpDwell.startTime
+            
+            if elapsed >= _G.spinUpDwell.delaySeconds then
+                -- Try cycle start
+                local startSuccess = pcall(function()
+                    mc.mcCntlCycleStart(inst)
+                end)
+                
+                if startSuccess then
+                    _G.spinUpDwell.armed = false
+                    _G.spinUpDwell.pauseActive = false
+                    _G.spinUpDwell.waitingForMotion = false
+                    _G.spinUpDwell.delaySeconds = 0
+                    mc.mcCntlSetLastError(inst, "Spindle at speed - resuming")
+                else
+                    mc.mcCntlSetLastError(inst, "ERROR: Cycle start FAILED!")
+                end
+            end
+        end
+        
+        _G.spinUpDwell.lastSpindleState = spindleOn
+    end
+
+    -- Reset if machine stops
+    if machState == mc.MC_STATE_IDLE then
+        if _G.spinUpDwell.pauseActive or _G.spinUpDwell.waitingForMotion then
+            _G.spinUpDwell.pauseActive = false
+            _G.spinUpDwell.armed = false
+            _G.spinUpDwell.waitingForMotion = false
+            mc.mcCntlSetLastError(inst, "Spindle dwell cancelled - machine idle")
+        end
+    end
+end)
+
+-- Report any errors
+if not success then
+    mc.mcCntlSetLastError(inst, "*** SPINDLE DWELL CRASH: " .. tostring(err) .. " ***")
+    -- Reset to safe state
+    _G.spinUpDwell.armed = false
+    _G.spinUpDwell.pauseActive = false
+    _G.spinUpDwell.waitingForMotion = false
 end
 
 

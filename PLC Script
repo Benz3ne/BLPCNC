@@ -19,8 +19,46 @@ local machWasEnabled = machEnabled
 -- Get current tool
 local currentTool = mc.mcToolGetCurrent(inst)
 
--- Increment test counter
-testcount = testcount + 1
+local STATE_IDLE = 0        -- Machine idle (CONFIRMED)
+local STATE_FRUN = 100      -- Feed running (CONFIRMED)
+local STATE_FHOLD = 101     -- Feed hold (CONFIRMED)
+local STATE_PHOLD = 102     -- Probe hold during G31 (CONFIRMED)
+local STATE_MRUN = 200      -- MDI/Macro running (CONFIRMED)
+local STATE_MRUN_FH = 201   -- MDI/Macro feed hold (CONFIRMED)
+local STATE_MHOLD = 103     -- Alternate hold state (probable)
+local STATE_HOLD_SYNC = 110 -- Hold sync state (probable)
+local STATE_STOP = 109      -- Stop state (probable)
+
+-- PRODUCTION MODE CONTROL - Set to false for debugging
+_G.PRODUCTION_MODE = true  -- Set to false to enable debug messages
+
+-- Debug print function that respects production mode
+local function debugPrint(message)
+    if not _G.PRODUCTION_MODE then
+        mc.mcCntlSetLastError(inst, message)
+    end
+end
+
+-- Initialize M6 completion tracking for edge detection
+if not _G.m6CompletionTracking then
+    _G.m6CompletionTracking = {
+        lastFlag = 0,              -- Previous #481 state
+        processingComplete = false, -- Already processed this completion
+        lastProcessTime = 0,        -- Time of last processing
+        completionCount = 0         -- Counter (kept for production monitoring)
+    }
+end
+
+if not _G.dustDebug then
+    _G.dustDebug = { 
+        cycleCount = 0  -- Keep only essential counter
+    }
+end
+
+-- Increment cycle counter
+_G.dustDebug.cycleCount = _G.dustDebug.cycleCount + 1
+
+
 
 -------------------------------------------------------
 --  Set plate align (G68) Led
@@ -130,6 +168,12 @@ end
 local function promptToolSelection(isStartup)
     local virtualToolActive = mc.mcCntlGetPoundVar(inst, 406) >= 90
     local suppressPrompt = mc.mcCntlGetPoundVar(inst, 498) == 1
+	
+	 if not _G.toolChoices or not _G.toolNumbers then
+        mc.mcCntlSetLastError(inst, "ERROR: Tool configuration not loaded")
+        mc.mcToolSetCurrent(inst, 0)
+        return
+    end
 
     if virtualToolActive or suppressPrompt then
         return
@@ -379,248 +423,161 @@ end
 local currentState = mc.mcCntlGetState(inst)
 local inCycle = mc.mcCntlIsInCycle(inst)
 
-local STATE_IDLE = 0
-local STATE_FRUN = 100
-
 local m6Flag = mc.mcCntlGetPoundVar(inst, 499)
-local probeFlag = mc.mcCntlGetPoundVar(inst, 496)
 local m6Completed = mc.mcCntlGetPoundVar(inst, 481)
 
--- CHECK FOR M6 COMPLETION
-if m6Completed == 1 then
-    mc.mcCntlSetPoundVar(inst, 481, 0)
-    
-    local currentTool = mc.mcToolGetCurrent(inst)
-    
-    if mc.mcCntlGetPoundVar(inst, 402) == 1 then
-        if currentTool > 0 and currentTool < 90 then
-            _G.waitingForMotionAfterToolChange = true
-            _G.motionHasStarted = false
-            mc.mcCntlSetLastError(inst, string.format("T%d ready - boot will lower on first cut", currentTool))
-            
-        elseif currentTool >= 90 and currentTool <= 99 then
-            local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
-            if hBoot and hBoot > 0 then
-                mc.mcSignalSetState(hBoot, 0)
-            end
-            _G.waitingForMotionAfterToolChange = false
-            _G.motionHasStarted = false
-            mc.mcCntlSetLastError(inst, string.format("Virtual T%d active - boot raised", currentTool))
-            
-        elseif currentTool == 0 then
-            _G.waitingForMotionAfterToolChange = false
-            _G.motionHasStarted = false
-        end
-    end
-end
 
 
+-- CHECK FOR M6 COMPLETION (with edge detection to prevent spam)
+local m6CompletedFlag = mc.mcCntlGetPoundVar(inst, 481)
 
-
-
--- ============================================
--- POUND VARIABLE #481 DIAGNOSTIC TEST
--- Place this in your PLC script temporarily
--- ============================================
-
--- Add this section RIGHT AFTER the M6 completion check section
--- (around line 260-280 in your PLC)
-
--- Diagnostic tracking variables
-if not _G.poundVarDiag then
-    _G.poundVarDiag = {
-        testCounter = 0,
-        lastValue481 = -999,
-        clearAttempts = 0,
-        firstDetection = 0,
-        stateWhenDetected = 0,
-        cycleWhenDetected = 0,
-        lastClearAttempt = 0,
-        m6RunningWhenSet = 0,
-        valueHistory = {},
-        maxHistory = 20
-    }
-end
-
--- Every PLC cycle, check #481
-local current481 = mc.mcCntlGetPoundVar(inst, 481)
-local currentTime = os.clock()
-
--- Track value changes
-if current481 ~= _G.poundVarDiag.lastValue481 then
-    -- Value changed!
-    local changeInfo = string.format("t=%.3f: #481 changed %d -> %d (state=%d, cycle=%s, M6flag=#499=%d)", 
-        currentTime,
-        _G.poundVarDiag.lastValue481,
-        current481,
-        mc.mcCntlGetState(inst),
-        tostring(mc.mcCntlIsInCycle(inst)),
-        mc.mcCntlGetPoundVar(inst, 499))
-    
-    mc.mcCntlSetLastError(inst, "DIAG: " .. changeInfo)
-    
-    -- Store in history
-    table.insert(_G.poundVarDiag.valueHistory, changeInfo)
-    if #_G.poundVarDiag.valueHistory > _G.poundVarDiag.maxHistory then
-        table.remove(_G.poundVarDiag.valueHistory, 1)
-    end
-    
-    -- If it just became 1, record context
-    if current481 == 1 and _G.poundVarDiag.lastValue481 ~= 1 then
-        _G.poundVarDiag.firstDetection = currentTime
-        _G.poundVarDiag.stateWhenDetected = mc.mcCntlGetState(inst)
-        _G.poundVarDiag.cycleWhenDetected = mc.mcCntlIsInCycle(inst)
-        _G.poundVarDiag.m6RunningWhenSet = mc.mcCntlGetPoundVar(inst, 499)
-        _G.poundVarDiag.clearAttempts = 0
-    end
-    
-    _G.poundVarDiag.lastValue481 = current481
-end
-
--- Special test when #481 = 1
-if current481 == 1 then
-    _G.poundVarDiag.testCounter = _G.poundVarDiag.testCounter + 1
-    
-    -- Every 10 cycles (200ms), try different clearing methods
-    if _G.poundVarDiag.testCounter % 10 == 0 then
-        local testNum = math.floor(_G.poundVarDiag.testCounter / 10)
+-- Rising edge detection: 0 -> 1 transition
+if m6CompletedFlag == 1 and _G.m6CompletionTracking.lastFlag == 0 then
+    -- Time guard: prevent double processing within 500ms
+    local currentTime = os.clock()
+    if (currentTime - _G.m6CompletionTracking.lastProcessTime) > 0.5 then
         
-        mc.mcCntlSetLastError(inst, string.format("DIAG: Test %d - #481 stuck at 1 for %.2fs", 
-            testNum, currentTime - _G.poundVarDiag.firstDetection))
+        -- CRITICAL: Clear flag IMMEDIATELY to prevent re-processing
+        mc.mcCntlSetPoundVar(inst, 481, 0)
         
-        -- Try different clearing methods
-        if testNum == 1 then
-            -- Method 1: Direct set
-            mc.mcCntlSetLastError(inst, "DIAG: Method 1 - Direct set to 0")
-            mc.mcCntlSetPoundVar(inst, 481, 0)
-            
-        elseif testNum == 2 then
-            -- Method 2: Set to different value first
-            mc.mcCntlSetLastError(inst, "DIAG: Method 2 - Set to 99 then 0")
-            mc.mcCntlSetPoundVar(inst, 481, 99)
-            wx.wxMilliSleep(1)
-            mc.mcCntlSetPoundVar(inst, 481, 0)
-            
-        elseif testNum == 3 then
-            -- Method 3: Check if M6 is still running
-            local m6Running = mc.mcCntlGetPoundVar(inst, 499)
-            mc.mcCntlSetLastError(inst, string.format("DIAG: Method 3 - M6 running = %d", m6Running))
-            if m6Running == 1 then
-                mc.mcCntlSetLastError(inst, "DIAG: M6 still running - forcing #499 = 0")
-                mc.mcCntlSetPoundVar(inst, 499, 0)
-            end
-            mc.mcCntlSetPoundVar(inst, 481, 0)
-            
-        elseif testNum == 4 then
-            -- Method 4: Use GCode to set it
-            mc.mcCntlSetLastError(inst, "DIAG: Method 4 - Using GCode #481=0")
-            mc.mcCntlMdiExecute(inst, "#481=0")
-            
-        elseif testNum == 5 then
-            -- Method 5: Check who's setting it
-            mc.mcCntlSetLastError(inst, "DIAG: Method 5 - Checking other pound vars")
-            local vars = {
-                ["#499 (M6 running)"] = 499,
-                ["#495 (Spindle dwell)"] = 495,
-                ["#496 (Dwell time)"] = 496,
-                ["#498 (Dialog supp)"] = 498
-            }
-            for name, var in pairs(vars) do
-                local val = mc.mcCntlGetPoundVar(inst, var)
-                mc.mcCntlSetLastError(inst, string.format("  %s = %d", name, val))
-            end
-            
-        elseif testNum == 6 then
-            -- Method 6: Check if it's being set by screen script
-            mc.mcCntlSetLastError(inst, "DIAG: Checking if external script is setting #481")
-            -- Set a marker to detect external changes
-            mc.mcCntlSetPoundVar(inst, 481, -1)  -- Unusual value
-            
-        elseif testNum == 7 then
-            -- Check if -1 stuck or changed back to 1
-            if current481 == -1 then
-                mc.mcCntlSetLastError(inst, "DIAG: #481 accepted -1, now setting to 0")
-                mc.mcCntlSetPoundVar(inst, 481, 0)
-            else
-                mc.mcCntlSetLastError(inst, "DIAG: #481 changed from -1 back to 1 - EXTERNAL SOURCE!")
-            end
-            
-        elseif testNum >= 8 then
-            -- Give up and show history
-            mc.mcCntlSetLastError(inst, "DIAG: === POUND VAR #481 HISTORY ===")
-            for i, entry in ipairs(_G.poundVarDiag.valueHistory) do
-                mc.mcCntlSetLastError(inst, "  " .. entry)
-            end
-            _G.poundVarDiag.testCounter = 0  -- Reset for next time
+        -- Mark as processed
+        _G.m6CompletionTracking.processingComplete = true
+        _G.m6CompletionTracking.lastProcessTime = currentTime
+        _G.m6CompletionTracking.completionCount = _G.m6CompletionTracking.completionCount + 1
+        
+        -- Get current tool for processing
+        local currentTool = mc.mcToolGetCurrent(inst)
+        
+        -- Single log message (only in debug mode)
+        if not _G.PRODUCTION_MODE then
+            mc.mcCntlSetLastError(inst, string.format("M6 Complete #%d: T%d, automation=#402=%d", 
+                _G.m6CompletionTracking.completionCount,
+                currentTool, 
+                mc.mcCntlGetPoundVar(inst, 402)))
+        else
+            -- Production mode: simple message
+            mc.mcCntlSetLastError(inst, string.format("Tool change complete: T%d", currentTool))
         end
         
-        _G.poundVarDiag.lastClearAttempt = currentTime
+ -- Setup dust boot automation
+        if mc.mcCntlGetPoundVar(inst, 402) == 1 then -- Dust boot automation enabled
+            if currentTool > 0 and currentTool < 90 then
+                -- Physical tool - arm dust boot to lower on motion
+                _G.waitingForMotionAfterToolChange = true
+                _G.motionHasStarted = false
+                _G.motionCheckStartTime = os.clock()
+                _G.motionCheckCycles = 0
+                mc.mcCntlSetLastError(inst, string.format("T%d ready - boot will lower on first cut", currentTool))
+                
+            elseif currentTool >= 90 and currentTool <= 99 then
+                -- Virtual tool - raise boot
+                local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+                if hBoot and hBoot > 0 then
+                    mc.mcSignalSetState(hBoot, 0)
+                    if not _G.PRODUCTION_MODE then
+                        mc.mcCntlSetLastError(inst, string.format("Virtual T%d - boot raised", currentTool))
+                    end
+                end
+                _G.waitingForMotionAfterToolChange = false
+                _G.motionHasStarted = false
+                
+            elseif currentTool == 0 then
+                -- T0 - no automation
+                _G.waitingForMotionAfterToolChange = false
+                _G.motionHasStarted = false
+                if not _G.PRODUCTION_MODE then
+                    mc.mcCntlSetLastError(inst, "T0 - no boot automation")
+                end
+            end
+        else
+            if not _G.PRODUCTION_MODE then
+                mc.mcCntlSetLastError(inst, "Boot automation disabled (#402=0)")
+            end
+        end
+    else
+        -- Too soon after last processing, skip
+        if not _G.PRODUCTION_MODE then
+            local timeSince = currentTime - _G.m6CompletionTracking.lastProcessTime
+            debugPrint(string.format("M6 completion ignored - too soon (%.2fs since last)", timeSince))
+        end
     end
-else
-    -- #481 is 0, reset counter
-    if _G.poundVarDiag.testCounter > 0 then
-        mc.mcCntlSetLastError(inst, string.format("DIAG: SUCCESS - #481 cleared after %d tests", 
-            math.floor(_G.poundVarDiag.testCounter / 10)))
-        _G.poundVarDiag.testCounter = 0
-    end
-end
-
--- Also monitor #499 (M6 running flag)
-local current499 = mc.mcCntlGetPoundVar(inst, 499)
-if not _G.poundVarDiag.lastValue499 then
-    _G.poundVarDiag.lastValue499 = current499
-elseif current499 ~= _G.poundVarDiag.lastValue499 then
-    mc.mcCntlSetLastError(inst, string.format("DIAG: #499 (M6 flag) changed %d -> %d", 
-        _G.poundVarDiag.lastValue499, current499))
-    _G.poundVarDiag.lastValue499 = current499
-end
-
--- ============================================
--- END DIAGNOSTIC SECTION
--- ============================================
-
-
-
-
-
--- Only process on state changes
-if currentState ~= _G.lastMachineState then
     
-    -- PROGRAM START: Idle -> Feed Run
-    if _G.lastMachineState == STATE_IDLE and currentState == STATE_FRUN then
-        
+elseif m6CompletedFlag == 0 then
+    -- Flag is clear, reset for next M6
+    _G.m6CompletionTracking.processingComplete = false
+end
+
+-- Update state for next cycle (this is our edge detection memory)
+_G.m6CompletionTracking.lastFlag = m6CompletedFlag
+
+
+-- Check if we should skip dust boot shutdown
+local skipDustShutdown = 0
+
+-- Skip if M6 is running
+if mc.mcCntlGetPoundVar(inst, 499) == 1 then
+    skipDustShutdown = 1
+end
+
+-- Skip if ANY virtual tool is active (T90-T99)
+local virtualTool = mc.mcCntlGetPoundVar(inst, 406) or 0
+if virtualTool >= 90 and virtualTool <= 99 then
+    skipDustShutdown = 1
+end
+
+	-- PROGRAM START/STOP HANDLERS
+	if currentState ~= _G.lastMachineState then
+		-- *** REMOVED: Debug logging for production ***
+		
+		-- PROGRAM START: Idle -> Feed Run
+		if _G.lastMachineState == STATE_IDLE and currentState == STATE_FRUN then
+        -- Start dust collection if enabled
         if mc.mcCntlGetPoundVar(inst, 400) == 1 then
             local hDust = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT4)
             if hDust and hDust > 0 then
                 mc.mcSignalSetState(hDust, 1)
-                mc.mcCntlSetLastError(inst, "AUTO: Dust collection ON")
+                mc.mcCntlSetLastError(inst, "Dust collection ON")
             end
         end
+      
+		-- Clear dust boot automation flags on program start
+        _G.waitingForMotionAfterToolChange = false
+        _G.motionHasStarted = false
+        _G.motionCheckCycles = 0
         
-        if not _G.waitingForMotionAfterToolChange then
+        if not _G.PRODUCTION_MODE then
             local currentTool = mc.mcToolGetCurrent(inst)
-            if currentTool > 0 and currentTool < 90 and mc.mcCntlGetPoundVar(inst, 402) == 1 then
-                _G.waitingForMotionAfterToolChange = true
-                _G.motionHasStarted = false
-                mc.mcCntlSetLastError(inst, string.format("T%d active - boot will lower on first cut", currentTool))
+            if currentTool > 0 and currentTool < 90 then
+                debugPrint(string.format("Program started with T%d - boot will arm after M6 if needed", currentTool))
             end
         end
-        
+		
     -- PROGRAM END: Feed Run -> Idle
     elseif _G.lastMachineState == STATE_FRUN and currentState == STATE_IDLE then
-        
-        if probeFlag == 1 then
-            -- M6/Probe is running, skip auto stop
+        if skipDustShutdown == 1 then
+            local skipReason = ""
+            if mc.mcCntlGetPoundVar(inst, 499) == 1 then
+                skipReason = "M6 active"
+            elseif virtualTool >= 90 then
+                skipReason = string.format("Virtual tool T%d active", virtualTool)
+            end
+            if not _G.PRODUCTION_MODE then
+                mc.mcCntlSetLastError(inst, string.format("Skipping auto-stop (%s)", skipReason))
+            end
         else
+            -- SHUTDOWN LOGIC
             local hDust = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT4)
+            local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+            
             if hDust and hDust > 0 then
                 mc.mcSignalSetState(hDust, 0)
             end
             
-            local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
             if hBoot and hBoot > 0 then
                 mc.mcSignalSetState(hBoot, 0)
             end
+            
+            mc.mcCntlSetLastError(inst, "Program end - Dust OFF, Boot UP")
             
             if mc.mcCntlGetPoundVar(inst, 401) == 1 then
                 local hVac1 = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT5)
@@ -632,30 +589,24 @@ if currentState ~= _G.lastMachineState then
                 if hVac2 and hVac2 > 0 then
                     mc.mcSignalSetState(hVac2, 0)
                 end
-                mc.mcCntlSetLastError(inst, "AUTO STOP: Dust OFF, Boot UP, Vacuums per setting")
-            else
-                mc.mcCntlSetLastError(inst, "AUTO STOP: Dust OFF, Boot UP")
             end
             
+            -- Reset all flags on program end
             _G.waitingForMotionAfterToolChange = false
             _G.motionHasStarted = false
+            _G.motionCheckCycles = 0
         end
     end
     
     _G.lastMachineState = currentState
+end  -- THIS IS THE ONLY 'end' THAT SHOULD BE HERE
+
+-- Track motion check cycles
+if _G.waitingForMotionAfterToolChange then
+    _G.motionCheckCycles = (_G.motionCheckCycles or 0) + 1
 end
 
--- HANDLE BOOT LOWERING ON MOTION
-local skipForSpindleDwell = false
-if _G.spinUpDwell ~= nil and type(_G.spinUpDwell) == "table" then
-    -- Check if spindle delay is still active (new simpler logic)
-    if _G.spinUpDwell.armed == true or 
-       (_G.spinUpDwell.spindleStartTime > 0 and not _G.spinUpDwell.delayComplete) then
-        skipForSpindleDwell = true
-    end
-end
-
-if not skipForSpindleDwell and inCycle == 1 and mc.mcCntlGetPoundVar(inst, 402) == 1 and not (mc.mcCntlGetPoundVar(inst, 499) == 1) then
+if inCycle == 1 and mc.mcCntlGetPoundVar(inst, 402) == 1 and not (mc.mcCntlGetPoundVar(inst, 499) == 1) then
     
     local currentTool = mc.mcToolGetCurrent(inst)
     local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
@@ -663,35 +614,99 @@ if not skipForSpindleDwell and inCycle == 1 and mc.mcCntlGetPoundVar(inst, 402) 
     if hBoot and hBoot > 0 then
         local bootIsDown = mc.mcSignalGetState(hBoot)
         
+        -- Track boot state changes (only in debug mode)
+        if not _G.PRODUCTION_MODE and bootIsDown ~= _G.dustDebug.lastBootState then
+            _G.dustDebug.bootStateChanges = _G.dustDebug.bootStateChanges + 1
+            mc.mcCntlSetLastError(inst, string.format("Boot state changed %d->%d", 
+                _G.dustDebug.lastBootState, bootIsDown))
+            _G.dustDebug.lastBootState = bootIsDown
+        end
+        
         if _G.waitingForMotionAfterToolChange then
-            local motionMode = mc.mcCntlGetPoundVar(inst, 4000)
-            
-            if motionMode >= 1 and motionMode <= 3 then
+            -- Check for timeout (30 seconds)
+            if _G.motionCheckStartTime and (os.clock() - _G.motionCheckStartTime) > 30 then
+                mc.mcCntlSetLastError(inst, "Motion wait timeout - resetting")
+                _G.waitingForMotionAfterToolChange = false
+                _G.motionHasStarted = false
+                _G.motionCheckCycles = 0
+            else
+                -- Motion detection
+                local motionMode = mc.mcCntlGetPoundVar(inst, 4000)
                 local xVel = mc.mcAxisGetVel(inst, 0)
                 local yVel = mc.mcAxisGetVel(inst, 1)
-                local threshold = 1.0
+                local zVel = mc.mcAxisGetVel(inst, 2)
+                local currentFeed = mc.mcCntlGetPoundVar(inst, mc.SV_FEEDRATE)
                 
-                if math.abs(xVel) > threshold or math.abs(yVel) > threshold then
-                    _G.motionHasStarted = true
+                -- Motion detection with multiple methods
+                local threshold = 0.5
+                local motionDetected = false
+                local detectionMethod = ""
+                
+                if math.abs(xVel) > threshold or math.abs(yVel) > threshold or math.abs(zVel) > threshold then
+                    motionDetected = true
+                    detectionMethod = "Velocity"
+                elseif motionMode >= 1 and motionMode <= 3 and currentFeed and currentFeed > 0 then
+                    motionDetected = true  
+                    detectionMethod = "FeedMode"
+                elseif motionMode >= 1 and motionMode <= 3 then
+                    -- Check position delta
+                    if not _G.lastAxisPositions then
+                        _G.lastAxisPositions = {
+                            x = mc.mcAxisGetMachinePos(inst, 0),
+                            y = mc.mcAxisGetMachinePos(inst, 1),
+                            z = mc.mcAxisGetMachinePos(inst, 2)
+                        }
+                    else
+                        local xPos = mc.mcAxisGetMachinePos(inst, 0)
+                        local yPos = mc.mcAxisGetMachinePos(inst, 1)
+                        local zPos = mc.mcAxisGetMachinePos(inst, 2)
+                        
+                        local xDelta = math.abs(xPos - _G.lastAxisPositions.x)
+                        local yDelta = math.abs(yPos - _G.lastAxisPositions.y)
+                        local zDelta = math.abs(zPos - _G.lastAxisPositions.z)
+                        
+                        if xDelta > 0.001 or yDelta > 0.001 or zDelta > 0.001 then
+                            motionDetected = true
+                            detectionMethod = "Position"
+                        end
+                        
+                        _G.lastAxisPositions = {x = xPos, y = yPos, z = zPos}
+                    end
                 end
-            end
-            
-            if _G.motionHasStarted and bootIsDown == 0 then
-                if currentTool > 0 and currentTool < 90 then
-                    mc.mcSignalSetState(hBoot, 1)
-                    mc.mcCntlSetLastError(inst, string.format("Dust boot lowered for T%d", currentTool))
+                
+                 if motionDetected then
+                    _G.motionHasStarted = true
+                 end
+                
+                -- Lower the boot if motion has started and boot is up
+                if _G.motionHasStarted and bootIsDown == 0 then
+                    if currentTool > 0 and currentTool < 90 then
+                        mc.mcSignalSetState(hBoot, 1)
+                        mc.mcCntlSetLastError(inst, string.format("Dust boot lowered for T%d", currentTool))
+                        _G.waitingForMotionAfterToolChange = false
+                        _G.motionHasStarted = false
+                        _G.motionCheckCycles = 0
+                        _G.lastAxisPositions = nil
+                    end
+                elseif _G.motionHasStarted and bootIsDown == 1 then
                     _G.waitingForMotionAfterToolChange = false
                     _G.motionHasStarted = false
+                    _G.motionCheckCycles = 0
                 end
             end
         end
         
+        -- Safety: raise boot for virtual tools
         if currentTool >= 90 and currentTool <= 99 and bootIsDown == 1 then
             mc.mcSignalSetState(hBoot, 0)
-            mc.mcCntlSetLastError(inst, "Safety: Boot raised for virtual tool")
+            if not _G.PRODUCTION_MODE then
+                mc.mcCntlSetLastError(inst, string.format("Boot raised for virtual tool T%d", currentTool))
+            end
         end
     end
 end
+
+
 
 -- ===== HOMING INDICATOR AND WARNING RESET =====
 do
@@ -1113,81 +1128,9 @@ elseif _G.lastLowAirState ~= -2 then
     _G.lastLowAirState = -2
 end
 
--- ================================
--- SIMPLIFIED: Spindle Spin-UP Delay (No Motion Pause)
--- ================================
-local inst = mc.mcGetInstance()
 
--- Initialize spindle dwell system
-if not _G.spinUpDwell then
-    _G.spinUpDwell = {
-        armed = false,
-        delaySeconds = 0,
-        spindleStartTime = 0,
-        delayComplete = false,
-        lastSpindleState = 0
-    }
-    mc.mcCntlSetLastError(inst, "SPINDLE DELAY: System initialized (non-pausing version)")
-end
 
--- Check if M6 armed the delay
-local spinUpFlag = mc.mcCntlGetPoundVar(inst, 495)
-if spinUpFlag == 1 then
-    _G.spinUpDwell.armed = true
-    _G.spinUpDwell.delaySeconds = mc.mcCntlGetPoundVar(inst, 496) or 0.7
-    _G.spinUpDwell.delayComplete = false
-    _G.spinUpDwell.spindleStartTime = 0
-    mc.mcCntlSetPoundVar(inst, 495, 0)
-    
-    mc.mcCntlSetLastError(inst, string.format("SPINDLE DELAY: Will wait %.1fs after spindle starts", _G.spinUpDwell.delaySeconds))
-end
 
--- Simple spindle detection
-local function getSpindleRunning()
-    -- Check spindle ON signal (your P2-14 output)
-    local hSpindleOn = mc.mcSignalGetHandle(inst, mc.OSIG_SPINDLEON)
-    if hSpindleOn and hSpindleOn > 0 then
-        return mc.mcSignalGetState(hSpindleOn) == 1
-    end
-    
-    -- Fallback: Check commanded RPM
-    local rpm = mc.mcSpindleGetCommandRPM(inst)
-    return rpm and rpm > 0
-end
-
--- Track spindle state for dust boot delay
-if _G.spinUpDwell.armed then
-    local spindleOn = getSpindleRunning() and 1 or 0
-    
-    -- Detect spindle start (rising edge)
-    if _G.spinUpDwell.lastSpindleState == 0 and spindleOn == 1 then
-        _G.spinUpDwell.spindleStartTime = os.clock()
-        mc.mcCntlSetLastError(inst, string.format("SPINDLE DELAY: Spindle started, waiting %.1fs before allowing boot to lower", _G.spinUpDwell.delaySeconds))
-    end
-    
-    -- Check if delay period has passed
-    if _G.spinUpDwell.spindleStartTime > 0 and not _G.spinUpDwell.delayComplete then
-        local elapsed = os.clock() - _G.spinUpDwell.spindleStartTime
-        
-        if elapsed >= _G.spinUpDwell.delaySeconds then
-            _G.spinUpDwell.delayComplete = true
-            _G.spinUpDwell.armed = false  -- Disarm after completion
-            mc.mcCntlSetLastError(inst, "SPINDLE DELAY: Complete - dust boot can now lower on motion")
-        end
-    end
-    
-    _G.spinUpDwell.lastSpindleState = spindleOn
-end
-
--- Reset on machine idle
-local machState = mc.mcCntlGetState(inst)
-if machState == mc.MC_STATE_IDLE then
-    if _G.spinUpDwell.armed or _G.spinUpDwell.spindleStartTime > 0 then
-        _G.spinUpDwell.armed = false
-        _G.spinUpDwell.spindleStartTime = 0
-        _G.spinUpDwell.delayComplete = false
-    end
-end
 
 -------------------------------------------------------
 -- This is the last thing we do. So keep it at the end of the script!

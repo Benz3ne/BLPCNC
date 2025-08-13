@@ -22,54 +22,44 @@ Physical Tools: Configurable which tools skip measurement
 function m6()
     local inst = mc.mcGetInstance()
     
-    -- EMERGENCY DEBUG - Using direct SetLastError since debugPrint not defined yet
-    mc.mcCntlSetLastError(inst, "M6 START: Function entered")
-    
     -- Check if M6 is already running (re-entry guard)
     local m6Already = mc.mcCntlGetPoundVar(inst, 499)
-    mc.mcCntlSetLastError(inst, string.format("M6 CHECK: #499 = %d", m6Already))
-    
     if m6Already == 1 then
         mc.mcCntlSetLastError(inst, "ERROR: M6 already running! Aborting.")
         return
     end
     
-    -- Check timing
-    local lastM6Time = mc.mcCntlGetPoundVar(inst, 483) or 0
-    local currentTime = os.clock()
-    local timeSinceLast = currentTime - lastM6Time
+    -- Store call time for potential debugging
+    mc.mcCntlSetPoundVar(inst, 483, os.clock())
     
-    mc.mcCntlSetLastError(inst, string.format("M6 TIMING: %.3f seconds since last call", timeSinceLast))
-    
-    -- Store this call time
-    mc.mcCntlSetPoundVar(inst, 483, currentTime)
-    
-    -- Log M6 entry
+    -- Get tool info for status message
     local selected = mc.mcToolGetSelected(inst)
     local current = mc.mcToolGetCurrent(inst)
-    mc.mcCntlSetLastError(inst, string.format("M6 TOOLS: T%d -> T%d", current, selected))
-    
-    -- NOW continue with the rest of the macro...
-	
-	
-	
-	
-	
     
     -- ============================================
     -- CONFIGURATION SECTION
     -- ============================================
     
-    -- Debug mode - set to false to suppress status messages
-    local DEBUG_MODE = true
+    -- PRODUCTION MODE - set to false for detailed debug messages
+    local PRODUCTION_MODE = true  -- Set to false for debugging
     
-    -- Function to print debug messages (MOVED TO OUTER SCOPE)
+    -- Function to print debug messages
     local function debugPrint(message)
-        if DEBUG_MODE then
+        if not PRODUCTION_MODE then
             mc.mcCntlSetLastError(inst, message)
         end
     end
     
+    -- Single status message for production mode
+    if PRODUCTION_MODE then
+        mc.mcCntlSetLastError(inst, string.format("M6: T%d -> T%d", current, selected))
+    else
+        debugPrint(string.format("M6 START: T%d -> T%d", current, selected))
+    end
+    
+	-- Debug mode - linked to PRODUCTION_MODE
+    local DEBUG_MODE = not PRODUCTION_MODE  -- Automatically false when PRODUCTION_MODE is true
+	
     -- Tools that should NOT be auto-measured (physical tools only)
     local NO_MEASURE_TOOLS = {
         [1] = true,   -- Tool 1: No auto measurement
@@ -471,8 +461,8 @@ function m6()
         local RETRACT = mc.mcCntlGetPoundVar(inst, 317) or 0.1
         
         -- Added: dwell settings (editable)
-        local SPINDLE_SPINDOWN_DWELL_S = 0.5   -- pause after spindle OFF before deposit
-        local SPINDLE_SPINUP_DWELL_S   = 0.7   -- one-shot pause after M6 when spindle turns ON (handled by PLC)
+        local SPINDLE_SPINDOWN_DWELL_S = 3   -- pause after spindle OFF before deposit
+        local SPINDLE_SPINUP_DWELL_S   = 3   -- one-shot pause after M6 when spindle turns ON (handled by PLC)
         
         local function validateProbeParams()
             if MAX_PROBE_DEPTH >= SAFE_Z then
@@ -554,14 +544,24 @@ function m6()
             toolPos = getToolPosition(requestedTool)
         end
         
-        -- Safety checks
-        if mc.mcSpindleGetCommandRPM(inst) > 0 then
-            mc.mcSpindleSetDirection(inst, 0)
-            -- Added: allow coast-down before moving toward rack
-            if (SPINDLE_SPINDOWN_DWELL_S or 0) > 0 then
-                mc.mcCntlGcodeExecuteWait(inst, string.format("G4 P%.3f", SPINDLE_SPINDOWN_DWELL_S))
-            end
-        end
+     -- Safety checks
+	-- Just stop spindle and wait for it to coast down
+	if mc.mcSpindleGetCommandRPM(inst) > 0 then
+		mc.mcSpindleSetDirection(inst, 0)
+		-- Added: allow coast-down before moving toward rack
+		if (SPINDLE_SPINDOWN_DWELL_S or 0) > 0 then
+			debugPrint(string.format("Waiting %.1fs for spindle to stop", SPINDLE_SPINDOWN_DWELL_S))
+			mc.mcCntlGcodeExecuteWait(inst, string.format("G4 P%.3f", SPINDLE_SPINDOWN_DWELL_S))
+		end
+	end
+
+	-- Optional: verify spindle is actually stopped if you have feedback
+	local spindleSpeed = mc.mcSpindleGetTrueRPM and mc.mcSpindleGetTrueRPM(inst) or 0
+	if spindleSpeed > 50 then  -- Allow small reading errors
+		debugPrint(string.format("WARNING: Spindle still at %d RPM", spindleSpeed))
+		-- Maybe wait a bit more
+		mc.mcCntlGcodeExecuteWait(inst, "G4 P1")
+	end
         
         mc.mcSignalSetState(handles.laserDown, 0)
         mc.mcSignalSetState(handles.probeDown, 0)
@@ -778,19 +778,35 @@ function m6()
     -- Run the main tool change in protected mode
     local success, result, message = pcall(toolChangeMain)
     
-    -- ============================================
+	-- ============================================
     -- CLEANUP - ALWAYS RUNS
     -- ============================================
     
     -- Restore state if we saved it (physical tool path)
     if saved then
-        -- Restore dust boot
+        -- Restore dust boot (or raise on error for safety)
         if handles and handles.dustBoot then
-            mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
+            if not success then
+                -- On error, always raise dust boot for safety/visibility
+                mc.mcSignalSetState(handles.dustBoot, 0)
+                if not PRODUCTION_MODE then
+                    debugPrint("ERROR: Dust boot raised for safety")
+                end
+            else
+                -- Normal completion - restore saved state
+                mc.mcSignalSetState(handles.dustBoot, saved.dustBoot)
+            end
         end
         
-        -- Restore FRO
-        mc.mcCntlSetFRO(inst, saved.fro)
+        -- Restore FRO (but cap at 100% for safety)
+        local newFro = saved.fro
+        if saved.fro > 100 then
+            newFro = 100
+            if not PRODUCTION_MODE then
+                debugPrint(string.format("FRO capped: %d%% -> 100%%", saved.fro))
+            end
+        end
+        mc.mcCntlSetFRO(inst, newFro)
         
         -- Build restore G-code
         local restoreGcode = ""
@@ -842,19 +858,7 @@ function m6()
         mc.mcCntlGcodeExecuteWait(inst, "G91")
     end
     
-    -- Clear dialog suppression
-    mc.mcCntlSetPoundVar(inst, 498, 0)
-    mc.mcCntlSetPoundVar(inst, 499, 0)  -- M6 running flag OFF
-    
-    -- Signal M6 completion to PLC for dust boot automation
-    if success then
-        mc.mcCntlSetPoundVar(inst, 481, 1)  -- Signal successful completion
-        debugPrint("M6 complete - signaling PLC for dust boot management")
-    else
-        mc.mcCntlSetPoundVar(inst, 481, 0)  -- No completion on error
-    end
-    
-    -- Handle error
+    -- Handle error FIRST (before setting flags)
     if not success then
         debugPrint("ERROR: " .. tostring(result))
         
@@ -869,67 +873,28 @@ function m6()
             end)
         end
     end
-	
-	
-	
-	
-	
-	-- Clear dialog suppression
-mc.mcCntlSetPoundVar(inst, 498, 0)
-
--- DEBUG: Check if #481 is already set before we set it
-local existing481 = mc.mcCntlGetPoundVar(inst, 481)
-if existing481 == 1 then
-    debugPrint("WARNING: #481 already = 1 before M6 sets it!")
-end
-
--- DEBUG: Add a unique marker to detect multiple M6 calls
-local callCount = mc.mcCntlGetPoundVar(inst, 480) or 0
-callCount = callCount + 1
-mc.mcCntlSetPoundVar(inst, 480, callCount)
-debugPrint(string.format("M6 execution #%d completing", callCount))
-
--- Signal M6 completion to PLC for dust boot automation
-if success then
-    -- DEBUG: Set completion with timestamp
-    local timestamp = os.clock()
-    mc.mcCntlSetPoundVar(inst, 482, timestamp)  -- Store when we set it
     
-    debugPrint(string.format("M6 setting #481=1 at time %.3f", timestamp))
-    mc.mcCntlSetPoundVar(inst, 481, 1)  -- Signal successful completion
+    -- Clear dialog suppression
+    mc.mcCntlSetPoundVar(inst, 498, 0)
+    mc.mcCntlSetPoundVar(inst, 499, 0)  -- M6 running flag OFF
     
-    -- DEBUG: Verify it was actually set
-    wx.wxMilliSleep(1)
-    local verify = mc.mcCntlGetPoundVar(inst, 481)
-    if verify ~= 1 then
-        debugPrint(string.format("ERROR: Set #481=1 but reads as %d!", verify))
+    -- Signal M6 completion to PLC for dust boot automation
+    if success then
+        mc.mcCntlSetPoundVar(inst, 481, 1)  -- Signal successful completion
+        if PRODUCTION_MODE then
+            mc.mcCntlSetLastError(inst, "M6 complete")
+        else
+            debugPrint("M6 complete - signaling PLC for dust boot management")
+        end
     else
-        debugPrint("M6 complete - #481 set successfully")
+        mc.mcCntlSetPoundVar(inst, 481, 0)  -- No completion on error
+        if PRODUCTION_MODE then
+            mc.mcCntlSetLastError(inst, "M6 failed")
+        else
+            debugPrint("M6 failed - error in tool change")
+        end
     end
-    
-    -- DEBUG: Wait a moment to see if PLC clears it
-    wx.wxMilliSleep(50)  -- Wait 50ms (2.5 PLC cycles)
-    local afterWait = mc.mcCntlGetPoundVar(inst, 481)
-    if afterWait == 0 then
-        debugPrint("GOOD: PLC cleared #481 quickly")
-    else
-        debugPrint(string.format("WARNING: #481 still = %d after 50ms", afterWait))
-    end
-else
-    mc.mcCntlSetPoundVar(inst, 481, 0)  -- No completion on error
-    debugPrint("M6 failed - #481 set to 0")
 end
 
--- IMPORTANT: Clear M6 running flag LAST (after setting #481)
-debugPrint("M6 clearing #499 (running flag)")
-mc.mcCntlSetPoundVar(inst, 499, 0)  -- M6 running flag OFF
-
-debugPrint(string.format("M6 macro exiting (call #%d)", callCount))
-	
-	
-	
-	
-	
-end
-
+-- Keep this line at the very end of the file:
 if (mc.mcInEditor() == 1) then m6() end

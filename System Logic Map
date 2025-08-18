@@ -78,20 +78,43 @@ Keyboard/EnableKeyboardJog   Keyboard jog enable state
 #318  Laser X offset
 #319  Laser Y offset
 #320  Probe Z calibration offset
+#321  Probe lift height (clearance height above surface for XY moves)
 #351  Last physical tool (for virtual tool return)
 #353  Work surface Z reference (critical for height calcs)
 #389  Probe contact Z (mentioned in M6 header, not actively used)
+#388  Probe state mode (0=normal, 1=sentinel mode, 2=error state)
+#390  Raw probe contact position (before compensation)
+#391  Edge position (adjusted for probe radius on X/Y, Z offset on Z)
+#392  Spindle position (adjusted for probe offset from spindle)
+#394  TRUE surface Z (H-compensated) for datum setting
+#395  Surface Z reference (machine coordinate during probe sequence)
+#396  Safe plane Z (machine coordinate during probe sequence)
+#397  Probe plane Z (machine coordinate during probe sequence)
 
 == Automation Control ==
 #400  Dust collection automation enable (0/1)
 #401  Vacuum table automation enable (0/1)  
 #402  Dust boot automation enable (0/1)
+#403  Dust boot target state (0=UP, 1=DOWN)
+#404  Dust collection target (0=OFF, 1=ON)
+#440  Stored G68 X center (for virtual tool recovery)
+#441  Stored G68 Y center (for virtual tool recovery)
+#442  Stored G68 rotation angle (for virtual tool recovery)
+#443  G68 adjustment needed flag
+#444  Virtual tool apply counter
+#445  Atomic operation in progress flag
+#446  Atomic operation type
 #481  M6 completion signal (1=complete, cleared by PLC)
 #483  M6 call time (os.clock() for debugging)
 #495  Spindle spin-up delay armed flag
 #496  Spindle spin-up delay seconds
 #498  Dialog suppression flag (prevents prompts during M6)
 #499  M6 running flag (1=running, 0=idle)
+
+== G68 Rotation State (System) ==
+#1245  Current G68 X center
+#1246  Current G68 Y center
+#1247  Current G68 rotation angle (degrees)
 
 == Modal State Variables (G-code state tracking) ==
 #4000  Motion mode (1=G1, 2=G2, 3=G3, 0=G0)
@@ -106,6 +129,13 @@ Keyboard/EnableKeyboardJog   Keyboard jog enable state
 == Extended Fixture Variables ==
 #5219  BUFP - P number for G54.1 extended fixtures
 #5220  Current work offset (54=G54, 55=G55... 54.1=G54.1 P1)
+
+== Extended Fixtures (G54.1) ==
+#7001-7020   G54.1 P1 (X,Y,Z,A,B,C + reserved)
+#7021-7040   G54.1 P2
+...continues every 20 variables...
+#14001-14020 G54.1 P51
+...continues to P100...
 
 == Work Offsets (G54-G59) ==
 G54: X=#5221, Y=#5222, Z=#5223

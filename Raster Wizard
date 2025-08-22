@@ -1,0 +1,2028 @@
+-- Laser Raster Image Wizard v2.7
+-- Complete implementation for image import, conversion, and GCode generation
+-- Critical fixes: Function order, error handling, debug support
+-- Features: Rotation, time estimate, even rows, preset editing, safety
+-- Requires: wxWidgets, Mach4 with ESS laser setup
+
+-- Custom dialog return codes
+local DIALOG_RESULT_BACK = 5001
+local DIALOG_RESULT_NEXT = 5002
+
+local function LaserRasterImageWizard()
+    local inst = mc.mcGetInstance()
+    
+    -- Checkpoint system
+    local checkpoints = {}
+    local function checkpoint(name)
+        table.insert(checkpoints, name)
+        mc.mcCntlSetLastError(inst, "Checkpoint: " .. name)
+    end
+    
+    checkpoint("Getting instance")
+    checkpoint("Loading constants")
+    
+    -- ==================== CONSTANTS ====================
+    local LASER_TOOL_NUMBER = 91
+    local LASER_OUTPUT_SIGNAL = mc.OSIG_OUTPUT1
+    local MAX_IMAGE_SIZE_MB = 1
+    local DEFAULT_FEEDRATE = 400
+    local TEMP_DIR = mc.mcCntlGetMachDir(inst) .. "\\LaserTemp\\"
+    local PROFILE_SECTION = "LaserRasterWizard"
+    local TIME_ESTIMATE_BUFFER = 1.1  -- 10% for acceleration/deceleration
+    
+    -- Image positioning modes
+    local POSITION_MODES = {
+        {id = 1, name = "Center at Current Position", desc = "Image center at probe position"},
+        {id = 2, name = "Top-Left at Current Position", desc = "Top-left corner at probe position"},
+        {id = 3, name = "Top-Right at Current Position", desc = "Top-right corner at probe position"},
+        {id = 4, name = "Bottom-Left at Current Position", desc = "Bottom-left corner at probe position"},
+        {id = 5, name = "Bottom-Right at Current Position", desc = "Bottom-right corner at probe position"}
+    }
+    
+    -- Default presets
+    local PRESETS = {
+        {name = "Fine Detail (High DPI)", dpi = 300, pwmMin = 5, pwmMax = 40, feedrate = 400},
+        {name = "Standard Quality", dpi = 150, pwmMin = 10, pwmMax = 60, feedrate = 400},
+        {name = "Fast Draft", dpi = 75, pwmMin = 15, pwmMax = 80, feedrate = 400},
+        {name = "Deep Burn", dpi = 100, pwmMin = 20, pwmMax = 100, feedrate = 400}
+    }
+    
+    -- ==================== PROFILE HELPER FUNCTIONS ====================
+    local function ProfileGetString(key, default)
+        if not inst then
+            return default  -- Failsafe if inst is nil
+        end
+        
+        local status, result = pcall(mc.mcProfileGetString, inst, PROFILE_SECTION, key, default)
+        if not status then
+            mc.mcCntlSetLastError(inst, "Profile read failed: " .. key)
+            return default
+        end
+        return result or default
+    end
+    
+    local function ProfileSetString(key, value)
+        if not inst then return end
+        
+        local status, err = pcall(mc.mcProfileWriteString, inst, PROFILE_SECTION, key, tostring(value))
+        if not status then
+            mc.mcCntlSetLastError(inst, "Profile write failed: " .. key)
+        end
+    end
+    
+    local function ProfileGetFloat(key, default)
+        local str = ProfileGetString(key, tostring(default))
+        if not str then return default end
+        
+        local num = tonumber(str)
+        if not num then
+            mc.mcCntlSetLastError(inst, "Invalid number in profile: " .. key .. "=" .. tostring(str))
+            return default
+        end
+        return num
+    end
+    
+    local function ProfileSetFloat(key, value)
+        ProfileSetString(key, tostring(value))
+    end
+    
+    local function ProfileGetInt(key, default)
+        local str = ProfileGetString(key, tostring(default))
+        if not str then return default end
+        
+        local num = tonumber(str)
+        if not num then
+            mc.mcCntlSetLastError(inst, "Invalid number in profile: " .. key .. "=" .. tostring(str))
+            return default
+        end
+        return math.floor(num)
+    end
+    
+    local function ProfileSetInt(key, value)
+        ProfileSetString(key, tostring(math.floor(value)))
+    end
+    
+    -- Load saved presets from profile
+    local function LoadPresetsFromProfile()
+        -- Wrap entire function in error handler
+        local status, err = pcall(function()
+            for i = 1, 4 do
+                -- Defensive checks
+                if not PRESETS[i] then
+                    PRESETS[i] = {name = "Preset " .. i, dpi = 100, pwmMin = 10, pwmMax = 60, feedrate = 400}
+                end
+                
+                local name = ProfileGetString("Preset" .. i .. "_Name", "")
+                if name ~= "" then
+                    -- Use existing values as fallbacks
+                    PRESETS[i] = {
+                        name = name,
+                        dpi = ProfileGetInt("Preset" .. i .. "_DPI", PRESETS[i].dpi),
+                        pwmMin = ProfileGetInt("Preset" .. i .. "_PwmMin", PRESETS[i].pwmMin),
+                        pwmMax = ProfileGetInt("Preset" .. i .. "_PwmMax", PRESETS[i].pwmMax),
+                        feedrate = ProfileGetInt("Preset" .. i .. "_Feedrate", PRESETS[i].feedrate)
+                    }
+                    
+                    -- Validate ranges
+                    PRESETS[i].dpi = math.max(50, math.min(600, PRESETS[i].dpi))
+                    PRESETS[i].pwmMin = math.max(0, math.min(100, PRESETS[i].pwmMin))
+                    PRESETS[i].pwmMax = math.max(0, math.min(100, PRESETS[i].pwmMax))
+                    PRESETS[i].feedrate = math.max(10, math.min(1000, PRESETS[i].feedrate))
+                end
+            end
+        end)
+        
+        if not status then
+            mc.mcCntlSetLastError(inst, "Preset loading error (using defaults): " .. tostring(err))
+            -- Continue with default presets
+        end
+    end
+
+    checkpoint("Defining helper functions")
+    
+    -- Call immediately after definition
+    checkpoint("Loading presets")
+    LoadPresetsFromProfile()
+    
+    -- ==================== STATE MANAGEMENT ====================
+    checkpoint("Initializing state")
+    local wizardState = {
+        currentStep = 1,
+        tempFiles = {},  -- Track temporary files for cleanup (NOT USED FOR BMP)
+        imageObjects = {}  -- Track wx.wxImage objects for cleanup
+    }
+    
+    -- ==================== CLEANUP FUNCTIONS ====================
+    local function CleanupTempFiles()
+        -- NOTE: BMP files are NOT cleaned up to ensure ESS can access them
+        for _, filepath in ipairs(wizardState.tempFiles) do
+            pcall(function()
+                os.remove(filepath)
+                mc.mcCntlSetLastError(inst, "Cleaned up temp file: " .. filepath)
+            end)
+        end
+        wizardState.tempFiles = {}
+    end
+    
+    local function CleanupImageObjects()
+        -- Explicitly delete wx.wxImage objects to free memory
+        for _, img in ipairs(wizardState.imageObjects) do
+            pcall(function()
+                if img and type(img.delete) == "function" then
+                    img:delete()
+                end
+            end)
+        end
+        wizardState.imageObjects = {}
+    end
+    
+    local function CleanupAll()
+        CleanupImageObjects()
+        -- NOTE: Not calling CleanupTempFiles for BMP persistence
+    end
+    
+    -- ==================== HELPER FUNCTIONS ====================
+    -- Safe wxWidgets parent wrapper
+    local function SafeGetParent()
+        local parent = wx.NULL
+        
+        pcall(function()
+            local app = wx.wxGetApp()
+            if app then
+                parent = app:GetTopWindow() or wx.NULL
+            end
+        end)
+        
+        return parent  -- Always returns something safe
+    end
+    
+    -- Create temp directory if it doesn't exist
+    local function EnsureTempDir()
+        if not TEMP_DIR then
+            TEMP_DIR = "C:\\Temp\\LaserTemp\\"  -- Fallback
+        end
+        
+        local status, err = pcall(function()
+            -- Try to create directory
+            local cmd = 'mkdir "' .. TEMP_DIR:gsub("\\$", "") .. '" 2>nul'
+            os.execute(cmd)
+            
+            -- Verify it exists by trying to write a test file
+            local testFile = TEMP_DIR .. "test.tmp"
+            local f = io.open(testFile, "w")
+            if f then
+                f:close()
+                os.remove(testFile)
+            else
+                error("Cannot write to temp directory")
+            end
+        end)
+        
+        if not status then
+            mc.mcCntlSetLastError(inst, "Temp dir issue: " .. tostring(err))
+            -- Try fallback location
+            TEMP_DIR = os.getenv("TEMP") .. "\\LaserWizard\\"
+            os.execute('mkdir "' .. TEMP_DIR:gsub("\\$", "") .. '" 2>nul')
+        end
+    end
+    
+    local function CleanOldTempFiles()
+        -- Clean up any leftover temp files from previous runs
+        local tempFiles = {
+            "outline_preview.nc",
+            "laser_raster_final.nc",
+            "raster_temp.nc"
+        }
+        
+        for _, filename in ipairs(tempFiles) do
+            local filepath = TEMP_DIR .. filename
+            pcall(function() os.remove(filepath) end)
+        end
+        
+        mc.mcCntlSetLastError(inst, "Cleaned temporary files")
+    end
+    
+    -- Safe image loading with validation
+    local function SafeImageLoad(path)
+        local success = false
+        local image = nil
+        local errorMsg = ""
+        
+        -- Multiple validation steps
+        local status, err = pcall(function()
+            -- Check file exists
+            local f = io.open(path, "rb")
+            if not f then
+                error("File not found: " .. path)
+            end
+            
+            -- Check file size
+            local size = f:seek("end")
+            f:close()
+            
+            if size > MAX_IMAGE_SIZE_MB * 1024 * 1024 then
+                error(string.format("File too large: %.2f MB", size / 1024 / 1024))
+            end
+            
+            -- Try to load image
+            image = wx.wxImage()
+            if not image:LoadFile(path) then
+                error("Invalid image format or corrupted file")
+            end
+            
+            -- Verify dimensions
+            if image:GetWidth() <= 0 or image:GetHeight() <= 0 then
+                error("Invalid image dimensions")
+            end
+            
+            success = true
+        end)
+        
+        if not status then
+            errorMsg = tostring(err)
+            if image then
+                pcall(function() image:delete() end)
+                image = nil
+            end
+        end
+        
+        return success, image, errorMsg
+    end
+    
+    -- Load GCode from string to file and execute with proper context
+    local function LoadAndExecuteGCode(gcodeString, filename, waitForCompletion)
+        EnsureTempDir()
+        local tempPath = TEMP_DIR .. filename
+        
+        -- Write GCode to temp file
+        local file = io.open(tempPath, "w")
+        if not file then
+            return false, "Cannot create temp GCode file"
+        end
+        
+        file:write(gcodeString)
+        file:close()
+        
+        -- Load file into Mach4
+        local rc = mc.mcCntlLoadGcodeFile(inst, tempPath)
+        if rc ~= mc.MERROR_NOERROR then
+            return false, "Failed to load GCode file"
+        end
+        
+        -- Start execution
+        rc = mc.mcCntlCycleStart(inst)
+        if rc ~= mc.MERROR_NOERROR then
+            return false, "Failed to start GCode execution"
+        end
+        
+        -- Wait for completion if requested
+        if waitForCompletion then
+            local timeout = 30000  -- 30 second timeout
+            local startTime = wx.wxGetUTCTime()
+            
+            while mc.mcCntlGetState(inst) == mc.MC_STATE_RUN do
+                wx.wxMilliSleep(100)
+                wx.wxYield()
+                
+                -- Check for timeout
+                if wx.wxGetUTCTime() - startTime > timeout then
+                    mc.mcCntlStop(inst)
+                    return false, "GCode execution timeout"
+                end
+            end
+            
+            -- Check final state
+            local finalState = mc.mcCntlGetState(inst)
+            if finalState ~= mc.MC_STATE_IDLE then
+                -- Check specific state for better error reporting
+                local stateMsg = "unknown state"
+                if finalState == mc.MC_STATE_HOLD then
+                    stateMsg = "Feed Hold active - press Cycle Start to continue"
+                elseif finalState == mc.MC_STATE_STOP then
+                    stateMsg = "Stop pressed - operation cancelled"
+                elseif finalState == mc.MC_STATE_ALARM then
+                    stateMsg = "Machine in ALARM state - check limit switches and E-Stop"
+                end
+                
+                return false, "GCode execution failed: " .. stateMsg
+            end
+        end
+        
+        return true, "GCode executed successfully"
+    end
+    
+    -- ==================== DITHERING ALGORITHM ====================
+    -- Ordered dithering using 4x4 Bayer matrix
+    local BAYER_MATRIX = {
+        { 0, 8, 2, 10},
+        {12, 4, 14, 6},
+        { 3, 11, 1, 9},
+        {15, 7, 13, 5}
+    }
+    
+    local function ApplyDithering(value, x, y, strength)
+        if strength <= 0 then return value end
+        
+        -- Cap maximum effect at 60% for better visual quality
+        local effectiveStrength = strength * 0.6
+        
+        local matrixX = (x % 4) + 1
+        local matrixY = (y % 4) + 1
+        local threshold = BAYER_MATRIX[matrixY][matrixX] * 16 - 128
+        
+        -- Corrected: Now 0=none, 100=maximum (capped)
+        local ditherAmount = (threshold * effectiveStrength) / 100
+        local ditheredValue = value + ditherAmount
+        
+        return (ditheredValue > 128) and 255 or 0
+    end
+    
+    -- ==================== CHECK LASER TOOL ====================
+    -- Check for Analog Out 1 configuration
+    local function CheckAnalogOut1()
+        -- Try to read ESS configuration (may not be accessible)
+        local warningShown = ProfileGetInt("AnalogOut1WarningShown", 0)
+        
+        if warningShown == 0 then
+            local msg = "IMPORTANT: If 'Use Analog Out 1' is enabled in your ESS configuration,\n" ..
+                       "the outline preview may burn at full power instead of 2%.\n\n" ..
+                       "To check: Configure → Plugins → ESS → Analog tab\n\n" ..
+                       "This message will only show once per profile."
+            
+            wx.wxMessageBox(msg, "Laser Configuration Notice", 
+                           wx.wxOK + wx.wxICON_INFORMATION)
+            ProfileSetInt("AnalogOut1WarningShown", 1)
+        end
+    end
+    
+    local function CheckAndActivateLaserTool()
+        local currentTool = mc.mcToolGetCurrent(inst)
+        local laserDownHandle = mc.mcSignalGetHandle(inst, LASER_OUTPUT_SIGNAL)
+        local laserDeployed = mc.mcSignalGetState(laserDownHandle)
+        
+        if currentTool ~= LASER_TOOL_NUMBER or laserDeployed ~= 1 then
+            local parent = wx.NULL
+            local app = wx.wxGetApp()
+            if app then
+                pcall(function() parent = app:GetTopWindow() or wx.NULL end)
+            end
+            
+            local dlg = wx.wxMessageDialog(parent,
+                string.format("Laser tool T%d must be active before using the raster wizard.\n\n" ..
+                             "Would you like to activate it now?", LASER_TOOL_NUMBER),
+                "Laser Tool Required",
+                wx.wxYES_NO + wx.wxICON_QUESTION)
+            
+            if dlg:ShowModal() == wx.wxID_YES then
+                dlg:Destroy()
+                mc.mcCntlGcodeExecuteWait(inst, string.format("T%d M6", LASER_TOOL_NUMBER))
+                wx.wxMilliSleep(500)
+                
+                -- Verify tool change succeeded
+                currentTool = mc.mcToolGetCurrent(inst)
+                laserDeployed = mc.mcSignalGetState(laserDownHandle)
+                if currentTool ~= LASER_TOOL_NUMBER or laserDeployed ~= 1 then
+                    wx.wxMessageBox("Laser tool activation failed. Please activate manually and try again.",
+                                  "Tool Change Failed", wx.wxOK + wx.wxICON_ERROR)
+                    return false
+                end
+            else
+                dlg:Destroy()
+                return false
+            end
+        end
+        
+        -- Show Analog Out 1 warning if needed
+        CheckAnalogOut1()
+        
+        return true
+    end
+    
+    -- ==================== LOAD SAVED SETTINGS ====================
+    local settings = {
+        lastImagePath = ProfileGetString("LastImagePath", ""),
+        scanLines = ProfileGetInt("ScanLines", 200),
+        physicalWidth = ProfileGetFloat("PhysicalWidth", 2.0),
+        pwmMin = ProfileGetInt("PwmMin", 10),
+        pwmMax = ProfileGetInt("PwmMax", 60),
+        feedrate = ProfileGetInt("Feedrate", DEFAULT_FEEDRATE),
+        zHeight = ProfileGetFloat("ZHeight", 0.0),
+        brightness = ProfileGetInt("Brightness", 0),
+        contrast = ProfileGetInt("Contrast", 0),
+        dithering = ProfileGetInt("Dithering", 0),  -- NEW: Dithering setting
+        rotation = ProfileGetInt("Rotation", 0),
+        evenRowsOnly = ProfileGetInt("EvenRowsOnly", 0),
+        invertImage = ProfileGetInt("InvertImage", 0),
+        positionMode = ProfileGetInt("PositionMode", 1),
+        showPreview = ProfileGetInt("ShowPreview", 1),
+        -- Add laser vector settings for preview
+        vectorFrequency = ProfileGetInt("VectorFrequency", 3000),
+        previewPower = ProfileGetInt("PreviewPower", 2),
+        gateDelay = ProfileGetFloat("GateDelay", 0.0),
+        gateDuration = ProfileGetFloat("GateDuration", 1.0)
+    }
+    
+    -- Variables to hold image data
+    local imageData = {
+        originalPath = "",
+        tempBmpPath = "",
+        width = 0,
+        height = 0,
+        fileSize = 0,
+        rotatedWidth = nil,  -- Dimensions after rotation
+        rotatedHeight = nil
+    }
+    
+    -- ==================== STEP 1: IMAGE SELECTION ====================
+    local function ShowImageSelectionDialog()
+        local parent = wx.NULL
+        local app = wx.wxGetApp()
+        if app then
+            pcall(function() parent = app:GetTopWindow() or wx.NULL end)
+        end
+        
+        local dlg = wx.wxDialog(parent, wx.wxID_ANY, "Step 1: Select Image",
+                              wx.wxDefaultPosition, wx.wxSize(500, 400))
+        
+        local panel = wx.wxPanel(dlg, wx.wxID_ANY)
+        local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+        
+        -- Instructions
+        local instructions = wx.wxStaticText(panel, wx.wxID_ANY,
+            "Select an image file to convert for laser rastering.\n" ..
+            "Supported formats: JPG, PNG, GIF, BMP, TIFF")
+        mainSizer:Add(instructions, 0, wx.wxALL, 10)
+        
+        -- File selection
+        local fileSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local fileInput = wx.wxTextCtrl(panel, wx.wxID_ANY, settings.lastImagePath,
+                                       wx.wxDefaultPosition, wx.wxSize(300, -1))
+        local browseBtn = wx.wxButton(panel, wx.wxID_ANY, "Browse...", 
+                                     wx.wxDefaultPosition, wx.wxSize(80, -1))
+        fileSizer:Add(fileInput, 1, wx.wxEXPAND + wx.wxRIGHT, 5)
+        fileSizer:Add(browseBtn, 0)
+        mainSizer:Add(fileSizer, 0, wx.wxEXPAND + wx.wxALL, 10)
+        
+        -- Image preview panel
+        local previewPanel = wx.wxPanel(panel, wx.wxID_ANY,
+                                       wx.wxDefaultPosition, wx.wxSize(460, 200))
+        previewPanel:SetBackgroundColour(wx.wxColour(240, 240, 240))
+        
+        local previewSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+        local previewLabel = wx.wxStaticText(previewPanel, wx.wxID_ANY, 
+                                            "No image selected", 
+                                            wx.wxDefaultPosition, wx.wxDefaultSize,
+                                            wx.wxALIGN_CENTER)
+        previewLabel:SetFont(wx.wxFont(10, wx.wxFONTFAMILY_DEFAULT, 
+                                      wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
+        previewSizer:Add(previewLabel, 1, wx.wxALIGN_CENTER + wx.wxALL, 20)
+        previewPanel:SetSizer(previewSizer)
+        
+        mainSizer:Add(previewPanel, 1, wx.wxEXPAND + wx.wxALL, 10)
+        
+        -- Image info
+        local infoLabel = wx.wxStaticText(panel, wx.wxID_ANY, "")
+        mainSizer:Add(infoLabel, 0, wx.wxALL, 10)
+        
+        -- Track preview image for cleanup
+        local previewImage = nil
+        
+        -- Update preview function
+        local function UpdatePreview()
+            local path = fileInput:GetValue()
+            if path == "" then return end
+            
+            -- Check file exists
+            local file = io.open(path, "rb")
+            if not file then
+                infoLabel:SetLabel("File not found")
+                return
+            end
+            
+            -- Check file size
+            local size = file:seek("end")
+            file:close()
+            
+            if size > MAX_IMAGE_SIZE_MB * 1024 * 1024 then
+                infoLabel:SetLabel(string.format("File too large (%.2f MB > %d MB limit)",
+                                                size / 1024 / 1024, MAX_IMAGE_SIZE_MB))
+                return
+            end
+            
+            -- Clean up previous preview image
+            if previewImage then
+                previewImage:delete()
+                previewImage = nil
+            end
+            
+            -- Load image
+            previewImage = wx.wxImage()
+            if not previewImage:LoadFile(path) then
+                infoLabel:SetLabel("Failed to load image")
+                previewImage:delete()
+                previewImage = nil
+                return
+            end
+            
+            -- Store image data
+            imageData.originalPath = path
+            imageData.width = previewImage:GetWidth()
+            imageData.height = previewImage:GetHeight()
+            imageData.fileSize = size
+            
+            -- Update info
+            infoLabel:SetLabel(string.format("Size: %dx%d pixels, %.2f KB",
+                                            imageData.width, imageData.height,
+                                            size / 1024))
+            
+            -- Update preview
+            local maxW, maxH = 460, 180
+            local scale = math.min(maxW / imageData.width, maxH / imageData.height, 1)
+            if scale < 1 then
+                previewImage:Rescale(imageData.width * scale, imageData.height * scale)
+            end
+            
+            -- Clear old preview
+            previewPanel:DestroyChildren()
+            
+            -- Create bitmap and static bitmap control
+            local bitmap = wx.wxBitmap(previewImage)
+            local bmpCtrl = wx.wxStaticBitmap(previewPanel, wx.wxID_ANY, bitmap)
+            
+            local newSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+            newSizer:Add(bmpCtrl, 1, wx.wxALIGN_CENTER + wx.wxALL, 5)
+            previewPanel:SetSizer(newSizer)
+            previewPanel:Layout()
+        end
+        
+        -- Browse button handler
+        browseBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function(event)
+            local fileDialog = wx.wxFileDialog(dlg, "Select Image File", "", "",
+                "Image files (*.jpg;*.jpeg;*.png;*.gif;*.bmp;*.tiff)|*.jpg;*.jpeg;*.png;*.gif;*.bmp;*.tiff|" ..
+                "All files (*.*)|*.*",
+                wx.wxFD_OPEN + wx.wxFD_FILE_MUST_EXIST)
+            
+            if fileDialog:ShowModal() == wx.wxID_OK then
+                fileInput:SetValue(fileDialog:GetPath())
+                UpdatePreview()
+            end
+            fileDialog:Destroy()
+        end)
+        
+        -- File input change handler
+        fileInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_UPDATED, function(event)
+            UpdatePreview()
+        end)
+        
+        -- Dialog buttons
+        local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local nextBtn = wx.wxButton(panel, wx.wxID_OK, "Next")
+        local cancelBtn = wx.wxButton(panel, wx.wxID_CANCEL, "Cancel")
+        btnSizer:Add(nextBtn, 0, wx.wxRIGHT, 5)
+        btnSizer:Add(cancelBtn, 0, wx.wxLEFT, 5)
+        mainSizer:Add(btnSizer, 0, wx.wxALIGN_CENTER + wx.wxALL, 10)
+        
+        panel:SetSizer(mainSizer)
+        dlg:Centre()
+        
+        -- Load initial preview if path exists
+        if settings.lastImagePath ~= "" then
+            UpdatePreview()
+        end
+        
+        local result = dlg:ShowModal()
+        
+        if result == wx.wxID_OK then
+            settings.lastImagePath = imageData.originalPath
+            ProfileSetString("LastImagePath", settings.lastImagePath)
+        end
+        
+        -- Cleanup preview image
+        if previewImage then
+            previewImage:delete()
+        end
+        
+        dlg:Destroy()
+        return result
+    end
+    
+    -- ==================== STEP 2: IMAGE ADJUSTMENTS ====================
+    local function ShowImageAdjustmentDialog()
+        local parent = wx.NULL
+        local app = wx.wxGetApp()
+        if app then
+            pcall(function() parent = app:GetTopWindow() or wx.NULL end)
+        end
+        
+        local dlg = wx.wxDialog(parent, wx.wxID_ANY, "Step 2: Image Adjustments",
+                              wx.wxDefaultPosition, wx.wxSize(600, 700))
+        
+        local panel = wx.wxPanel(dlg, wx.wxID_ANY)
+        local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+        
+        -- Load original image
+        local originalImage = wx.wxImage()
+        originalImage:LoadFile(imageData.originalPath)
+        
+        -- Convert to grayscale and track for cleanup
+        local workingImage = originalImage:ConvertToGreyscale()
+        table.insert(wizardState.imageObjects, originalImage)
+        table.insert(wizardState.imageObjects, workingImage)
+        
+        -- Preview panel
+        local previewPanel = wx.wxPanel(panel, wx.wxID_ANY,
+                                       wx.wxDefaultPosition, wx.wxSize(560, 300))
+        previewPanel:SetBackgroundColour(wx.wxColour(240, 240, 240))
+        
+        local previewBitmap = nil
+        local previewCtrl = nil
+        local adjustedImage = nil
+        
+        -- Update preview function with FIXED CONTRAST and DITHERING
+        local function UpdateImagePreview()
+            -- Cleanup previous preview resources
+            if previewCtrl then
+                previewCtrl:Destroy()
+                previewCtrl = nil
+            end
+            if previewBitmap then
+                pcall(function() previewBitmap:delete() end)
+                previewBitmap = nil
+            end
+            -- Clean up previous adjusted image
+            if adjustedImage and adjustedImage ~= workingImage then
+                pcall(function() adjustedImage:delete() end)
+                adjustedImage = nil
+            end
+            
+            -- Apply adjustments to working image
+            adjustedImage = workingImage:Copy()
+            table.insert(wizardState.imageObjects, adjustedImage)
+            
+            -- Apply brightness and contrast with BETTER FORMULA
+            if settings.brightness ~= 0 or settings.contrast ~= 0 then
+                for y = 0, adjustedImage:GetHeight() - 1 do
+                    for x = 0, adjustedImage:GetWidth() - 1 do
+                        local r = adjustedImage:GetRed(x, y)
+                        
+                        -- Apply contrast with industry-standard formula - mathematically stable
+                        if settings.contrast ~= 0 then
+                            local factor = (100 + settings.contrast) / 100  -- Range 0.0 to 2.0
+                            r = math.floor((r - 128) * factor + 128)
+                            r = math.max(0, math.min(255, r))
+                        end
+                        
+                        -- Apply brightness WITH CLAMPING
+                        r = r + settings.brightness
+                        r = math.max(0, math.min(255, r))
+                        
+                        adjustedImage:SetRGB(x, y, r, r, r)
+                    end
+                end
+            end
+            
+            -- Apply dithering if enabled
+            if settings.dithering > 0 then
+                for y = 0, adjustedImage:GetHeight() - 1 do
+                    for x = 0, adjustedImage:GetWidth() - 1 do
+                        local r = adjustedImage:GetRed(x, y)
+                        local dithered = ApplyDithering(r, x, y, settings.dithering)
+                        adjustedImage:SetRGB(x, y, dithered, dithered, dithered)
+                    end
+                end
+            end
+            
+            -- Apply inversion if needed (AFTER dithering)
+            if settings.invertImage == 1 then
+                for y = 0, adjustedImage:GetHeight() - 1 do
+                    for x = 0, adjustedImage:GetWidth() - 1 do
+                        local r = adjustedImage:GetRed(x, y)
+                        adjustedImage:SetRGB(x, y, 255 - r, 255 - r, 255 - r)
+                    end
+                end
+            end
+            
+            -- Apply rotation if needed (AFTER inversion)
+            if settings.rotation > 0 then
+                local radians = math.rad(settings.rotation)
+                local center = wx.wxPoint(adjustedImage:GetWidth()/2, 
+                                         adjustedImage:GetHeight()/2)
+                adjustedImage = adjustedImage:Rotate(radians, center, true)
+                table.insert(wizardState.imageObjects, adjustedImage)
+                
+                -- Store rotated dimensions for size calculations
+                imageData.rotatedWidth = adjustedImage:GetWidth()
+                imageData.rotatedHeight = adjustedImage:GetHeight()
+            else
+                -- Clear rotated dimensions if no rotation
+                imageData.rotatedWidth = nil
+                imageData.rotatedHeight = nil
+            end
+            
+            -- Create scaled preview
+            local previewCopy = adjustedImage:Copy()
+            table.insert(wizardState.imageObjects, previewCopy)
+            
+            -- Scale for preview
+            local maxW, maxH = 540, 280
+            local scale = math.min(maxW / previewCopy:GetWidth(), maxH / previewCopy:GetHeight(), 1)
+            if scale < 1 then
+                previewCopy:Rescale(previewCopy:GetWidth() * scale, previewCopy:GetHeight() * scale)
+            end
+            
+            -- Update preview
+            previewBitmap = wx.wxBitmap(previewCopy)
+            previewCtrl = wx.wxStaticBitmap(previewPanel, wx.wxID_ANY, previewBitmap)
+            
+            local sizer = wx.wxBoxSizer(wx.wxVERTICAL)
+            sizer:Add(previewCtrl, 1, wx.wxALIGN_CENTER + wx.wxALL, 10)
+            previewPanel:SetSizer(sizer)
+            previewPanel:Layout()
+        end
+        
+        mainSizer:Add(previewPanel, 0, wx.wxEXPAND + wx.wxALL, 10)
+        
+        -- Adjustment controls
+        local adjustBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Adjustments")
+        
+        -- Brightness slider
+        local brightSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local brightLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Brightness:")
+        brightLabel:SetMinSize(wx.wxSize(80, -1))
+        local brightSlider = wx.wxSlider(panel, wx.wxID_ANY, settings.brightness,
+                                        -100, 100, wx.wxDefaultPosition, wx.wxSize(300, -1))
+        local brightValue = wx.wxStaticText(panel, wx.wxID_ANY, tostring(settings.brightness))
+        brightValue:SetMinSize(wx.wxSize(40, -1))
+        brightSizer:Add(brightLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+        brightSizer:Add(brightSlider, 1, wx.wxEXPAND)
+        brightSizer:Add(brightValue, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxLEFT, 5)
+        adjustBox:Add(brightSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
+        
+        -- Contrast slider
+        local contrastSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local contrastLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Contrast:")
+        contrastLabel:SetMinSize(wx.wxSize(80, -1))
+        local contrastSlider = wx.wxSlider(panel, wx.wxID_ANY, settings.contrast,
+                                          -100, 100, wx.wxDefaultPosition, wx.wxSize(300, -1))
+        local contrastValue = wx.wxStaticText(panel, wx.wxID_ANY, tostring(settings.contrast))
+        contrastValue:SetMinSize(wx.wxSize(40, -1))
+        contrastSizer:Add(contrastLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+        contrastSizer:Add(contrastSlider, 1, wx.wxEXPAND)
+        contrastSizer:Add(contrastValue, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxLEFT, 5)
+        adjustBox:Add(contrastSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
+        
+        -- Dithering slider (NEW)
+        local ditherSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local ditherLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Dithering:")
+        ditherLabel:SetMinSize(wx.wxSize(80, -1))
+        local ditherSlider = wx.wxSlider(panel, wx.wxID_ANY, settings.dithering,
+                                        0, 100, wx.wxDefaultPosition, wx.wxSize(300, -1))
+        local ditherValue = wx.wxStaticText(panel, wx.wxID_ANY, tostring(settings.dithering))
+        ditherValue:SetMinSize(wx.wxSize(40, -1))
+        ditherSizer:Add(ditherLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+        ditherSizer:Add(ditherSlider, 1, wx.wxEXPAND)
+        ditherSizer:Add(ditherValue, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxLEFT, 5)
+        adjustBox:Add(ditherSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
+        
+        -- Rotation spinner 0-360°
+        local rotationSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local rotationLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Rotation:")
+        rotationLabel:SetMinSize(wx.wxSize(80, -1))
+        local rotationInput = wx.wxSpinCtrl(panel, wx.wxID_ANY, tostring(settings.rotation),
+                                           wx.wxDefaultPosition, wx.wxSize(100, -1),
+                                           wx.wxSP_ARROW_KEYS + wx.wxSP_WRAP, 0, 360, settings.rotation)
+        local rotationDegLabel = wx.wxStaticText(panel, wx.wxID_ANY, "degrees")
+        rotationSizer:Add(rotationLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+        rotationSizer:Add(rotationInput, 0, wx.wxRIGHT, 5)
+        rotationSizer:Add(rotationDegLabel, 0, wx.wxALIGN_CENTER_VERTICAL)
+        adjustBox:Add(rotationSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
+        
+        -- Invert checkbox
+        local invertCheck = wx.wxCheckBox(panel, wx.wxID_ANY, "Invert Image (dark burns)")
+        invertCheck:SetValue(settings.invertImage == 1)
+        adjustBox:Add(invertCheck, 0, wx.wxALL, 5)
+        
+        mainSizer:Add(adjustBox, 0, wx.wxEXPAND + wx.wxALL, 10)
+        
+        -- Reset button
+        local resetBtn = wx.wxButton(panel, wx.wxID_ANY, "Reset Adjustments")
+        mainSizer:Add(resetBtn, 0, wx.wxALIGN_CENTER + wx.wxALL, 5)
+        
+        -- Connect events
+        brightSlider:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_SLIDER_UPDATED, function(event)
+            settings.brightness = brightSlider:GetValue()
+            brightValue:SetLabel(tostring(settings.brightness))
+            UpdateImagePreview()
+        end)
+        
+        contrastSlider:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_SLIDER_UPDATED, function(event)
+            settings.contrast = contrastSlider:GetValue()
+            contrastValue:SetLabel(tostring(settings.contrast))
+            UpdateImagePreview()
+        end)
+        
+        ditherSlider:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_SLIDER_UPDATED, function(event)
+            settings.dithering = ditherSlider:GetValue()
+            ditherValue:SetLabel(tostring(settings.dithering))
+            UpdateImagePreview()
+        end)
+        
+        rotationInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_SPINCTRL_UPDATED, function(event)
+            settings.rotation = rotationInput:GetValue()
+            UpdateImagePreview()
+        end)
+        
+        invertCheck:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_CHECKBOX_CLICKED, function(event)
+            settings.invertImage = invertCheck:GetValue() and 1 or 0
+            UpdateImagePreview()
+        end)
+        
+        resetBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function(event)
+            settings.brightness = 0
+            settings.contrast = 0
+            settings.dithering = 0  -- Reset dithering too
+            settings.rotation = 0  -- Reset rotation too
+            settings.invertImage = 0
+            brightSlider:SetValue(0)
+            contrastSlider:SetValue(0)
+            ditherSlider:SetValue(0)
+            rotationInput:SetValue(0)
+            invertCheck:SetValue(false)
+            brightValue:SetLabel("0")
+            contrastValue:SetLabel("0")
+            ditherValue:SetLabel("0")
+            UpdateImagePreview()
+        end)
+        
+        -- Dialog buttons
+        local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local backBtn = wx.wxButton(panel, wx.wxID_ANY, "Back")
+        local nextBtn = wx.wxButton(panel, wx.wxID_ANY, "Next")
+        local cancelBtn = wx.wxButton(panel, wx.wxID_CANCEL, "Cancel")
+        
+        -- Add explicit handlers for navigation
+        backBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
+            dlg:EndModal(DIALOG_RESULT_BACK)
+        end)
+        
+        nextBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
+            dlg:EndModal(wx.wxID_OK)
+        end)
+        
+        btnSizer:Add(backBtn, 0, wx.wxRIGHT, 5)
+        btnSizer:Add(nextBtn, 0, wx.wxRIGHT + wx.wxLEFT, 5)
+        btnSizer:Add(cancelBtn, 0, wx.wxLEFT, 5)
+        mainSizer:Add(btnSizer, 0, wx.wxALIGN_CENTER + wx.wxALL, 10)
+        
+        panel:SetSizer(mainSizer)
+        dlg:Centre()
+        
+        -- Initial preview
+        UpdateImagePreview()
+        
+        local result = dlg:ShowModal()
+        
+        -- Save settings
+        ProfileSetInt("Brightness", settings.brightness)
+        ProfileSetInt("Contrast", settings.contrast)
+        ProfileSetInt("Dithering", settings.dithering)
+        ProfileSetInt("Rotation", settings.rotation)
+        ProfileSetInt("InvertImage", settings.invertImage)
+        
+        dlg:Destroy()
+        return result
+    end
+    
+    -- ==================== EDIT PRESETS DIALOG ====================
+    local function ShowEditPresetsDialog()
+        local parent = wx.NULL
+        local app = wx.wxGetApp()
+        if app then
+            pcall(function() parent = app:GetTopWindow() or wx.NULL end)
+        end
+        
+        local editDlg = wx.wxDialog(parent, wx.wxID_ANY, "Edit Presets",
+                                   wx.wxDefaultPosition, wx.wxSize(600, 400))
+        
+        local editPanel = wx.wxPanel(editDlg, wx.wxID_ANY)
+        local editSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+        
+        -- Instructions
+        local instructLabel = wx.wxStaticText(editPanel, wx.wxID_ANY,
+            "Edit preset values below. Changes are saved automatically.")
+        editSizer:Add(instructLabel, 0, wx.wxALL, 10)
+        
+        -- Create grid for editing
+        local gridSizer = wx.wxFlexGridSizer(#PRESETS + 1, 5, 5, 10)
+        gridSizer:AddGrowableCol(0, 1)  -- Name column expandable
+        
+        -- Headers
+        local headers = {"Name", "DPI", "Min PWM", "Max PWM", "Feedrate"}
+        for _, header in ipairs(headers) do
+            local label = wx.wxStaticText(editPanel, wx.wxID_ANY, header)
+            label:SetFont(wx.wxFont(9, wx.wxFONTFAMILY_DEFAULT, 
+                                   wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_BOLD))
+            gridSizer:Add(label, 0, wx.wxALIGN_CENTER)
+        end
+        
+        -- Create input controls for each preset
+        local presetControls = {}
+        for i, preset in ipairs(PRESETS) do
+            presetControls[i] = {
+                name = wx.wxTextCtrl(editPanel, wx.wxID_ANY, preset.name,
+                                   wx.wxDefaultPosition, wx.wxSize(200, -1)),
+                dpi = wx.wxSpinCtrl(editPanel, wx.wxID_ANY, tostring(preset.dpi),
+                                  wx.wxDefaultPosition, wx.wxSize(80, -1),
+                                  wx.wxSP_ARROW_KEYS, 50, 600, preset.dpi),
+                pwmMin = wx.wxSpinCtrl(editPanel, wx.wxID_ANY, tostring(preset.pwmMin),
+                                     wx.wxDefaultPosition, wx.wxSize(80, -1),
+                                     wx.wxSP_ARROW_KEYS, 0, 100, preset.pwmMin),
+                pwmMax = wx.wxSpinCtrl(editPanel, wx.wxID_ANY, tostring(preset.pwmMax),
+                                     wx.wxDefaultPosition, wx.wxSize(80, -1),
+                                     wx.wxSP_ARROW_KEYS, 0, 100, preset.pwmMax),
+                feedrate = wx.wxSpinCtrl(editPanel, wx.wxID_ANY, tostring(preset.feedrate),
+                                       wx.wxDefaultPosition, wx.wxSize(80, -1),
+                                       wx.wxSP_ARROW_KEYS, 10, 1000, preset.feedrate)
+            }
+            
+            gridSizer:Add(presetControls[i].name, 0, wx.wxEXPAND)
+            gridSizer:Add(presetControls[i].dpi, 0)
+            gridSizer:Add(presetControls[i].pwmMin, 0)
+            gridSizer:Add(presetControls[i].pwmMax, 0)
+            gridSizer:Add(presetControls[i].feedrate, 0)
+        end
+        
+        editSizer:Add(gridSizer, 1, wx.wxEXPAND + wx.wxALL, 10)
+        
+        -- Buttons
+        local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local resetBtn = wx.wxButton(editPanel, wx.wxID_ANY, "Reset to Defaults")
+        local saveBtn = wx.wxButton(editPanel, wx.wxID_ANY, "Save & Close")
+        
+        resetBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
+            -- Reset to original defaults
+            local defaults = {
+                {name = "Fine Detail (High DPI)", dpi = 300, pwmMin = 5, pwmMax = 40, feedrate = 400},
+                {name = "Standard Quality", dpi = 150, pwmMin = 10, pwmMax = 60, feedrate = 400},
+                {name = "Fast Draft", dpi = 75, pwmMin = 15, pwmMax = 80, feedrate = 400},
+                {name = "Deep Burn", dpi = 100, pwmMin = 20, pwmMax = 100, feedrate = 400}
+            }
+            
+            for i, preset in ipairs(defaults) do
+                if presetControls[i] then
+                    presetControls[i].name:SetValue(preset.name)
+                    presetControls[i].dpi:SetValue(preset.dpi)
+                    presetControls[i].pwmMin:SetValue(preset.pwmMin)
+                    presetControls[i].pwmMax:SetValue(preset.pwmMax)
+                    presetControls[i].feedrate:SetValue(preset.feedrate)
+                end
+            end
+        end)
+        
+        saveBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
+            editDlg:EndModal(wx.wxID_OK)
+        end)
+        
+        btnSizer:Add(resetBtn, 0, wx.wxRIGHT, 10)
+        btnSizer:Add(saveBtn, 0)
+        editSizer:Add(btnSizer, 0, wx.wxALIGN_CENTER + wx.wxALL, 10)
+        
+        editPanel:SetSizer(editSizer)
+        editDlg:Centre()
+        
+        local result = editDlg:ShowModal()
+        
+        if result == wx.wxID_OK then
+            -- Save all preset values
+            for i, controls in ipairs(presetControls) do
+                PRESETS[i] = {
+                    name = controls.name:GetValue(),
+                    dpi = controls.dpi:GetValue(),
+                    pwmMin = controls.pwmMin:GetValue(),
+                    pwmMax = controls.pwmMax:GetValue(),
+                    feedrate = controls.feedrate:GetValue()
+                }
+                
+                -- Save to profile for persistence
+                ProfileSetString("Preset" .. i .. "_Name", PRESETS[i].name)
+                ProfileSetInt("Preset" .. i .. "_DPI", PRESETS[i].dpi)
+                ProfileSetInt("Preset" .. i .. "_PwmMin", PRESETS[i].pwmMin)
+                ProfileSetInt("Preset" .. i .. "_PwmMax", PRESETS[i].pwmMax)
+                ProfileSetInt("Preset" .. i .. "_Feedrate", PRESETS[i].feedrate)
+            end
+        end
+        
+        editDlg:Destroy()
+        return result
+    end
+    
+    -- ==================== STEP 3: LASER PARAMETERS ====================
+    local function ShowLaserParametersDialog()
+        local parent = wx.NULL
+        local app = wx.wxGetApp()
+        if app then
+            pcall(function() parent = app:GetTopWindow() or wx.NULL end)
+        end
+        
+        local dlg = wx.wxDialog(parent, wx.wxID_ANY, "Step 3: Laser Parameters",
+                              wx.wxDefaultPosition, wx.wxSize(500, 700))
+        
+        local panel = wx.wxPanel(dlg, wx.wxID_ANY)
+        local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+        
+        -- Quick presets
+        local presetBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Quick Presets")
+        local presetChoice = wx.wxChoice(panel, wx.wxID_ANY)
+        presetChoice:Append("Custom")
+        for _, preset in ipairs(PRESETS) do
+            presetChoice:Append(preset.name)
+        end
+        presetChoice:SetSelection(0)
+        presetBox:Add(presetChoice, 0, wx.wxEXPAND + wx.wxALL, 5)
+        
+        -- Add Edit Presets button
+        local editPresetsBtn = wx.wxButton(panel, wx.wxID_ANY, "Edit Presets...")
+        presetBox:Add(editPresetsBtn, 0, wx.wxEXPAND + wx.wxALL, 5)
+        
+        mainSizer:Add(presetBox, 0, wx.wxEXPAND + wx.wxALL, 10)
+        
+        -- Physical size and DPI
+        local sizeBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Physical Size")
+        
+        -- Width input
+        local widthSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local widthLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Width (inches):")
+        widthLabel:SetMinSize(wx.wxSize(120, -1))
+        local widthInput = wx.wxTextCtrl(panel, wx.wxID_ANY, 
+                                        string.format("%.3f", settings.physicalWidth))
+        widthSizer:Add(widthLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+        widthSizer:Add(widthInput, 1, wx.wxEXPAND)
+        sizeBox:Add(widthSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
+        
+        -- Scan lines input
+        local scanSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local scanLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Scan Lines (Y):")
+        scanLabel:SetMinSize(wx.wxSize(120, -1))
+        local scanInput = wx.wxTextCtrl(panel, wx.wxID_ANY, tostring(settings.scanLines))
+        scanSizer:Add(scanLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+        scanSizer:Add(scanInput, 1, wx.wxEXPAND)
+        sizeBox:Add(scanSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
+        
+        -- Calculated values
+        local calcLabel = wx.wxStaticText(panel, wx.wxID_ANY, "")
+        sizeBox:Add(calcLabel, 0, wx.wxALL, 5)
+        
+        -- Time estimate display
+        local timeLabel = wx.wxStaticText(panel, wx.wxID_ANY, "")
+        sizeBox:Add(timeLabel, 0, wx.wxALL, 5)
+        
+        local function UpdateCalculations()
+            local width = tonumber(widthInput:GetValue()) or 0
+            local scans = tonumber(scanInput:GetValue()) or 0
+            
+            if width > 0 and scans > 0 then
+                -- Use rotated dimensions if available
+                local actualWidth = imageData.rotatedWidth or imageData.width
+                local actualHeight = imageData.rotatedHeight or imageData.height
+                local aspectRatio = actualWidth / actualHeight
+                local height = width / aspectRatio
+                local dpiX = actualWidth / width
+                local dpiY = scans / height
+                
+                calcLabel:SetLabel(string.format(
+                    "Height: %.3f inches\n" ..
+                    "DPI: %.1f x %.1f\n" ..
+                    "X pixels: %d (resampled to match)",
+                    height, dpiX, dpiY, math.floor(scans * aspectRatio)))
+                    
+                -- Calculate time estimate
+                local feedrate = tonumber(feedInput:GetValue()) or 1
+                if feedrate > 0 then
+                    local distancePerRow = width + 2.0  -- Include overtravel
+                    local totalDistance = distancePerRow * scans
+                    local baseMinutes = totalDistance / feedrate
+                    local estimatedMinutes = baseMinutes * TIME_ESTIMATE_BUFFER
+                    
+                    -- Format as HH:MM:SS
+                    local hours = math.floor(estimatedMinutes / 60)
+                    local minutes = math.floor(estimatedMinutes % 60)
+                    local seconds = math.floor((estimatedMinutes * 60) % 60)
+                    
+                    timeLabel:SetLabel(string.format("Estimated time: %02d:%02d:%02d",
+                                                    hours, minutes, seconds))
+                else
+                    timeLabel:SetLabel("Invalid feedrate")
+                end
+            else
+                calcLabel:SetLabel("Invalid dimensions")
+                timeLabel:SetLabel("")
+            end
+            panel:Layout()
+        end
+        
+        mainSizer:Add(sizeBox, 0, wx.wxEXPAND + wx.wxALL, 10)
+        
+        -- Power settings
+        local powerBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Power Settings")
+        
+        -- Min PWM
+        local minSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local minLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Min PWM (%):")
+        minLabel:SetMinSize(wx.wxSize(120, -1))
+        local minInput = wx.wxTextCtrl(panel, wx.wxID_ANY, tostring(settings.pwmMin))
+        minSizer:Add(minLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+        minSizer:Add(minInput, 1, wx.wxEXPAND)
+        powerBox:Add(minSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
+        
+        -- Max PWM
+        local maxSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local maxLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Max PWM (%):")
+        maxLabel:SetMinSize(wx.wxSize(120, -1))
+        local maxInput = wx.wxTextCtrl(panel, wx.wxID_ANY, tostring(settings.pwmMax))
+        maxSizer:Add(maxLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+        maxSizer:Add(maxInput, 1, wx.wxEXPAND)
+        powerBox:Add(maxSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
+        
+        -- Feedrate
+        local feedSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local feedLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Feedrate (IPM):")
+        feedLabel:SetMinSize(wx.wxSize(120, -1))
+        local feedInput = wx.wxTextCtrl(panel, wx.wxID_ANY, tostring(settings.feedrate))
+        feedSizer:Add(feedLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+        feedSizer:Add(feedInput, 1, wx.wxEXPAND)
+        powerBox:Add(feedSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
+        
+        mainSizer:Add(powerBox, 0, wx.wxEXPAND + wx.wxALL, 10)
+        
+        -- Z Height
+        local zSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local zLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Z Height:")
+        zLabel:SetMinSize(wx.wxSize(120, -1))
+        local zInput = wx.wxTextCtrl(panel, wx.wxID_ANY, 
+                                    string.format("%.3f", settings.zHeight))
+        zSizer:Add(zLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+        zSizer:Add(zInput, 1, wx.wxEXPAND)
+        mainSizer:Add(zSizer, 0, wx.wxEXPAND + wx.wxALL, 10)
+        
+        -- Even Rows Only checkbox
+        local evenRowsCheck = wx.wxCheckBox(panel, wx.wxID_ANY,
+            "Burn Even Rows Only (Recommended for alignment testing)")
+        evenRowsCheck:SetValue(settings.evenRowsOnly == 1)
+        mainSizer:Add(evenRowsCheck, 0, wx.wxALL, 10)
+        
+        -- Connect events
+        widthInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateCalculations)
+        scanInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateCalculations)
+        feedInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateCalculations)
+        
+        presetChoice:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_CHOICE_SELECTED, function(event)
+            local sel = presetChoice:GetSelection()
+            if sel > 0 then
+                local preset = PRESETS[sel]
+                if preset then
+                    -- Calculate scan lines based on preset DPI and image size
+                    local width = tonumber(widthInput:GetValue()) or settings.physicalWidth
+                    local actualWidth = imageData.rotatedWidth or imageData.width
+                    local actualHeight = imageData.rotatedHeight or imageData.height
+                    local height = width * actualHeight / actualWidth
+                    local scans = math.floor(height * preset.dpi)
+                    
+                    scanInput:SetValue(tostring(scans))
+                    minInput:SetValue(tostring(preset.pwmMin))
+                    maxInput:SetValue(tostring(preset.pwmMax))
+                    feedInput:SetValue(tostring(preset.feedrate))
+                    UpdateCalculations()
+                end
+            end
+        end)
+        
+        -- Connect Edit Presets button
+        editPresetsBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
+            local result = ShowEditPresetsDialog()
+            if result == wx.wxID_OK then
+                -- Update dropdown with new preset names
+                presetChoice:Clear()
+                presetChoice:Append("Custom")
+                for _, preset in ipairs(PRESETS) do
+                    presetChoice:Append(preset.name)
+                end
+                presetChoice:SetSelection(0)
+            end
+        end)
+        
+        -- Initial calculation
+        UpdateCalculations()
+        
+        -- Dialog buttons
+        local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local backBtn = wx.wxButton(panel, wx.wxID_ANY, "Back")
+        local nextBtn = wx.wxButton(panel, wx.wxID_ANY, "Next")
+        local cancelBtn = wx.wxButton(panel, wx.wxID_CANCEL, "Cancel")
+        
+        -- Add explicit handlers
+        backBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
+            dlg:EndModal(DIALOG_RESULT_BACK)
+        end)
+        
+        nextBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
+            dlg:EndModal(wx.wxID_OK)
+        end)
+        
+        btnSizer:Add(backBtn, 0, wx.wxRIGHT, 5)
+        btnSizer:Add(nextBtn, 0, wx.wxRIGHT + wx.wxLEFT, 5)
+        btnSizer:Add(cancelBtn, 0, wx.wxLEFT, 5)
+        mainSizer:Add(btnSizer, 0, wx.wxALIGN_CENTER + wx.wxALL, 10)
+        
+        panel:SetSizer(mainSizer)
+        dlg:Centre()
+        
+        local result = dlg:ShowModal()
+        
+        if result == wx.wxID_OK then
+            -- Validate and save settings
+            settings.physicalWidth = tonumber(widthInput:GetValue()) or settings.physicalWidth
+            settings.scanLines = tonumber(scanInput:GetValue()) or settings.scanLines
+            settings.pwmMin = tonumber(minInput:GetValue()) or settings.pwmMin
+            settings.pwmMax = tonumber(maxInput:GetValue()) or settings.pwmMax
+            settings.feedrate = tonumber(feedInput:GetValue()) or settings.feedrate
+            settings.zHeight = tonumber(zInput:GetValue()) or settings.zHeight
+            settings.evenRowsOnly = evenRowsCheck:GetValue() and 1 or 0
+            
+            ProfileSetFloat("PhysicalWidth", settings.physicalWidth)
+            ProfileSetInt("ScanLines", settings.scanLines)
+            ProfileSetInt("PwmMin", settings.pwmMin)
+            ProfileSetInt("PwmMax", settings.pwmMax)
+            ProfileSetInt("Feedrate", settings.feedrate)
+            ProfileSetFloat("ZHeight", settings.zHeight)
+            ProfileSetInt("EvenRowsOnly", settings.evenRowsOnly)
+        end
+        
+        dlg:Destroy()
+        return result
+    end
+    
+    -- ==================== STEP 4: POSITIONING ====================
+    local function ShowPositioningDialog()
+        local parent = wx.NULL
+        local app = wx.wxGetApp()
+        if app then
+            pcall(function() parent = app:GetTopWindow() or wx.NULL end)
+        end
+        
+        local dlg = wx.wxDialog(parent, wx.wxID_ANY, "Step 4: Image Positioning",
+                              wx.wxDefaultPosition, wx.wxSize(450, 500))
+        
+        local panel = wx.wxPanel(dlg, wx.wxID_ANY)
+        local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+        
+        -- Current position display
+        local posX = mc.mcAxisGetPos(inst, mc.X_AXIS)
+        local posY = mc.mcAxisGetPos(inst, mc.Y_AXIS)
+        
+        local posLabel = wx.wxStaticText(panel, wx.wxID_ANY,
+            string.format("Current Position: X%.4f Y%.4f", posX, posY))
+        posLabel:SetFont(wx.wxFont(10, wx.wxFONTFAMILY_DEFAULT, 
+                                  wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_BOLD))
+        mainSizer:Add(posLabel, 0, wx.wxALL, 10)
+        
+        -- Position mode radio
+        local posRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
+            "Image Position Reference", wx.wxDefaultPosition, wx.wxDefaultSize,
+            {"Center", "Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right"},
+            1, wx.wxRA_SPECIFY_COLS)
+        posRadio:SetSelection(settings.positionMode - 1)
+        mainSizer:Add(posRadio, 0, wx.wxEXPAND + wx.wxALL, 10)
+        
+        -- Preview checkbox
+        local previewCheck = wx.wxCheckBox(panel, wx.wxID_ANY, 
+                                          "Show preview outline before rastering")
+        previewCheck:SetValue(settings.showPreview == 1)
+        mainSizer:Add(previewCheck, 0, wx.wxALL, 10)
+        
+        -- Create wrapper panel for vector settings
+        local vectorPanel = wx.wxPanel(panel, wx.wxID_ANY)
+        local vectorPanelSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+        
+        local vectorBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, vectorPanel, "Preview Laser Settings")
+        
+        local freqSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local freqLabel = wx.wxStaticText(vectorPanel, wx.wxID_ANY, "Frequency (Hz):")
+        freqLabel:SetMinSize(wx.wxSize(120, -1))
+        local freqInput = wx.wxTextCtrl(vectorPanel, wx.wxID_ANY, tostring(settings.vectorFrequency))
+        freqSizer:Add(freqLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+        freqSizer:Add(freqInput, 1, wx.wxEXPAND)
+        vectorBox:Add(freqSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
+        
+        -- Add preview power input
+        local powerSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local powerLabel = wx.wxStaticText(vectorPanel, wx.wxID_ANY, "Preview Power (%):")
+        powerLabel:SetMinSize(wx.wxSize(120, -1))
+        local powerInput = wx.wxSpinCtrl(vectorPanel, wx.wxID_ANY, tostring(settings.previewPower),
+                                        wx.wxDefaultPosition, wx.wxSize(80, -1),
+                                        wx.wxSP_ARROW_KEYS, 1, 10, settings.previewPower)
+        powerSizer:Add(powerLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+        powerSizer:Add(powerInput, 0)
+        vectorBox:Add(powerSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
+        
+        vectorPanelSizer:Add(vectorBox, 1, wx.wxEXPAND)
+        vectorPanel:SetSizer(vectorPanelSizer)
+        
+        mainSizer:Add(vectorPanel, 0, wx.wxEXPAND + wx.wxALL, 10)
+        vectorPanel:Show(settings.showPreview == 1)
+        
+        -- Toggle vector settings visibility
+        previewCheck:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_CHECKBOX_CLICKED, function(event)
+            vectorPanel:Show(previewCheck:GetValue())
+            panel:Layout()
+            dlg:Fit()
+        end)
+        
+        -- Image dimensions info
+        local width = settings.physicalWidth
+        local actualWidth = imageData.rotatedWidth or imageData.width
+        local actualHeight = imageData.rotatedHeight or imageData.height
+        local height = width * actualHeight / actualWidth
+        
+        local dimLabel = wx.wxStaticText(panel, wx.wxID_ANY,
+            string.format("Image size: %.3f\" x %.3f\"", width, height))
+        mainSizer:Add(dimLabel, 0, wx.wxALL, 10)
+        
+        -- Dialog buttons - CHANGED TO "Trace Outline"
+        local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local backBtn = wx.wxButton(panel, wx.wxID_ANY, "Back")
+        local genBtn = wx.wxButton(panel, wx.wxID_ANY, "Continue")  -- Changed label
+        local cancelBtn = wx.wxButton(panel, wx.wxID_CANCEL, "Cancel")
+        
+        -- Add explicit handlers
+        backBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
+            dlg:EndModal(DIALOG_RESULT_BACK)
+        end)
+        
+        genBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
+            dlg:EndModal(wx.wxID_OK)
+        end)
+        
+        btnSizer:Add(backBtn, 0, wx.wxRIGHT, 5)
+        btnSizer:Add(genBtn, 0, wx.wxRIGHT + wx.wxLEFT, 5)
+        btnSizer:Add(cancelBtn, 0, wx.wxLEFT, 5)
+        mainSizer:Add(btnSizer, 0, wx.wxALIGN_CENTER + wx.wxALL, 10)
+        
+        panel:SetSizer(mainSizer)
+        dlg:Centre()
+        
+        local result = dlg:ShowModal()
+        
+        if result == wx.wxID_OK then
+            settings.positionMode = posRadio:GetSelection() + 1
+            settings.showPreview = previewCheck:GetValue() and 1 or 0
+            settings.vectorFrequency = tonumber(freqInput:GetValue()) or settings.vectorFrequency
+            settings.previewPower = powerInput:GetValue()
+            
+            ProfileSetInt("PositionMode", settings.positionMode)
+            ProfileSetInt("ShowPreview", settings.showPreview)
+            ProfileSetInt("VectorFrequency", settings.vectorFrequency)
+            ProfileSetInt("PreviewPower", settings.previewPower)
+        end
+        
+        dlg:Destroy()
+        return result
+    end
+    
+    -- ==================== 8-BIT BMP CREATION ====================
+    local function Create8BitBMP(filepath, width, height, pixelData)
+        local file = io.open(filepath, "wb")
+        if not file then
+            return false, "Cannot create BMP file"
+        end
+        
+        -- BMP Header (14 bytes)
+        file:write("BM")  -- Signature
+        
+        -- Calculate sizes
+        local rowSize = math.ceil(width / 4) * 4  -- Rows must be multiple of 4 bytes
+        local pixelDataSize = rowSize * height
+        local paletteSize = 256 * 4  -- 256 colors, 4 bytes each
+        local fileSize = 14 + 40 + paletteSize + pixelDataSize
+        
+        -- Write file size (little-endian)
+        local function WriteDWord(value)
+            file:write(string.char(
+                value % 256,
+                math.floor(value / 256) % 256,
+                math.floor(value / 65536) % 256,
+                math.floor(value / 16777216) % 256
+            ))
+        end
+        
+        local function WriteWord(value)
+            file:write(string.char(
+                value % 256,
+                math.floor(value / 256) % 256
+            ))
+        end
+        
+        WriteDWord(fileSize)        -- File size
+        WriteDWord(0)               -- Reserved
+        WriteDWord(14 + 40 + paletteSize)  -- Offset to pixel data
+        
+        -- DIB Header (40 bytes)
+        WriteDWord(40)              -- Header size
+        WriteDWord(width)           -- Width
+        WriteDWord(height)          -- Height
+        WriteWord(1)                -- Planes
+        WriteWord(8)                -- Bits per pixel (8-bit)
+        WriteDWord(0)               -- Compression
+        WriteDWord(pixelDataSize)   -- Image size
+        WriteDWord(2835)            -- X pixels per meter (72 DPI)
+        WriteDWord(2835)            -- Y pixels per meter
+        WriteDWord(256)             -- Colors used
+        WriteDWord(256)             -- Important colors
+        
+        -- Palette (256 grayscale entries)
+        for i = 0, 255 do
+            file:write(string.char(i, i, i, 0))  -- B, G, R, Reserved
+        end
+        
+        -- Pixel data (bottom-up, left-to-right)
+        for y = height - 1, 0, -1 do
+            for x = 0, width - 1 do
+                local pixelValue = pixelData[y * width + x + 1] or 0
+                file:write(string.char(math.max(0, math.min(255, pixelValue))))
+            end
+            -- Padding to make row multiple of 4 bytes
+            for p = 1, rowSize - width do
+                file:write(string.char(0))
+            end
+        end
+        
+        file:close()
+        return true, "8-bit BMP created"
+    end
+    
+    -- ==================== GENERATE BMP WITH 8-BIT FORMAT ====================
+    local function GenerateBMP()
+        EnsureTempDir()
+        
+        -- Load and process image
+        local img = wx.wxImage()
+        if not img:LoadFile(imageData.originalPath) then
+            return false, "Failed to load image"
+        end
+        table.insert(wizardState.imageObjects, img)
+        
+        -- Convert to grayscale
+        img = img:ConvertToGreyscale()
+        
+        -- Resize to match scan lines
+        local width = settings.physicalWidth
+        local height = width * imageData.height / imageData.width
+        local pixelsX = math.floor(settings.scanLines * imageData.width / imageData.height)
+        
+        img:Rescale(pixelsX, settings.scanLines)
+        
+        -- Collect pixel data with adjustments
+        local pixelData = {}
+        for y = 0, img:GetHeight() - 1 do
+            for x = 0, img:GetWidth() - 1 do
+                local r = img:GetRed(x, y)
+                
+                -- Contrast already applied in preview - skip to prevent double application
+                
+                -- Apply brightness
+                r = r + settings.brightness
+                r = math.max(0, math.min(255, r))
+                
+                -- Apply dithering if enabled
+                if settings.dithering > 0 then
+                    r = ApplyDithering(r, x, y, settings.dithering)
+                end
+                
+                -- Invert if needed (AFTER dithering)
+                if settings.invertImage == 1 then
+                    r = 255 - r
+                end
+                
+                table.insert(pixelData, r)
+            end
+        end
+        
+        -- Use FIXED filename for persistence
+        imageData.tempBmpPath = TEMP_DIR .. "laser_raster_current.bmp"
+        
+        -- Create 8-bit BMP
+        local success, errorMsg = Create8BitBMP(imageData.tempBmpPath, pixelsX, settings.scanLines, pixelData)
+        
+        if success then
+            -- DO NOT add to cleanup list - file needs to persist for ESS
+            mc.mcCntlSetLastError(inst, "8-bit BMP saved: " .. imageData.tempBmpPath)
+            
+            -- Verify file exists
+            local verifyFile = io.open(imageData.tempBmpPath, "rb")
+            if verifyFile then
+                local size = verifyFile:seek("end")
+                verifyFile:close()
+                mc.mcCntlSetLastError(inst, string.format("BMP verified: %d bytes", size))
+            else
+                mc.mcCntlSetLastError(inst, "WARNING: BMP saved but cannot verify!")
+            end
+        else
+            imageData.tempBmpPath = ""
+            mc.mcCntlSetLastError(inst, "ERROR: " .. errorMsg)
+        end
+        
+        return success, success and "OK" or errorMsg
+    end
+    
+    -- ==================== GENERATE OUTLINE WITH PROPORTIONAL SPEED ====================
+    local function GenerateOutlineGCode()
+        local currentX = mc.mcAxisGetPos(inst, mc.X_AXIS)
+        local currentY = mc.mcAxisGetPos(inst, mc.Y_AXIS)
+        
+        local width = settings.physicalWidth
+        local height = width * imageData.height / imageData.width
+        
+        -- Calculate proportional feedrate based on perimeter
+        local perimeter = 2 * (width + height)
+        local outlineFeedrate = math.floor(50 * (perimeter / 4))  -- 50 IPM for 1x1" square
+        outlineFeedrate = math.max(25, math.min(400, outlineFeedrate))  -- Clamp between 25-400 IPM
+        
+        local startX, startY
+        
+        if settings.positionMode == 1 then -- Center
+            startX = currentX - width / 2
+            startY = currentY - height / 2
+        elseif settings.positionMode == 2 then -- Top-Left
+            startX = currentX
+            startY = currentY - height
+        elseif settings.positionMode == 3 then -- Top-Right
+            startX = currentX - width
+            startY = currentY - height
+        elseif settings.positionMode == 4 then -- Bottom-Left
+            startX = currentX
+            startY = currentY
+        else -- Bottom-Right
+            startX = currentX - width
+            startY = currentY
+        end
+        
+        local gcode = {}
+        
+        table.insert(gcode, "; Laser Preview Outline")
+        table.insert(gcode, "; Generated by Laser Raster Wizard v2.7")
+        table.insert(gcode, string.format("; Size: %.3f x %.3f inches", width, height))
+        table.insert(gcode, string.format("; Perimeter: %.3f inches", perimeter))
+        table.insert(gcode, string.format("; Outline speed: %d IPM", outlineFeedrate))
+        table.insert(gcode, "")
+        
+        table.insert(gcode, "G90 ; Absolute positioning")
+        table.insert(gcode, string.format("G0 Z%.3f ; Move to laser height", settings.zHeight))
+        table.insert(gcode, string.format("G0 X%.4f Y%.4f ; Move to start position", startX, startY))
+        table.insert(gcode, "")
+        
+        table.insert(gcode, string.format("; Preview outline at %d%% power", settings.previewPower or 2))
+        table.insert(gcode, string.format("M2003 (LASER_VECTOR_PWM_PERCENTAGE=%d)", settings.previewPower or 2))
+        table.insert(gcode, string.format("M2003 (LASER_VECTOR_FREQUENCY=%d)", settings.vectorFrequency))
+        
+        if settings.gateDelay > 0 or settings.gateDuration > 0 then
+            table.insert(gcode, string.format("M2003 (LASER_VECTOR_GATE_DELAY=%.2f)", settings.gateDelay))
+            table.insert(gcode, string.format("M2003 (LASER_VECTOR_GATE_DURATION=%.2f)", settings.gateDuration))
+        end
+        
+        table.insert(gcode, "M2004 ; Enable laser")
+        table.insert(gcode, "M62 P9 ; Laser on")
+        table.insert(gcode, string.format("G1 X%.4f F%d", startX + width, outlineFeedrate))
+        table.insert(gcode, string.format("G1 Y%.4f", startY + height))
+        table.insert(gcode, string.format("G1 X%.4f", startX))
+        table.insert(gcode, string.format("G1 Y%.4f", startY))
+        table.insert(gcode, "M63 P9 ; Laser off")
+        table.insert(gcode, "M2005 ; Disable laser")
+        table.insert(gcode, "")
+        
+        table.insert(gcode, string.format("G0 X%.4f Y%.4f ; Return to original position", 
+                                         currentX, currentY))
+        table.insert(gcode, "M30 ; End program")
+        
+        return table.concat(gcode, "\n")
+    end
+    
+    -- ==================== GENERATE RASTER GCODE ====================
+    local function GenerateRasterGCode()
+        local currentX = mc.mcAxisGetPos(inst, mc.X_AXIS)
+        local currentY = mc.mcAxisGetPos(inst, mc.Y_AXIS)
+        
+        local width = settings.physicalWidth
+        local height = width * imageData.height / imageData.width
+        
+        local startX, startY
+        
+        if settings.positionMode == 1 then -- Center
+            startX = currentX - width / 2
+            startY = currentY - height / 2
+        elseif settings.positionMode == 2 then -- Top-Left
+            startX = currentX
+            startY = currentY - height
+        elseif settings.positionMode == 3 then -- Top-Right
+            startX = currentX - width
+            startY = currentY - height
+        elseif settings.positionMode == 4 then -- Bottom-Left
+            startX = currentX
+            startY = currentY
+        else -- Bottom-Right
+            startX = currentX - width
+            startY = currentY
+        end
+        
+        local gcode = {}
+        
+        table.insert(gcode, "; Laser Raster Image")
+        table.insert(gcode, "; Generated by Laser Raster Wizard v2.7")
+        table.insert(gcode, string.format("; Image: %s", imageData.originalPath))
+        table.insert(gcode, string.format("; Size: %.3f x %.3f inches", width, height))
+        table.insert(gcode, string.format("; Scan lines: %d", settings.scanLines))
+        table.insert(gcode, string.format("; Feedrate: %d IPM", settings.feedrate))
+        if settings.rotation > 0 then
+            table.insert(gcode, string.format("; Image rotated: %d degrees", settings.rotation))
+        end
+        table.insert(gcode, "")
+        
+        table.insert(gcode, "G90 ; Absolute positioning")
+        table.insert(gcode, string.format("G0 Z%.3f ; Move to laser height", settings.zHeight))
+        table.insert(gcode, string.format("G0 X%.4f Y%.4f ; Move to start position", startX, startY))
+        table.insert(gcode, "")
+        
+        table.insert(gcode, "; Begin raster")
+        table.insert(gcode, string.format("M2000 (%s)", imageData.tempBmpPath))
+        table.insert(gcode, "M2001 (UNITS=IN)")
+        table.insert(gcode, string.format("M2001 (FEEDRATE=%d)", settings.feedrate))
+        table.insert(gcode, "M2001 (IMAGE_STARTING_CORNER=4)") -- Top-left, scan right then down
+        table.insert(gcode, string.format("M2001 (PWM_MAX=%d)", settings.pwmMax))
+        table.insert(gcode, string.format("M2001 (PWM_MIN=%d)", settings.pwmMin))
+        table.insert(gcode, "M2001 (COMP_FOR_ACCEL_DIST_X=1)")
+        table.insert(gcode, "M2001 (SHOW_WINDOW_TO_START=0)")
+        if settings.evenRowsOnly == 1 then
+            table.insert(gcode, "M2001 (LASER_RASTER_EVEN_ROWS_ONLY=1)")
+        end
+        table.insert(gcode, "")
+        table.insert(gcode, "G4 P0.5 ; Pause for macro processing")
+        table.insert(gcode, "M2002 ; Start raster")
+        table.insert(gcode, "G4 P0.5 ; Wait for raster completion")
+        table.insert(gcode, "")
+        
+        table.insert(gcode, string.format("G0 X%.4f Y%.4f ; Return to original position", 
+                                         currentX, currentY))
+        table.insert(gcode, "M30 ; End program")
+        
+        return table.concat(gcode, "\n")
+    end
+    
+    -- ==================== CUSTOM 3-BUTTON FINAL DIALOG ====================
+    local function ShowFinalDialog(rasterGCode)
+        local parent = wx.NULL
+        local app = wx.wxGetApp()
+        if app then
+            pcall(function() parent = app:GetTopWindow() or wx.NULL end)
+        end
+        
+        local dlg = wx.wxDialog(parent, wx.wxID_ANY, "Generation Complete",
+                              wx.wxDefaultPosition, wx.wxSize(400, 180))
+        
+        local panel = wx.wxPanel(dlg, wx.wxID_ANY)
+        local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+        
+        -- Message
+        local message = wx.wxStaticText(panel, wx.wxID_ANY,
+            "GCode generated successfully!\n\nWhat would you like to do?")
+        message:SetFont(wx.wxFont(10, wx.wxFONTFAMILY_DEFAULT, 
+                                 wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
+        mainSizer:Add(message, 0, wx.wxALIGN_CENTER + wx.wxALL, 20)
+        
+        -- Three buttons
+        local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local saveBtn = wx.wxButton(panel, wx.wxID_ANY, "Save to File")
+        local loadBtn = wx.wxButton(panel, wx.wxID_ANY, "Load into Mach4")
+        local cancelBtn = wx.wxButton(panel, wx.wxID_ANY, "Cancel")
+        
+        btnSizer:Add(saveBtn, 0, wx.wxRIGHT, 10)
+        btnSizer:Add(loadBtn, 0, wx.wxRIGHT + wx.wxLEFT, 10)
+        btnSizer:Add(cancelBtn, 0, wx.wxLEFT, 10)
+        mainSizer:Add(btnSizer, 0, wx.wxALIGN_CENTER + wx.wxALL, 10)
+        
+        panel:SetSizer(mainSizer)
+        dlg:Centre()
+        
+        local result = 0  -- 0=cancel, 1=save, 2=load
+        
+        -- Connect button handlers
+        saveBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
+            result = 1
+            dlg:EndModal(wx.wxID_OK)
+        end)
+        
+        loadBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
+            result = 2
+            dlg:EndModal(wx.wxID_OK)
+        end)
+        
+        cancelBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
+            result = 0
+            dlg:EndModal(wx.wxID_CANCEL)
+        end)
+        
+        dlg:ShowModal()
+        dlg:Destroy()
+        
+        return result
+    end
+    
+    -- ==================== MAIN WIZARD NAVIGATION ====================
+    local function RunWizard()
+        local continueWizard = true
+        
+        while continueWizard do
+            local result
+            
+            if wizardState.currentStep == 1 then
+                -- Step 1: Image Selection
+                result = ShowImageSelectionDialog()
+                
+                if result == wx.wxID_OK then
+                    if imageData.originalPath == "" then
+                        wx.wxMessageBox("No image selected", "Error", wx.wxOK + wx.wxICON_ERROR)
+                    else
+                        wizardState.currentStep = 2
+                    end
+                elseif result == wx.wxID_CANCEL then
+                    continueWizard = false
+                end
+                
+            elseif wizardState.currentStep == 2 then
+                -- Step 2: Image Adjustments
+                result = ShowImageAdjustmentDialog()
+                
+                if result == wx.wxID_OK then
+                    wizardState.currentStep = 3
+                elseif result == DIALOG_RESULT_BACK then
+                    wizardState.currentStep = 1
+                elseif result == wx.wxID_CANCEL then
+                    continueWizard = false
+                end
+                
+            elseif wizardState.currentStep == 3 then
+                -- Step 3: Laser Parameters
+                result = ShowLaserParametersDialog()
+                
+                if result == wx.wxID_OK then
+                    wizardState.currentStep = 4
+                elseif result == DIALOG_RESULT_BACK then
+                    wizardState.currentStep = 2
+                elseif result == wx.wxID_CANCEL then
+                    continueWizard = false
+                end
+                
+            elseif wizardState.currentStep == 4 then
+                -- Step 4: Positioning
+                result = ShowPositioningDialog()
+                
+                if result == wx.wxID_OK then
+                    wizardState.currentStep = 5  -- Generate phase
+                elseif result == DIALOG_RESULT_BACK then
+                    wizardState.currentStep = 3
+                elseif result == wx.wxID_CANCEL then
+                    continueWizard = false
+                end
+                
+            elseif wizardState.currentStep == 5 then
+                -- IMPROVED WORKFLOW: Auto-execute outline
+                
+                -- Generate BMP first
+                mc.mcCntlSetLastError(inst, "Generating 8-bit bitmap...")
+                local success, errorMsg = GenerateBMP()
+                
+                if not success then
+                    wx.wxMessageBox("Failed to generate bitmap: " .. errorMsg, 
+                                  "Error", wx.wxOK + wx.wxICON_ERROR)
+                    wizardState.currentStep = 3  -- Go back to parameters
+                else
+                    local parent = wx.NULL
+                    local app = wx.wxGetApp()
+                    if app then
+                        pcall(function() parent = app:GetTopWindow() or wx.NULL end)
+                    end
+                    
+                    -- Handle preview outline if enabled
+                    if settings.showPreview == 1 then
+                        -- Z-height confirmation
+                        local confirmDlg = wx.wxMessageDialog(parent,
+                            "Please ensure your Z axis is at the correct focus height.\n\n" ..
+                            "The outline will now be traced at 2% power.\n\n" ..
+                            "Ready to proceed?",
+                            "Confirm Z Height",
+                            wx.wxYES_NO + wx.wxICON_QUESTION)
+                        
+                        if confirmDlg:ShowModal() == wx.wxID_YES then
+                            confirmDlg:Destroy()
+                            
+                            -- Generate and execute outline automatically
+                            mc.mcCntlSetLastError(inst, "Tracing outline...")
+                            local outlineGCode = GenerateOutlineGCode()
+                            
+                            -- Execute via file for proper M2003 processing
+                            local success, errorMsg = LoadAndExecuteGCode(
+                                outlineGCode, "outline_preview.nc", true)
+                            
+                            if not success then
+                                wx.wxMessageBox("Outline trace failed. Check machine state and try again.",
+                                              "Trace Error", wx.wxOK + wx.wxICON_ERROR)
+                                wizardState.currentStep = 4  -- Back to positioning
+                                goto continue
+                            end
+                            
+                            -- Ask for approval after outline
+                            local approvalDlg = wx.wxMessageDialog(parent,
+                                "Outline trace complete.\n\n" ..
+                                "Is the position correct?",
+                                "Verify Position",
+                                wx.wxYES_NO + wx.wxICON_QUESTION)
+                            
+                            if approvalDlg:ShowModal() == wx.wxID_NO then
+                                approvalDlg:Destroy()
+                                wizardState.currentStep = 4  -- Back to positioning
+                                goto continue
+                            end
+                            approvalDlg:Destroy()
+                        else
+                            confirmDlg:Destroy()
+                            wizardState.currentStep = 4  -- Back to positioning
+                            goto continue
+                        end
+                    end
+                    
+                    -- Generate final raster GCode
+                    mc.mcCntlSetLastError(inst, "Generating raster GCode...")
+                    local rasterGCode = GenerateRasterGCode()
+                    
+                    -- Show CUSTOM 3-button dialog
+                    local finalChoice = ShowFinalDialog(rasterGCode)
+                    
+                    if finalChoice == 1 then
+                        -- Save to file
+                        local saveDialog = wx.wxFileDialog(parent, "Save GCode File", "", 
+                                                          "laser_raster.nc",
+                                                          "GCode files (*.nc;*.tap;*.gcode)|*.nc;*.tap;*.gcode|" ..
+                                                          "All files (*.*)|*.*",
+                                                          wx.wxFD_SAVE + wx.wxFD_OVERWRITE_PROMPT)
+                        
+                        if saveDialog:ShowModal() == wx.wxID_OK then
+                            local file = io.open(saveDialog:GetPath(), "w")
+                            if file then
+                                file:write(rasterGCode)
+                                file:close()
+                                mc.mcCntlSetLastError(inst, "GCode saved: " .. saveDialog:GetPath())
+                            else
+                                wx.wxMessageBox("Failed to save file", "Error", wx.wxOK + wx.wxICON_ERROR)
+                            end
+                        end
+                        saveDialog:Destroy()
+                        
+                    elseif finalChoice == 2 then
+                        -- Load into Mach4
+                        local tempGcode = TEMP_DIR .. "raster_temp.nc"
+                        local file = io.open(tempGcode, "w")
+                        if file then
+                            file:write(rasterGCode)
+                            file:close()
+                            mc.mcCntlLoadGcodeFile(inst, tempGcode)
+                            mc.mcCntlSetLastError(inst, "Laser raster GCode loaded - ready to run")
+                        else
+                            wx.wxMessageBox("Failed to load GCode", "Error", wx.wxOK + wx.wxICON_ERROR)
+                        end
+                    end
+                    
+                    continueWizard = false  -- End wizard
+                end
+                
+                ::continue::  -- Label for goto when returning to positioning
+            end
+        end
+        
+        -- Cleanup when wizard ends (only cleanup images, not BMP files)
+        CleanupImageObjects()
+    end
+    
+    -- ==================== MAIN EXECUTION ====================
+    
+    -- Initialize temp directory and cleanup old files
+    checkpoint("Setting up temp directory")
+    EnsureTempDir()
+    CleanOldTempFiles()
+    
+    -- Check laser tool first
+    checkpoint("Checking laser tool")
+    if not CheckAndActivateLaserTool() then
+        return
+    end
+    
+    -- Run the wizard with navigation
+    checkpoint("Ready to show UI")
+    checkpoint("Starting wizard navigation")
+    local status, err = pcall(RunWizard)
+    
+    if not status then
+        -- Error occurred, cleanup and report
+        CleanupAll()
+        wx.wxMessageBox("An error occurred: " .. tostring(err), 
+                      "Wizard Error", wx.wxOK + wx.wxICON_ERROR)
+    end
+end
+
+-- ==================== SAFE EXECUTION WRAPPER ====================
+local function ExecuteWizardSafely()
+    -- Initial test to see if Mach4 is responsive
+    local testStatus, testInst = pcall(mc.mcGetInstance)
+    if not testStatus then
+        -- Can't even get instance, show OS-level error
+        wx.wxMessageBox("Cannot connect to Mach4 core: " .. tostring(testInst),
+                       "Fatal Error", wx.wxOK + wx.wxICON_ERROR)
+        return
+    end
+    
+    -- Log buffer for debugging
+    local debugLog = {}
+    local function log(msg)
+        table.insert(debugLog, os.date("%H:%M:%S") .. " - " .. msg)
+        mc.mcCntlSetLastError(testInst, msg)
+    end
+    
+    log("Starting Laser Raster Wizard v2.7")
+    
+    -- Main execution with full error catching
+    local status, err = pcall(function()
+        LaserRasterImageWizard()
+    end)
+    
+    if not status then
+        local errorReport = "LASER WIZARD FAILED\n" ..
+                          "==================\n" ..
+                          "Error: " .. tostring(err) .. "\n\n" ..
+                          "Debug Log:\n" .. table.concat(debugLog, "\n")
+        
+        -- Try multiple ways to show error
+        pcall(wx.wxMessageBox, errorReport, "Wizard Crash", wx.wxOK + wx.wxICON_ERROR)
+        mc.mcCntlSetLastError(testInst, "WIZARD CRASH: " .. tostring(err))
+        
+        -- Save crash log to file
+        pcall(function()
+            local crashFile = mc.mcCntlGetMachDir(testInst) .. "\\wizard_crash.log"
+            local f = io.open(crashFile, "w")
+            if f then
+                f:write(errorReport)
+                f:close()
+            end
+        end)
+    else
+        log("Wizard completed successfully")
+    end
+end
+
+-- Execute with safety
+ExecuteWizardSafely()

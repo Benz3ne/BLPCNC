@@ -11,11 +11,19 @@ local DIALOG_RESULT_NEXT = 5002
 local function LaserRasterImageWizard()
     local inst = mc.mcGetInstance()
     
+    -- Add debug mode flag and logging system
+    local DEBUG_MODE = true  -- Set to false for production
+    
+    local function DEBUG(msg)
+        if not DEBUG_MODE then return end
+        local timestamp = os.date("%H:%M:%S")
+        local fullMsg = string.format("[DEBUG %s] %s", timestamp, msg)
+        mc.mcCntlSetLastError(inst, fullMsg)
+    end
+    
     -- Checkpoint system
-    local checkpoints = {}
     local function checkpoint(name)
-        table.insert(checkpoints, name)
-        mc.mcCntlSetLastError(inst, "Checkpoint: " .. name)
+        DEBUG("Checkpoint: " .. name)
     end
     
     checkpoint("Getting instance")
@@ -49,24 +57,31 @@ local function LaserRasterImageWizard()
     
     -- ==================== PROFILE HELPER FUNCTIONS ====================
     local function ProfileGetString(key, default)
+        DEBUG(string.format("ProfileGet: %s", key))
+        
         if not inst then
-            return default  -- Failsafe if inst is nil
+            DEBUG("ERROR: inst is nil in ProfileGetString!")
+            return default
         end
         
         local status, result = pcall(mc.mcProfileGetString, inst, PROFILE_SECTION, key, default)
         if not status then
-            mc.mcCntlSetLastError(inst, "Profile read failed: " .. key)
+            DEBUG(string.format("ERROR: Profile read failed: %s - %s", key, tostring(result)))
             return default
         end
+        
         return result or default
     end
     
     local function ProfileSetString(key, value)
-        if not inst then return end
+        if not inst then 
+            DEBUG("ERROR: inst is nil in ProfileSetString!")
+            return 
+        end
         
         local status, err = pcall(mc.mcProfileWriteString, inst, PROFILE_SECTION, key, tostring(value))
         if not status then
-            mc.mcCntlSetLastError(inst, "Profile write failed: " .. key)
+            DEBUG(string.format("ERROR: Profile write failed: %s - %s", key, tostring(err)))
         end
     end
     
@@ -76,7 +91,7 @@ local function LaserRasterImageWizard()
         
         local num = tonumber(str)
         if not num then
-            mc.mcCntlSetLastError(inst, "Invalid number in profile: " .. key .. "=" .. tostring(str))
+            DEBUG(string.format("ERROR: Invalid float in profile: %s=%s", key, tostring(str)))
             return default
         end
         return num
@@ -92,7 +107,7 @@ local function LaserRasterImageWizard()
         
         local num = tonumber(str)
         if not num then
-            mc.mcCntlSetLastError(inst, "Invalid number in profile: " .. key .. "=" .. tostring(str))
+            DEBUG(string.format("ERROR: Invalid int in profile: %s=%s", key, tostring(str)))
             return default
         end
         return math.floor(num)
@@ -104,17 +119,25 @@ local function LaserRasterImageWizard()
     
     -- Load saved presets from profile
     local function LoadPresetsFromProfile()
-        -- Wrap entire function in error handler
+        DEBUG("=== LoadPresetsFromProfile START ===")
+        
         local status, err = pcall(function()
             for i = 1, 4 do
-                -- Defensive checks
+                -- Validate array before access
+                if not PRESETS then
+                    DEBUG("ERROR: PRESETS array is nil!")
+                    PRESETS = {}
+                end
+                
                 if not PRESETS[i] then
+                    DEBUG(string.format("WARNING: PRESETS[%d] is nil, initializing", i))
                     PRESETS[i] = {name = "Preset " .. i, dpi = 100, pwmMin = 10, pwmMax = 60, feedrate = 400}
                 end
                 
                 local name = ProfileGetString("Preset" .. i .. "_Name", "")
                 if name ~= "" then
-                    -- Use existing values as fallbacks
+                    DEBUG(string.format("Loading preset %d: %s", i, name))
+                    
                     PRESETS[i] = {
                         name = name,
                         dpi = ProfileGetInt("Preset" .. i .. "_DPI", PRESETS[i].dpi),
@@ -123,19 +146,34 @@ local function LaserRasterImageWizard()
                         feedrate = ProfileGetInt("Preset" .. i .. "_Feedrate", PRESETS[i].feedrate)
                     }
                     
-                    -- Validate ranges
+                    -- Validate and clamp values
                     PRESETS[i].dpi = math.max(50, math.min(600, PRESETS[i].dpi))
                     PRESETS[i].pwmMin = math.max(0, math.min(100, PRESETS[i].pwmMin))
                     PRESETS[i].pwmMax = math.max(0, math.min(100, PRESETS[i].pwmMax))
                     PRESETS[i].feedrate = math.max(10, math.min(1000, PRESETS[i].feedrate))
+                    
+                    -- Validate PWM range
+                    if PRESETS[i].pwmMin >= PRESETS[i].pwmMax then
+                        DEBUG(string.format("WARNING: Invalid PWM range for preset %d, resetting", i))
+                        PRESETS[i].pwmMin = 10
+                        PRESETS[i].pwmMax = 60
+                    end
                 end
             end
         end)
         
         if not status then
-            mc.mcCntlSetLastError(inst, "Preset loading error (using defaults): " .. tostring(err))
-            -- Continue with default presets
+            DEBUG(string.format("ERROR: LoadPresetsFromProfile failed: %s", tostring(err)))
+            -- Initialize with defaults if loading failed
+            PRESETS = {
+                {name = "Fine Detail (High DPI)", dpi = 300, pwmMin = 5, pwmMax = 40, feedrate = 400},
+                {name = "Standard Quality", dpi = 150, pwmMin = 10, pwmMax = 60, feedrate = 400},
+                {name = "Fast Draft", dpi = 75, pwmMin = 15, pwmMax = 80, feedrate = 400},
+                {name = "Deep Burn", dpi = 100, pwmMin = 20, pwmMax = 100, feedrate = 400}
+            }
         end
+        
+        DEBUG("=== LoadPresetsFromProfile END ===")
     end
 
     checkpoint("Defining helper functions")
@@ -151,6 +189,64 @@ local function LaserRasterImageWizard()
         tempFiles = {},  -- Track temporary files for cleanup (NOT USED FOR BMP)
         imageObjects = {}  -- Track wx.wxImage objects for cleanup
     }
+    
+    -- ==================== DATA VALIDATION ====================
+    -- Data integrity validation
+    local function ValidateImageData()
+        DEBUG("ValidateImageData called")
+        DEBUG(string.format("imageData state in validation: %s", tostring(imageData)))
+        
+        -- CRITICAL: Check if imageData itself is nil first
+        if not imageData then
+            DEBUG("FATAL: imageData is nil in ValidateImageData!")
+            if _G.imageData then
+                DEBUG("RECOVERY: Found imageData in global scope")
+                imageData = _G.imageData
+            else
+                DEBUG("NO RECOVERY: imageData not found anywhere")
+                return false, {"imageData is completely nil - scope lost"}
+            end
+        end
+        
+        local issues = {}
+        
+        if not imageData.originalPath or imageData.originalPath == "" then
+            table.insert(issues, "originalPath is empty")
+        end
+        
+        if not imageData.width or imageData.width <= 0 then
+            table.insert(issues, "width is invalid: " .. tostring(imageData.width))
+        end
+        
+        if not imageData.height or imageData.height <= 0 then
+            table.insert(issues, "height is invalid: " .. tostring(imageData.height))
+        end
+        
+        -- Check rotation consistency
+        if settings.rotation and settings.rotation > 0 and settings.rotation ~= 360 then
+            if not imageData.rotatedWidth then
+                table.insert(issues, "rotation set but rotatedWidth is nil")
+            end
+            if not imageData.rotatedHeight then
+                table.insert(issues, "rotation set but rotatedHeight is nil")
+            end
+        elseif settings.rotation == 0 or settings.rotation == 360 then
+            if imageData.rotatedWidth or imageData.rotatedHeight then
+                table.insert(issues, "no rotation but rotated dimensions exist")
+            end
+        end
+        
+        if #issues > 0 then
+            DEBUG("DATA VALIDATION FAILED:")
+            for _, issue in ipairs(issues) do
+                DEBUG("  - " .. issue)
+            end
+            return false, issues
+        end
+        
+        DEBUG("Data validation passed")
+        return true, {}
+    end
     
     -- ==================== CLEANUP FUNCTIONS ====================
     local function CleanupTempFiles()
@@ -244,27 +340,31 @@ local function LaserRasterImageWizard()
     
     -- Safe image loading with validation
     local function SafeImageLoad(path)
+        DEBUG(string.format("SafeImageLoad: %s", path))
         local success = false
         local image = nil
         local errorMsg = ""
+        local fileHandle = nil
         
-        -- Multiple validation steps
         local status, err = pcall(function()
-            -- Check file exists
-            local f = io.open(path, "rb")
-            if not f then
+            -- Check file exists and get size
+            fileHandle = io.open(path, "rb")
+            if not fileHandle then
                 error("File not found: " .. path)
             end
             
-            -- Check file size
-            local size = f:seek("end")
-            f:close()
+            local size = fileHandle:seek("end")
+            DEBUG(string.format("File size: %d bytes", size))
+            
+            -- CRITICAL: Close file BEFORE loading image
+            fileHandle:close()
+            fileHandle = nil
             
             if size > MAX_IMAGE_SIZE_MB * 1024 * 1024 then
                 error(string.format("File too large: %.2f MB", size / 1024 / 1024))
             end
             
-            -- Try to load image
+            -- Load image
             image = wx.wxImage()
             if not image:LoadFile(path) then
                 error("Invalid image format or corrupted file")
@@ -275,11 +375,19 @@ local function LaserRasterImageWizard()
                 error("Invalid image dimensions")
             end
             
+            DEBUG(string.format("Image loaded: %dx%d", image:GetWidth(), image:GetHeight()))
             success = true
         end)
         
+        -- ENSURE file handle is closed
+        if fileHandle then
+            DEBUG("WARNING: Closing file handle in cleanup")
+            pcall(function() fileHandle:close() end)
+        end
+        
         if not status then
             errorMsg = tostring(err)
+            DEBUG(string.format("ERROR: SafeImageLoad failed: %s", errorMsg))
             if image then
                 pcall(function() image:delete() end)
                 image = nil
@@ -363,18 +471,40 @@ local function LaserRasterImageWizard()
     local function ApplyDithering(value, x, y, strength)
         if strength <= 0 then return value end
         
-        -- Cap maximum effect at 60% for better visual quality
-        local effectiveStrength = strength * 0.6
-        
         local matrixX = (x % 4) + 1
         local matrixY = (y % 4) + 1
-        local threshold = BAYER_MATRIX[matrixY][matrixX] * 16 - 128
         
-        -- Corrected: Now 0=none, 100=maximum (capped)
-        local ditherAmount = (threshold * effectiveStrength) / 100
-        local ditheredValue = value + ditherAmount
+        -- Normalize Bayer matrix value to -0.5 to 0.5 range
+        local bayerValue = (BAYER_MATRIX[matrixY][matrixX] - 7.5) / 15
         
-        return (ditheredValue > 128) and 255 or 0
+        -- Progressive dithering based on strength
+        if strength <= 50 then
+            -- Low strength (1-50): Add noise to grayscale
+            -- Strength 1 = ±2.55 levels, Strength 50 = ±127.5 levels
+            local noiseRange = strength * 2.55
+            local noise = bayerValue * noiseRange
+            local ditheredValue = value + noise
+            
+            -- Clamp to valid range
+            return math.max(0, math.min(255, math.floor(ditheredValue + 0.5)))
+        else
+            -- High strength (51-100): Progressive binary dithering
+            -- Adjust threshold based on Bayer matrix
+            local ditherScale = (strength - 50) / 50  -- 0 to 1 for 51-100
+            local threshold = 128 + (bayerValue * 128 * ditherScale)
+            
+            -- For 51-75, blend between grayscale and binary
+            if strength <= 75 then
+                local binaryValue = (value > threshold) and 255 or 0
+                local blendFactor = (strength - 50) / 25  -- 0 to 1 for 51-75
+                
+                -- Blend original with binary dithered
+                return math.floor(value * (1 - blendFactor) + binaryValue * blendFactor)
+            else
+                -- For 76-100, pure binary dithering with variable threshold
+                return (value > threshold) and 255 or 0
+            end
+        end
     end
     
     -- ==================== CHECK LASER TOOL ====================
@@ -472,6 +602,10 @@ local function LaserRasterImageWizard()
         rotatedWidth = nil,  -- Dimensions after rotation
         rotatedHeight = nil
     }
+    
+    -- DIAGNOSTIC: Track scope integrity
+    local SCOPE_CHECK_ID = tostring(imageData)
+    DEBUG(string.format("imageData created with ID: %s", SCOPE_CHECK_ID))
     
     -- ==================== STEP 1: IMAGE SELECTION ====================
     local function ShowImageSelectionDialog()
@@ -680,6 +814,21 @@ local function LaserRasterImageWizard()
         
         -- Update preview function with FIXED CONTRAST and DITHERING
         local function UpdateImagePreview()
+            DEBUG("=== UpdateImagePreview CALLED ===")
+            DEBUG(string.format("imageData state: %s", tostring(imageData)))
+            DEBUG(string.format("workingImage state: %s", tostring(workingImage)))
+            DEBUG(string.format("settings state: %s", tostring(settings)))
+            
+            if not imageData then
+                DEBUG("ERROR: imageData is nil in UpdateImagePreview!")
+                return
+            end
+            
+            if not workingImage then
+                DEBUG("ERROR: workingImage is nil in UpdateImagePreview!")
+                return
+            end
+            
             -- Cleanup previous preview resources
             if previewCtrl then
                 previewCtrl:Destroy()
@@ -747,16 +896,69 @@ local function LaserRasterImageWizard()
                 local radians = math.rad(settings.rotation)
                 local center = wx.wxPoint(adjustedImage:GetWidth()/2, 
                                          adjustedImage:GetHeight()/2)
-                adjustedImage = adjustedImage:Rotate(radians, center, true)
+                
+                -- Approach 1: Try wxWidgets fill color parameter
+                local rotatedImage = nil
+                local success = pcall(function()
+                    -- Try with wx.wxWHITE constant
+                    rotatedImage = adjustedImage:Rotate(radians, center, true, wx.wxWHITE)
+                end)
+                
+                if not success or not rotatedImage then
+                    -- Fallback: Try with explicit color
+                    success = pcall(function()
+                        local white = wx.wxColour(255, 255, 255)
+                        rotatedImage = adjustedImage:Rotate(radians, center, true, white)
+                    end)
+                end
+                
+                if not success or not rotatedImage then
+                    -- Final fallback: Rotate without fill color
+                    rotatedImage = adjustedImage:Rotate(radians, center, true)
+                end
+                
+                adjustedImage = rotatedImage
+                
+                -- Approach 2: Post-process to fix black pixels at edges
+                -- This ensures white background regardless of wxWidgets version
+                local width = adjustedImage:GetWidth()
+                local height = adjustedImage:GetHeight()
+                
+                -- Check all edge pixels
+                for y = 0, height - 1 do
+                    for x = 0, width - 1 do
+                        -- Process edge pixels only
+                        if x == 0 or y == 0 or x == width-1 or y == height-1 then
+                            local r = adjustedImage:GetRed(x, y)
+                            local g = adjustedImage:GetGreen(x, y)
+                            local b = adjustedImage:GetBlue(x, y)
+                            
+                            -- If pixel is pure black (likely rotation fill)
+                            if r == 0 and g == 0 and b == 0 then
+                                adjustedImage:SetRGB(x, y, 255, 255, 255)
+                            end
+                        end
+                    end
+                end
+                
+                -- Track for cleanup
                 table.insert(wizardState.imageObjects, adjustedImage)
                 
-                -- Store rotated dimensions for size calculations
-                imageData.rotatedWidth = adjustedImage:GetWidth()
-                imageData.rotatedHeight = adjustedImage:GetHeight()
+                -- Store rotated dimensions for calculations
+                DEBUG(string.format("ASSIGNING rotated dimensions: %d x %d", width, height))
+                DEBUG(string.format("imageData before assignment: %s", tostring(imageData)))
+                imageData.rotatedWidth = width
+                imageData.rotatedHeight = height
+                DEBUG(string.format("imageData after assignment: %s", tostring(imageData)))
+                DEBUG(string.format("Assigned rotatedWidth=%s, rotatedHeight=%s", 
+                    tostring(imageData.rotatedWidth), tostring(imageData.rotatedHeight)))
             else
                 -- Clear rotated dimensions if no rotation
+                DEBUG("CLEARING rotated dimensions (no rotation)")
+                DEBUG(string.format("imageData before clearing: %s", tostring(imageData)))
                 imageData.rotatedWidth = nil
                 imageData.rotatedHeight = nil
+                DEBUG(string.format("imageData after clearing: %s", tostring(imageData)))
             end
             
             -- Create scaled preview
@@ -778,6 +980,16 @@ local function LaserRasterImageWizard()
             sizer:Add(previewCtrl, 1, wx.wxALIGN_CENTER + wx.wxALL, 10)
             previewPanel:SetSizer(sizer)
             previewPanel:Layout()
+            
+            DEBUG("=== UpdateImagePreview COMPLETED ===")
+            DEBUG(string.format("Final imageData state: %s", tostring(imageData)))
+            if imageData then
+                DEBUG(string.format("Final dimensions: %dx%d, rotated: %s x %s", 
+                    imageData.width, imageData.height, 
+                    tostring(imageData.rotatedWidth), tostring(imageData.rotatedHeight)))
+            else
+                DEBUG("FATAL: imageData became nil during UpdateImagePreview!")
+            end
         end
         
         mainSizer:Add(previewPanel, 0, wx.wxEXPAND + wx.wxALL, 10)
@@ -850,9 +1062,13 @@ local function LaserRasterImageWizard()
         
         -- Connect events
         brightSlider:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_SLIDER_UPDATED, function(event)
+            DEBUG("Brightness slider changed")
+            DEBUG(string.format("Pre-change imageData: %s", tostring(imageData)))
             settings.brightness = brightSlider:GetValue()
             brightValue:SetLabel(tostring(settings.brightness))
+            DEBUG(string.format("About to call UpdateImagePreview - imageData: %s", tostring(imageData)))
             UpdateImagePreview()
+            DEBUG("UpdateImagePreview returned")
         end)
         
         contrastSlider:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_SLIDER_UPDATED, function(event)
@@ -868,8 +1084,25 @@ local function LaserRasterImageWizard()
         end)
         
         rotationInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_SPINCTRL_UPDATED, function(event)
+            DEBUG("=== ROTATION CHANGED ===")
+            DEBUG(string.format("Pre-rotation imageData: %s", tostring(imageData)))
+            if imageData then
+                DEBUG(string.format("Pre-rotation dimensions: %dx%d, rotated: %s x %s", 
+                    imageData.width, imageData.height, 
+                    tostring(imageData.rotatedWidth), tostring(imageData.rotatedHeight)))
+            end
             settings.rotation = rotationInput:GetValue()
+            DEBUG(string.format("New rotation value: %d", settings.rotation))
+            DEBUG("About to call UpdateImagePreview for rotation...")
             UpdateImagePreview()
+            DEBUG("Rotation UpdateImagePreview completed")
+            if imageData then
+                DEBUG(string.format("Post-rotation dimensions: %dx%d, rotated: %s x %s", 
+                    imageData.width, imageData.height, 
+                    tostring(imageData.rotatedWidth), tostring(imageData.rotatedHeight)))
+            else
+                DEBUG("CRITICAL: imageData became nil after rotation!")
+            end
         end)
         
         invertCheck:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_CHECKBOX_CLICKED, function(event)
@@ -902,11 +1135,26 @@ local function LaserRasterImageWizard()
         
         -- Add explicit handlers for navigation
         backBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
+            DEBUG("Step 2 Back button clicked")
+            DEBUG(string.format("imageData at back: %s", tostring(imageData)))
             dlg:EndModal(DIALOG_RESULT_BACK)
         end)
         
         nextBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
+            DEBUG("=== STEP 2 NEXT BUTTON CLICKED ===")
+            DEBUG(string.format("imageData state: %s", tostring(imageData)))
+            if imageData then
+                DEBUG(string.format("imageData.width: %s", tostring(imageData.width)))
+                DEBUG(string.format("imageData.height: %s", tostring(imageData.height)))
+                DEBUG(string.format("imageData.rotatedWidth: %s", tostring(imageData.rotatedWidth)))
+                DEBUG(string.format("imageData.rotatedHeight: %s", tostring(imageData.rotatedHeight)))
+            else
+                DEBUG("CRITICAL: imageData is nil in Next button handler!")
+            end
+            DEBUG(string.format("settings state: %s", tostring(settings)))
+            DEBUG("About to call EndModal(wx.wxID_OK)")
             dlg:EndModal(wx.wxID_OK)
+            DEBUG("EndModal completed")
         end)
         
         btnSizer:Add(backBtn, 0, wx.wxRIGHT, 5)
@@ -922,14 +1170,54 @@ local function LaserRasterImageWizard()
         
         local result = dlg:ShowModal()
         
-        -- Save settings
-        ProfileSetInt("Brightness", settings.brightness)
-        ProfileSetInt("Contrast", settings.contrast)
-        ProfileSetInt("Dithering", settings.dithering)
-        ProfileSetInt("Rotation", settings.rotation)
-        ProfileSetInt("InvertImage", settings.invertImage)
+        DEBUG("=== Step 2 Dialog Result: " .. tostring(result) .. " ===")
+        DEBUG(string.format("Settings at close: rotation=%d, brightness=%d, contrast=%d", 
+            settings.rotation, settings.brightness, settings.contrast))
+        DEBUG(string.format("ImageData at close: w=%d, h=%d, rotatedW=%s, rotatedH=%s",
+            imageData.width, imageData.height,
+            tostring(imageData.rotatedWidth), tostring(imageData.rotatedHeight)))
+        
+        if result == wx.wxID_OK then
+            -- Critical check: Ensure rotated dimensions are saved
+            if settings.rotation > 0 and settings.rotation ~= 360 then
+                if not imageData.rotatedWidth or not imageData.rotatedHeight then
+                    DEBUG("CRITICAL WARNING: Rotation set but dimensions not saved!")
+                    -- Force recalculation or show error
+                end
+            end
+            
+            -- Save settings
+            ProfileSetInt("Brightness", settings.brightness)
+            ProfileSetInt("Contrast", settings.contrast)
+            ProfileSetInt("Dithering", settings.dithering)
+            ProfileSetInt("Rotation", settings.rotation)
+            ProfileSetInt("InvertImage", settings.invertImage)
+        elseif result == DIALOG_RESULT_BACK then
+            DEBUG("Step 2: User went back")
+        else
+            DEBUG("Step 2: User cancelled")
+        end
+        
+        -- CRITICAL: Protect imageData scope before dialog destruction
+        DEBUG(string.format("Pre-destroy imageData: %s", tostring(imageData)))
+        local imageDataBackup = imageData
+        local settingsBackup = settings
         
         dlg:Destroy()
+        
+        -- Check if scope was corrupted by destruction
+        DEBUG(string.format("Post-destroy imageData: %s", tostring(imageData)))
+        if not imageData and imageDataBackup then
+            DEBUG("SCOPE CORRUPTION: Restoring imageData from backup")
+            imageData = imageDataBackup
+            _G.imageData = imageDataBackup  -- Store in global as fallback
+        end
+        if not settings and settingsBackup then
+            DEBUG("SCOPE CORRUPTION: Restoring settings from backup")
+            settings = settingsBackup
+            _G.settings = settingsBackup
+        end
+        
         return result
     end
     
@@ -1058,6 +1346,18 @@ local function LaserRasterImageWizard()
     
     -- ==================== STEP 3: LASER PARAMETERS ====================
     local function ShowLaserParametersDialog()
+        -- CRITICAL: Capture imageData in local closure to prevent scope loss
+        local capturedImageData = imageData
+        local capturedSettings = settings
+        
+        DEBUG(string.format("ShowLaserParametersDialog: Capturing imageData %s", tostring(capturedImageData)))
+        
+        if not capturedImageData then
+            DEBUG("CRITICAL: imageData is nil at dialog creation!")
+            wx.wxMessageBox("Internal error: Image data lost", "Error", wx.wxOK + wx.wxICON_ERROR)
+            return wx.wxID_CANCEL
+        end
+        
         local parent = wx.NULL
         local app = wx.wxGetApp()
         if app then
@@ -1094,7 +1394,9 @@ local function LaserRasterImageWizard()
         local widthLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Width (inches):")
         widthLabel:SetMinSize(wx.wxSize(120, -1))
         local widthInput = wx.wxTextCtrl(panel, wx.wxID_ANY, 
-                                        string.format("%.3f", settings.physicalWidth))
+                                        string.format("%.3f", settings.physicalWidth),
+                                        wx.wxDefaultPosition, wx.wxDefaultSize,
+                                        wx.wxTE_PROCESS_ENTER)
         widthSizer:Add(widthLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
         widthSizer:Add(widthInput, 1, wx.wxEXPAND)
         sizeBox:Add(widthSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
@@ -1103,7 +1405,9 @@ local function LaserRasterImageWizard()
         local scanSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
         local scanLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Scan Lines (Y):")
         scanLabel:SetMinSize(wx.wxSize(120, -1))
-        local scanInput = wx.wxTextCtrl(panel, wx.wxID_ANY, tostring(settings.scanLines))
+        local scanInput = wx.wxTextCtrl(panel, wx.wxID_ANY, tostring(settings.scanLines),
+                                       wx.wxDefaultPosition, wx.wxDefaultSize,
+                                       wx.wxTE_PROCESS_ENTER)
         scanSizer:Add(scanLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
         scanSizer:Add(scanInput, 1, wx.wxEXPAND)
         sizeBox:Add(scanSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
@@ -1117,13 +1421,55 @@ local function LaserRasterImageWizard()
         sizeBox:Add(timeLabel, 0, wx.wxALL, 5)
         
         local function UpdateCalculations()
+            DEBUG("UpdateCalculations called from event handler")
+            
+            -- Use captured variable, not direct reference
+            local img = capturedImageData
+            
+            -- Validate capture
+            if not img then
+                DEBUG("CRITICAL: capturedImageData is nil in UpdateCalculations!")
+                if _G.imageData then
+                    DEBUG("EMERGENCY: Using global imageData")
+                    img = _G.imageData
+                else
+                    DEBUG("FATAL: No imageData available anywhere!")
+                    if calcLabel then calcLabel:SetLabel("ERROR: Image data lost") end
+                    if timeLabel then timeLabel:SetLabel("") end
+                    return
+                end
+            end
+            
+            -- Check controls exist
+            if not widthInput or not scanInput then
+                DEBUG("ERROR: Controls not initialized yet!")
+                return
+            end
+            
             local width = tonumber(widthInput:GetValue()) or 0
             local scans = tonumber(scanInput:GetValue()) or 0
             
             if width > 0 and scans > 0 then
-                -- Use rotated dimensions if available
-                local actualWidth = imageData.rotatedWidth or imageData.width
-                local actualHeight = imageData.rotatedHeight or imageData.height
+                -- Use rotated dimensions if available from captured image
+                local actualWidth = img.rotatedWidth or img.width
+                local actualHeight = img.rotatedHeight or img.height
+                
+                DEBUG(string.format("Using dimensions: %dx%d (rotated: %s)", 
+                    actualWidth, actualHeight, tostring(img.rotatedWidth ~= nil)))
+                
+                -- CRITICAL: Prevent division by zero
+                if not actualWidth or actualWidth <= 0 then
+                    DEBUG("ERROR: actualWidth is invalid: " .. tostring(actualWidth))
+                    calcLabel:SetLabel("ERROR: Invalid image width")
+                    return
+                end
+                
+                if not actualHeight or actualHeight <= 0 then
+                    DEBUG("ERROR: actualHeight is invalid: " .. tostring(actualHeight))
+                    calcLabel:SetLabel("ERROR: Invalid image height")
+                    return
+                end
+                
                 local aspectRatio = actualWidth / actualHeight
                 local height = width / aspectRatio
                 local dpiX = actualWidth / width
@@ -1135,29 +1481,37 @@ local function LaserRasterImageWizard()
                     "X pixels: %d (resampled to match)",
                     height, dpiX, dpiY, math.floor(scans * aspectRatio)))
                     
-                -- Calculate time estimate
-                local feedrate = tonumber(feedInput:GetValue()) or 1
-                if feedrate > 0 then
-                    local distancePerRow = width + 2.0  -- Include overtravel
-                    local totalDistance = distancePerRow * scans
-                    local baseMinutes = totalDistance / feedrate
-                    local estimatedMinutes = baseMinutes * TIME_ESTIMATE_BUFFER
-                    
-                    -- Format as HH:MM:SS
-                    local hours = math.floor(estimatedMinutes / 60)
-                    local minutes = math.floor(estimatedMinutes % 60)
-                    local seconds = math.floor((estimatedMinutes * 60) % 60)
-                    
-                    timeLabel:SetLabel(string.format("Estimated time: %02d:%02d:%02d",
-                                                    hours, minutes, seconds))
-                else
-                    timeLabel:SetLabel("Invalid feedrate")
+                -- Time calculation only if feedInput exists
+                if feedInput and timeLabel then
+                    local feedrate = tonumber(feedInput:GetValue()) or 1
+                    if feedrate > 0 then
+                        local distancePerRow = width + 2.0  -- Include overtravel
+                        local totalDistance = distancePerRow * scans
+                        local baseMinutes = totalDistance / feedrate
+                        local estimatedMinutes = baseMinutes * 1.3  -- 30% buffer
+                        
+                        local hours = math.floor(estimatedMinutes / 60)
+                        local minutes = math.floor(estimatedMinutes % 60)
+                        local seconds = math.floor((estimatedMinutes * 60) % 60)
+                        
+                        timeLabel:SetLabel(string.format("Estimated time: %02d:%02d:%02d",
+                                                        hours, minutes, seconds))
+                    else
+                        DEBUG("ERROR: Invalid feedrate: " .. tostring(feedrate))
+                        timeLabel:SetLabel("Invalid feedrate")
+                    end
+                elseif timeLabel then
+                    timeLabel:SetLabel("")
                 end
             else
-                calcLabel:SetLabel("Invalid dimensions")
-                timeLabel:SetLabel("")
+                DEBUG(string.format("Invalid dimensions: width=%f, scans=%d", width, scans))
+                if calcLabel then calcLabel:SetLabel("Invalid dimensions") end
+                if timeLabel then timeLabel:SetLabel("") end
             end
-            panel:Layout()
+            
+            if panel then
+                panel:Layout()
+            end
         end
         
         mainSizer:Add(sizeBox, 0, wx.wxEXPAND + wx.wxALL, 10)
@@ -1169,7 +1523,9 @@ local function LaserRasterImageWizard()
         local minSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
         local minLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Min PWM (%):")
         minLabel:SetMinSize(wx.wxSize(120, -1))
-        local minInput = wx.wxTextCtrl(panel, wx.wxID_ANY, tostring(settings.pwmMin))
+        local minInput = wx.wxTextCtrl(panel, wx.wxID_ANY, tostring(settings.pwmMin),
+                                      wx.wxDefaultPosition, wx.wxDefaultSize,
+                                      wx.wxTE_PROCESS_ENTER)
         minSizer:Add(minLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
         minSizer:Add(minInput, 1, wx.wxEXPAND)
         powerBox:Add(minSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
@@ -1178,7 +1534,9 @@ local function LaserRasterImageWizard()
         local maxSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
         local maxLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Max PWM (%):")
         maxLabel:SetMinSize(wx.wxSize(120, -1))
-        local maxInput = wx.wxTextCtrl(panel, wx.wxID_ANY, tostring(settings.pwmMax))
+        local maxInput = wx.wxTextCtrl(panel, wx.wxID_ANY, tostring(settings.pwmMax),
+                                      wx.wxDefaultPosition, wx.wxDefaultSize,
+                                      wx.wxTE_PROCESS_ENTER)
         maxSizer:Add(maxLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
         maxSizer:Add(maxInput, 1, wx.wxEXPAND)
         powerBox:Add(maxSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
@@ -1187,7 +1545,9 @@ local function LaserRasterImageWizard()
         local feedSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
         local feedLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Feedrate (IPM):")
         feedLabel:SetMinSize(wx.wxSize(120, -1))
-        local feedInput = wx.wxTextCtrl(panel, wx.wxID_ANY, tostring(settings.feedrate))
+        local feedInput = wx.wxTextCtrl(panel, wx.wxID_ANY, tostring(settings.feedrate),
+                                       wx.wxDefaultPosition, wx.wxDefaultSize,
+                                       wx.wxTE_PROCESS_ENTER)
         feedSizer:Add(feedLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
         feedSizer:Add(feedInput, 1, wx.wxEXPAND)
         powerBox:Add(feedSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
@@ -1199,7 +1559,9 @@ local function LaserRasterImageWizard()
         local zLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Z Height:")
         zLabel:SetMinSize(wx.wxSize(120, -1))
         local zInput = wx.wxTextCtrl(panel, wx.wxID_ANY, 
-                                    string.format("%.3f", settings.zHeight))
+                                    string.format("%.3f", settings.zHeight),
+                                    wx.wxDefaultPosition, wx.wxDefaultSize,
+                                    wx.wxTE_PROCESS_ENTER)
         zSizer:Add(zLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
         zSizer:Add(zInput, 1, wx.wxEXPAND)
         mainSizer:Add(zSizer, 0, wx.wxEXPAND + wx.wxALL, 10)
@@ -1215,15 +1577,51 @@ local function LaserRasterImageWizard()
         scanInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateCalculations)
         feedInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateCalculations)
         
+        -- Enter key navigation (like Tab)
+        widthInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_ENTER, function() scanInput:SetFocus() end)
+        scanInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_ENTER, function() minInput:SetFocus() end)
+        minInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_ENTER, function() maxInput:SetFocus() end)
+        maxInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_ENTER, function() feedInput:SetFocus() end)
+        feedInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_ENTER, function() zInput:SetFocus() end)
+        zInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_ENTER, function() evenRowsCheck:SetFocus() end)
+        
         presetChoice:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_CHOICE_SELECTED, function(event)
             local sel = presetChoice:GetSelection()
+            DEBUG(string.format("Preset selected: index=%d", sel))
+            
             if sel > 0 then
+                -- Validate array bounds
+                if not PRESETS then
+                    DEBUG("ERROR: PRESETS is nil!")
+                    return
+                end
+                
+                if sel > #PRESETS then
+                    DEBUG(string.format("ERROR: Selection %d exceeds PRESETS size %d", sel, #PRESETS))
+                    return
+                end
+                
                 local preset = PRESETS[sel]
-                if preset then
-                    -- Calculate scan lines based on preset DPI and image size
-                    local width = tonumber(widthInput:GetValue()) or settings.physicalWidth
-                    local actualWidth = imageData.rotatedWidth or imageData.width
-                    local actualHeight = imageData.rotatedHeight or imageData.height
+                if not preset then
+                    DEBUG(string.format("ERROR: PRESETS[%d] is nil!", sel))
+                    return
+                end
+                
+                -- Validate preset data
+                if not preset.name or not preset.dpi or not preset.pwmMin or 
+                   not preset.pwmMax or not preset.feedrate then
+                    DEBUG(string.format("ERROR: PRESETS[%d] has missing fields!", sel))
+                    return
+                end
+                
+                DEBUG(string.format("Applying preset: %s", preset.name))
+                
+                -- Calculate scan lines based on preset DPI
+                local width = tonumber(widthInput:GetValue()) or capturedSettings.physicalWidth
+                local actualWidth = capturedImageData.rotatedWidth or capturedImageData.width
+                local actualHeight = capturedImageData.rotatedHeight or capturedImageData.height
+                
+                if actualWidth > 0 and actualHeight > 0 then
                     local height = width * actualHeight / actualWidth
                     local scans = math.floor(height * preset.dpi)
                     
@@ -1232,6 +1630,8 @@ local function LaserRasterImageWizard()
                     maxInput:SetValue(tostring(preset.pwmMax))
                     feedInput:SetValue(tostring(preset.feedrate))
                     UpdateCalculations()
+                else
+                    DEBUG("ERROR: Invalid image dimensions for preset calculation")
                 end
             end
         end)
@@ -1378,9 +1778,9 @@ local function LaserRasterImageWizard()
         end)
         
         -- Image dimensions info
-        local width = settings.physicalWidth
-        local actualWidth = imageData.rotatedWidth or imageData.width
-        local actualHeight = imageData.rotatedHeight or imageData.height
+        local width = capturedSettings.physicalWidth
+        local actualWidth = capturedImageData.rotatedWidth or capturedImageData.width
+        local actualHeight = capturedImageData.rotatedHeight or capturedImageData.height
         local height = width * actualHeight / actualWidth
         
         local dimLabel = wx.wxStaticText(panel, wx.wxID_ANY,
@@ -1430,73 +1830,107 @@ local function LaserRasterImageWizard()
     
     -- ==================== 8-BIT BMP CREATION ====================
     local function Create8BitBMP(filepath, width, height, pixelData)
-        local file = io.open(filepath, "wb")
-        if not file then
-            return false, "Cannot create BMP file"
-        end
+        DEBUG(string.format("Create8BitBMP: %dx%d to %s", width, height, filepath))
         
-        -- BMP Header (14 bytes)
-        file:write("BM")  -- Signature
+        local file = nil
+        local success = false
+        local errorMsg = ""
         
-        -- Calculate sizes
-        local rowSize = math.ceil(width / 4) * 4  -- Rows must be multiple of 4 bytes
-        local pixelDataSize = rowSize * height
-        local paletteSize = 256 * 4  -- 256 colors, 4 bytes each
-        local fileSize = 14 + 40 + paletteSize + pixelDataSize
-        
-        -- Write file size (little-endian)
-        local function WriteDWord(value)
-            file:write(string.char(
-                value % 256,
-                math.floor(value / 256) % 256,
-                math.floor(value / 65536) % 256,
-                math.floor(value / 16777216) % 256
-            ))
-        end
-        
-        local function WriteWord(value)
-            file:write(string.char(
-                value % 256,
-                math.floor(value / 256) % 256
-            ))
-        end
-        
-        WriteDWord(fileSize)        -- File size
-        WriteDWord(0)               -- Reserved
-        WriteDWord(14 + 40 + paletteSize)  -- Offset to pixel data
-        
-        -- DIB Header (40 bytes)
-        WriteDWord(40)              -- Header size
-        WriteDWord(width)           -- Width
-        WriteDWord(height)          -- Height
-        WriteWord(1)                -- Planes
-        WriteWord(8)                -- Bits per pixel (8-bit)
-        WriteDWord(0)               -- Compression
-        WriteDWord(pixelDataSize)   -- Image size
-        WriteDWord(2835)            -- X pixels per meter (72 DPI)
-        WriteDWord(2835)            -- Y pixels per meter
-        WriteDWord(256)             -- Colors used
-        WriteDWord(256)             -- Important colors
-        
-        -- Palette (256 grayscale entries)
-        for i = 0, 255 do
-            file:write(string.char(i, i, i, 0))  -- B, G, R, Reserved
-        end
-        
-        -- Pixel data (bottom-up, left-to-right)
-        for y = height - 1, 0, -1 do
-            for x = 0, width - 1 do
-                local pixelValue = pixelData[y * width + x + 1] or 0
-                file:write(string.char(math.max(0, math.min(255, pixelValue))))
+        -- Use pcall to ensure cleanup
+        local status, err = pcall(function()
+            file = io.open(filepath, "wb")
+            if not file then
+                error("Cannot create BMP file at: " .. filepath)
             end
-            -- Padding to make row multiple of 4 bytes
-            for p = 1, rowSize - width do
-                file:write(string.char(0))
+            
+            -- BMP Header
+            file:write("BM")
+            
+            -- Calculate sizes
+            local rowSize = math.ceil(width / 4) * 4
+            local pixelDataSize = rowSize * height
+            local paletteSize = 256 * 4
+            local fileSize = 14 + 40 + paletteSize + pixelDataSize
+            
+            -- Write file size (little-endian)
+            local function WriteDWord(value)
+                file:write(string.char(
+                    value % 256,
+                    math.floor(value / 256) % 256,
+                    math.floor(value / 65536) % 256,
+                    math.floor(value / 16777216) % 256
+                ))
             end
+            
+            local function WriteWord(value)
+                file:write(string.char(
+                    value % 256,
+                    math.floor(value / 256) % 256
+                ))
+            end
+            
+            WriteDWord(fileSize)        -- File size
+            WriteDWord(0)               -- Reserved
+            WriteDWord(14 + 40 + paletteSize)  -- Offset to pixel data
+            
+            -- DIB Header (40 bytes)
+            WriteDWord(40)              -- Header size
+            WriteDWord(width)           -- Width
+            WriteDWord(height)          -- Height
+            WriteWord(1)                -- Planes
+            WriteWord(8)                -- Bits per pixel (8-bit)
+            WriteDWord(0)               -- Compression
+            WriteDWord(pixelDataSize)   -- Image size
+            WriteDWord(2835)            -- X pixels per meter (72 DPI)
+            WriteDWord(2835)            -- Y pixels per meter
+            WriteDWord(256)             -- Colors used
+            WriteDWord(256)             -- Important colors
+            
+            -- Palette (256 grayscale entries)
+            for i = 0, 255 do
+                file:write(string.char(i, i, i, 0))  -- B, G, R, Reserved
+            end
+            
+            -- Pixel data with validation
+            for y = height - 1, 0, -1 do
+                for x = 0, width - 1 do
+                    local idx = y * width + x + 1
+                    local pixelValue = pixelData[idx]
+                    
+                    if not pixelValue then
+                        DEBUG(string.format("WARNING: Missing pixel at [%d,%d]", x, y))
+                        pixelValue = 0
+                    end
+                    
+                    file:write(string.char(math.max(0, math.min(255, pixelValue))))
+                end
+                
+                -- Padding
+                for p = 1, rowSize - width do
+                    file:write(string.char(0))
+                end
+            end
+            
+            success = true
+        end)
+        
+        -- CRITICAL: Always close file
+        if file then
+            pcall(function() file:close() end)
+            DEBUG("BMP file closed")
         end
         
-        file:close()
-        return true, "8-bit BMP created"
+        if not status then
+            errorMsg = tostring(err)
+            DEBUG("ERROR in Create8BitBMP: " .. errorMsg)
+            
+            -- Try to delete failed file
+            pcall(function() os.remove(filepath) end)
+        else
+            DEBUG("BMP created successfully")
+        end
+        
+        return success, success and "8-bit BMP created" or errorMsg
     end
     
     -- ==================== GENERATE BMP WITH 8-BIT FORMAT ====================
@@ -1700,7 +2134,11 @@ local function LaserRasterImageWizard()
         table.insert(gcode, "M2001 (COMP_FOR_ACCEL_DIST_X=1)")
         table.insert(gcode, "M2001 (SHOW_WINDOW_TO_START=0)")
         if settings.evenRowsOnly == 1 then
+            DEBUG("Even Rows Only: ENABLED - will burn alternate rows")
             table.insert(gcode, "M2001 (LASER_RASTER_EVEN_ROWS_ONLY=1)")
+            table.insert(gcode, "; Note: ESS firmware must support LASER_RASTER_EVEN_ROWS_ONLY parameter")
+        else
+            DEBUG("Even Rows Only: DISABLED - will burn all rows")
         end
         table.insert(gcode, "")
         table.insert(gcode, "G4 P0.5 ; Pause for macro processing")
@@ -1776,9 +2214,11 @@ local function LaserRasterImageWizard()
     
     -- ==================== MAIN WIZARD NAVIGATION ====================
     local function RunWizard()
+        DEBUG("=== WIZARD START ===")
         local continueWizard = true
         
         while continueWizard do
+            DEBUG(string.format("Current step: %d", wizardState.currentStep))
             local result
             
             if wizardState.currentStep == 1 then
@@ -1800,7 +2240,29 @@ local function LaserRasterImageWizard()
                 result = ShowImageAdjustmentDialog()
                 
                 if result == wx.wxID_OK then
-                    wizardState.currentStep = 3
+                    -- DEFENSIVE: Check imageData before validation
+                    DEBUG(string.format("Pre-validation imageData check: %s", tostring(imageData)))
+                    if not imageData then
+                        DEBUG("CRITICAL: imageData is nil before validation call!")
+                        if _G.imageData then
+                            DEBUG("RECOVERY: Using global imageData")
+                            imageData = _G.imageData
+                        else
+                            DEBUG("FATAL: No imageData recovery possible")
+                            wx.wxMessageBox("Critical error: Image data lost after dialog closed.", 
+                                "Internal Error", wx.wxOK + wx.wxICON_ERROR)
+                            wizardState.currentStep = 1  -- Force restart
+                        end
+                    end
+                    
+                    -- Validate before proceeding
+                    local valid, issues = ValidateImageData()
+                    if not valid then
+                        local msg = "Cannot proceed - data validation failed:\n" .. table.concat(issues, "\n")
+                        wx.wxMessageBox(msg, "Validation Error", wx.wxOK + wx.wxICON_ERROR)
+                    else
+                        wizardState.currentStep = 3
+                    end
                 elseif result == DIALOG_RESULT_BACK then
                     wizardState.currentStep = 1
                 elseif result == wx.wxID_CANCEL then
@@ -1809,14 +2271,42 @@ local function LaserRasterImageWizard()
                 
             elseif wizardState.currentStep == 3 then
                 -- Step 3: Laser Parameters
-                result = ShowLaserParametersDialog()
+                -- DEFENSIVE: Check imageData before validation
+                DEBUG(string.format("Step 3 pre-validation imageData check: %s", tostring(imageData)))
+                if not imageData then
+                    DEBUG("CRITICAL: imageData is nil before Step 3 validation!")
+                    if _G.imageData then
+                        DEBUG("RECOVERY: Using global imageData for Step 3")
+                        imageData = _G.imageData
+                    else
+                        DEBUG("FATAL: No imageData for Step 3")
+                        wx.wxMessageBox("Image data lost. Returning to Step 2.", 
+                            "Data Error", wx.wxOK + wx.wxICON_ERROR)
+                        wizardState.currentStep = 2
+                    end
+                end
                 
-                if result == wx.wxID_OK then
-                    wizardState.currentStep = 4
-                elseif result == DIALOG_RESULT_BACK then
+                -- Validate data before showing dialog
+                local valid, issues = ValidateImageData()
+                if not valid then
+                    DEBUG("ERROR: Invalid data entering Step 3")
+                    wx.wxMessageBox("Image data corrupted. Please go back and re-adjust the image.",
+                                  "Data Error", wx.wxOK + wx.wxICON_ERROR)
                     wizardState.currentStep = 2
-                elseif result == wx.wxID_CANCEL then
-                    continueWizard = false
+                else
+                    DEBUG(string.format("PRE-STEP 3: imageData=%s settings=%s", 
+                        tostring(imageData), tostring(settings)))
+                    result = ShowLaserParametersDialog()
+                    DEBUG(string.format("POST-STEP 3: imageData=%s settings=%s result=%d", 
+                        tostring(imageData), tostring(settings), result))
+                    
+                    if result == wx.wxID_OK then
+                        wizardState.currentStep = 4
+                    elseif result == DIALOG_RESULT_BACK then
+                        wizardState.currentStep = 2
+                    elseif result == wx.wxID_CANCEL then
+                        continueWizard = false
+                    end
                 end
                 
             elseif wizardState.currentStep == 4 then
@@ -1945,6 +2435,8 @@ local function LaserRasterImageWizard()
             end
         end
         
+        DEBUG("=== WIZARD END ===")
+        
         -- Cleanup when wizard ends (only cleanup images, not BMP files)
         CleanupImageObjects()
     end
@@ -1977,50 +2469,24 @@ end
 
 -- ==================== SAFE EXECUTION WRAPPER ====================
 local function ExecuteWizardSafely()
-    -- Initial test to see if Mach4 is responsive
     local testStatus, testInst = pcall(mc.mcGetInstance)
     if not testStatus then
-        -- Can't even get instance, show OS-level error
         wx.wxMessageBox("Cannot connect to Mach4 core: " .. tostring(testInst),
                        "Fatal Error", wx.wxOK + wx.wxICON_ERROR)
         return
     end
     
-    -- Log buffer for debugging
-    local debugLog = {}
-    local function log(msg)
-        table.insert(debugLog, os.date("%H:%M:%S") .. " - " .. msg)
-        mc.mcCntlSetLastError(testInst, msg)
-    end
-    
-    log("Starting Laser Raster Wizard v2.7")
-    
-    -- Main execution with full error catching
+    -- Main execution with error catching
     local status, err = pcall(function()
         LaserRasterImageWizard()
     end)
     
     if not status then
-        local errorReport = "LASER WIZARD FAILED\n" ..
-                          "==================\n" ..
-                          "Error: " .. tostring(err) .. "\n\n" ..
-                          "Debug Log:\n" .. table.concat(debugLog, "\n")
+        local errorReport = "LASER WIZARD FAILED: " .. tostring(err)
         
-        -- Try multiple ways to show error
-        pcall(wx.wxMessageBox, errorReport, "Wizard Crash", wx.wxOK + wx.wxICON_ERROR)
+        -- Show error in message box and console
+        pcall(wx.wxMessageBox, errorReport, "Wizard Error", wx.wxOK + wx.wxICON_ERROR)
         mc.mcCntlSetLastError(testInst, "WIZARD CRASH: " .. tostring(err))
-        
-        -- Save crash log to file
-        pcall(function()
-            local crashFile = mc.mcCntlGetMachDir(testInst) .. "\\wizard_crash.log"
-            local f = io.open(crashFile, "w")
-            if f then
-                f:write(errorReport)
-                f:close()
-            end
-        end)
-    else
-        log("Wizard completed successfully")
     end
 end
 

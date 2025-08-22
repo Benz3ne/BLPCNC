@@ -97,6 +97,8 @@ Keyboard/EnableKeyboardJog   Keyboard jog enable state
 #402  Dust boot automation enable (0/1)
 #403  Dust boot target state (0=UP, 1=DOWN)
 #404  Dust collection target (0=OFF, 1=ON)
+#405  Dust collection manual override flag (0=auto, 1=override active)
+#410  Dust boot manual override flag (0=auto, 1=override active)
 #440  Stored G68 X center (for virtual tool recovery)
 #441  Stored G68 Y center (for virtual tool recovery)
 #442  Stored G68 rotation angle (for virtual tool recovery)
@@ -104,12 +106,30 @@ Keyboard/EnableKeyboardJog   Keyboard jog enable state
 #444  Virtual tool apply counter
 #445  Atomic operation in progress flag
 #446  Atomic operation type
+
+== System Control (NEW REFACTOR VARIABLES) ==
+#470  Universal button handler ID
+#471  Virtual tool operation selector (1=deploy probe, 2=deploy laser, 3=retract)
+#472  Dust control operation selector
+#473  State machine temporary storage
+#474  State machine temporary storage
+#475  Reserved for future expansion
+#476  Reserved for future expansion
+#477  Reserved for future expansion
+#478  Reserved for future expansion
+#479  Reserved for future expansion
+
+== M6 and System State ==
 #481  M6 completion signal (1=complete, cleared by PLC)
 #483  M6 call time (os.clock() for debugging)
 #495  Spindle spin-up delay armed flag
 #496  Spindle spin-up delay seconds
 #498  Dialog suppression flag (prevents prompts during M6)
 #499  M6 running flag (1=running, 0=idle)
+
+== Temporary Storage ==
+#500  First probe contact storage (used in m2010)
+#501  Second probe contact storage (used in m2010)
 
 == G68 Rotation State (System) ==
 #1245  Current G68 X center
@@ -146,6 +166,9 @@ G58: X=#5301, Y=#5302, Z=#5303
 G59: X=#5321, Y=#5322, Z=#5323
 
 == Probing Result Variables ==
+#5061  Probe contact X position
+#5062  Probe contact Y position
+#5063  Probe contact Z position
 #5073  Final probe contact Z position (from G31)
 
 == DRO Persistence Variables ==

@@ -1,0 +1,41 @@
+local inst = mc.mcGetInstance()
+-- Get current actual boot position
+local h = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+if not h or h <= 0 then
+    mc.mcCntlSetLastError(inst, "ERROR: Dust boot signal not found")
+    return
+end
+local current = mc.mcSignalGetState(h)
+local newTarget = 1 - current  -- Toggle
+
+-- Check for M6 or virtual tool (these block manual control)
+local m6Running = mc.mcCntlGetPoundVar(inst, 499)
+local virtualTool = mc.mcCntlGetPoundVar(inst, 406)
+if m6Running == 1 then
+    mc.mcCntlSetLastError(inst, "Cannot control dust boot during tool change")
+    return
+elseif virtualTool >= 90 then
+    mc.mcCntlSetLastError(inst, "Cannot control dust boot with virtual tool active")
+    return
+end
+
+-- SET OVERRIDE FIRST to prevent race condition
+mc.mcCntlSetPoundVar(inst, 410, 1)  -- Set override flag FIRST
+mc.mcCntlSetPoundVar(inst, 403, newTarget)  -- Then set target
+-- Update tracking variable
+if _G.lastBootTarget then 
+    _G.lastBootTarget = newTarget 
+end
+-- Apply the change
+mc.mcSignalSetState(h, newTarget)
+
+-- Update button appearance
+if newTarget == 1 then
+    scr.SetProperty("btnDustBoot", "Bg Color", "#00FF00")
+    scr.SetProperty("btnDustBoot", "Label", "Dust Boot\nDOWN")
+    mc.mcCntlSetLastError(inst, "Manual: Boot DOWN (until spindle change)")
+else
+    scr.SetProperty("btnDustBoot", "Bg Color", "#FF0000")
+    scr.SetProperty("btnDustBoot", "Label", "Dust Boot\nUP")
+    mc.mcCntlSetLastError(inst, "Manual: Boot UP (until spindle change)")
+end

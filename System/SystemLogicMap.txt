@@ -1,0 +1,1303 @@
+# CNC System Logic Map - Unified Reference v2.0
+## Complete M6, PLC, Virtual Tools & Automation System
+
+---
+
+## System Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ SCREEN LOAD SCRIPT (Runs once at startup)                   │
+│ • Defines global RetractVirtualTool() function               │
+│ • Initializes pound variables from profile                   │
+│ • Sets up Machine Enable signal handler                      │
+│ • Clears stale M6 flags and virtual tool states             │
+│ • Validates virtual tool configurations                      │
+│ • Populates tool dropdown from tool table                   │
+│ • Initializes dust boot and safety systems                  │
+│ • Sets up homing warning system                             │
+└────────────────┬─────────────────────────────────────────────┘
+                 │ Provides Global Functions
+                 ↓
+┌─────────────────────────────────────────────────────────────┐
+│ M6 MACRO (Runs on tool change command)                       │
+│ • Production/Debug mode switching                            │
+│ • Enhanced virtual tool system with G68 support             │
+│ • Handles physical tools (T1-T89) with configurable measure │
+│ • Handles virtual tools (T90-T99) with offset management    │
+│ • Sets flags: #495, #496, #498, #499                        │
+│ • Calls global RetractVirtualTool() when needed              │
+│ • Comprehensive error handling and cleanup                  │
+│ • Atomic operation tracking (#445, #446)                    │
+└────────────────┬─────────────────────────────────────────────┘
+                 │ Coordinates with PLC via flags
+                 ↓
+┌─────────────────────────────────────────────────────────────┐
+│ PLC SCRIPT (Runs ~20x per second)                            │
+│ • Advanced dust control automation                           │
+│ • Tool presence monitoring with debouncing                  │
+│ • Low air pressure safety system                            │
+│ • Homing state monitoring and indicators                    │
+│ • Button state synchronization                              │
+│ • Emergency laser shutoff procedures                        │
+│ • Manual tool selection prompts (BLOCKING ISSUE)            │
+│ • Work offset monitoring and UI updates                     │
+│ • Coroutine-based dialog handling                           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Critical Pound Variables & Signals
+
+### Profile Storage Sections
+```
+[ProbeSettings]         Stores all probe/tool parameters (#300-#320, #353)
+[RememberPos]           Stores X, Y, Z machine positions for return
+[PersistentDROs]        Stores edge finder, gage block values (#1034-#1036)
+[FixtureDescriptions]   Custom descriptions for G54-G59 fixtures
+
+IO Registers:
+Keyboard/Enable              Keyboard input enable state
+Keyboard/EnableKeyboardJog   Keyboard jog enable state
+```
+
+### Enhanced Pound Variables System
+
+```
+== Virtual Tool System (Enhanced) ==
+#406  Active virtual tool (0=none, 90-99=virtual active)
+#407  X offset delta applied to work coordinates
+#408  Y offset delta applied to work coordinates
+#440  Stored G68 X center (for virtual tool recovery)
+#441  Stored G68 Y center (for virtual tool recovery)
+#442  Stored G68 rotation angle (for virtual tool recovery)
+#443  G68 adjustment needed flag (0=no, 1=needs adjustment)
+#444  Virtual tool apply counter (debugging)
+#445  Atomic operation in progress flag (0=idle, 1=active)
+#446  Atomic operation type (1=applying, 2=removing)
+#494  Dust boot state before virtual tool (0=unknown, 1=was down, 2=was up)
+
+== Tool Change Parameters ==
+#300  Probe diameter
+#301  Probe X offset (T90)
+#302  Probe Y offset (T90)
+#303  Probe fast feed
+#304  Probe slow feed
+#305  Probe max travel
+#306  Probe backoff 1
+#307  Probe backoff 2
+#308  Tool change Z height (typically -6.5)
+#309  Tool pullout distance (typically 1.75)
+#310  Approach feed rate (typically 200)
+#311  Height probe station X
+#312  Height probe station Y
+#314  Max probe depth
+#315  Fast tool height feed
+#316  Slow tool height feed
+#317  Tool height retract
+#318  Laser X offset (T91)
+#319  Laser Y offset (T91)
+#320  Probe Z calibration offset
+#321  Probe lift height (clearance height above surface for XY moves)
+#351  Last physical tool (for virtual tool return)
+#353  Work surface Z reference (critical for height calcs)
+#388  Probe state mode (0=normal, 1=sentinel mode, 2=error state)
+#389  Probe contact Z (legacy - not actively used)
+#390  Raw probe contact position (before compensation)
+#391  Edge position (adjusted for probe radius on X/Y, Z offset on Z)
+#392  Spindle position (adjusted for probe offset from spindle)
+#394  TRUE surface Z (H-compensated) for datum setting
+#395  Surface Z reference (machine coordinate during probe sequence)
+#396  Safe plane Z (machine coordinate during probe sequence)
+#397  Probe plane Z (machine coordinate during probe sequence)
+
+== Enhanced Automation Control ==
+#400  Dust collection automation enable (0=manual, 1=auto)
+#401  Vacuum table automation enable (0=manual, 1=auto)
+#402  Dust boot automation enable (0=manual, 1=auto)
+#403  Dust boot target state (0=UP, 1=DOWN)
+#404  Dust collection target (0=OFF, 1=ON)
+#405  Dust collection manual override flag (0=auto, 1=override active)
+#410  Dust boot manual override flag (0=auto, 1=override active)
+
+== System Control & Debug ==
+#470  Universal button handler ID (reserved for future)
+#471  Virtual tool operation selector (reserved for future)
+#472  Dust control operation selector (reserved for future)
+#473  State machine temporary storage (reserved for future)
+#474  State machine temporary storage (reserved for future)
+#475  Reserved for future expansion
+#476  Reserved for future expansion
+#477  Reserved for future expansion
+#478  Reserved for future expansion
+#479  Reserved for future expansion
+
+== M6 and System State ==
+#483  M6 call time (os.clock() for debugging)
+#495  Spindle spin-up delay armed flag (set by M6, cleared by PLC)
+#496  Spindle spin-up delay seconds (configurable, default 3)
+#498  Dialog suppression flag (prevents prompts during M6)
+#499  M6 running flag (1=running, 0=idle)
+
+== Temporary Storage ==
+#500  First probe contact storage (used in m2010)
+#501  Second probe contact storage (used in m2010)
+
+== G68 Rotation State (System) ==
+#1245  Current G68 X center
+#1246  Current G68 Y center  
+#1247  Current G68 rotation angle (degrees)
+
+== Modal State Variables (G-code state tracking) ==
+#4000  Motion mode (0=G0, 1=G1, 2=G2, 3=G3)
+#4001  Feed mode (94=G94 units/min, 95=G95 units/rev)
+#4002  Plane selection (17=G17 XY, 18=G18 XZ, 19=G19 YZ)
+#4003  Absolute/Incremental mode (90=G90 absolute, 91=G91 incremental)
+#4008  Tool compensation/H offset state (49=G49 cancelled, 43=G43 active)
+#4014  Modal work offset (alternate detection for current fixture)
+#4016  Rotation modal (68=G68 rotation active, 69=G69 no rotation)
+#4120  Active H offset number (which H is currently applied)
+
+== Extended Fixture Variables ==
+#5219  BUFP - P number for G54.1 extended fixtures
+#5220  Current work offset (54=G54, 55=G55... 54.1=G54.1 P1)
+
+== Extended Fixtures (G54.1) ==
+#7001-7020   G54.1 P1 (X,Y,Z,A,B,C + reserved)
+#7021-7040   G54.1 P2
+...continues every 20 variables...
+#14001-14020 G54.1 P51
+...continues to P100...
+
+== Work Offsets (G54-G59) ==
+G54: X=#5221, Y=#5222, Z=#5223
+G55: X=#5241, Y=#5242, Z=#5243
+G56: X=#5261, Y=#5262, Z=#5263
+G57: X=#5281, Y=#5282, Z=#5283
+G58: X=#5301, Y=#5302, Z=#5303
+G59: X=#5321, Y=#5322, Z=#5323
+
+== Probing Result Variables ==
+#5061  Probe contact X position
+#5062  Probe contact Y position
+#5063  Probe contact Z position
+#5073  Final probe contact Z position (from G31)
+
+== DRO Persistence Variables ==
+#1034  Edge finder DRO value (persisted to profile)
+#1035  Gage block DRO value (persisted to profile)
+#1036  Gage block T DRO value (persisted to profile)
+```
+
+### Critical Signals
+
+```
+OUTPUTS:
+  OSIG_OUTPUT1          Laser crosshair power
+  OSIG_OUTPUT2          Tool release solenoid
+  OSIG_OUTPUT3          Dust boot down (1=down, 0=up)
+  OSIG_OUTPUT4          Dust collector power
+  OSIG_OUTPUT5          Vacuum table 1 (rear)
+  OSIG_OUTPUT6          Vacuum table 2 (front)
+  OSIG_OUTPUT7          Touch probe power
+  OSIG_SPINDLEON        Spindle running signal
+  OSIG_MACHINE_ENABLED  Machine enabled state
+  OSIG_JOG_CONT         Continuous jog mode active
+  OSIG_JOG_INC          Incremental jog mode active
+  OSIG_JOG_MPG          MPG jog mode active
+  OSIG_SOFTLIMITS_ON    Soft limits enabled
+
+INPUTS:
+  ISIG_INPUT6           Low air pressure (1=low/bad, 0=normal)
+  ISIG_INPUT7           Dust boot up sensor (1=up, 0=down)
+  ISIG_INPUT8           Tool release button (manual override)
+  ISIG_INPUT16          Tool clamp open sensor (1=open, 0=closed)
+  ISIG_INPUT17          Tool present in spindle (1=present, 0=empty)
+  ISIG_PROBE            Probe contact signal (1=contact, 0=no contact)
+```
+
+### Machine States (Mach4 Official Values)
+
+```
+STATE_IDLE              = 0     Machine idle
+STATE_FRUN              = 100   Feed running (program executing)
+STATE_FHOLD             = 101   Feed hold
+STATE_FRUN_PROBE        = 102   Probing run (active G31 probing)
+STATE_FRUN_PROBE_FH     = 103   Feed hold while probing
+STATE_FRUN_MACROH_JOG   = 109   Macro hold + jog enabled
+STATE_FRUN_SINGLE_BLOCK = 110   Single block execution
+STATE_MRUN              = 200   MDI/Macro running
+STATE_MRUN_FH           = 201   MDI/Macro feed hold
+STATE_MRUN_THREAD_FH    = 205   Thread feed hold
+STATE_MRUN_TAP          = 206   Tapping operation
+STATE_MRUN_MACROH       = 207   Macro hold
+STATE_MRUN_MACROH_JOG   = 208   Macro hold + jog enabled
+
+Additional State Constants:
+mc.MERROR_NOERROR  = Success/no error return code
+
+CRITICAL NOTES:
+- State 102 is ACTIVE PROBING, not a hold state!
+- State 103 is the probe-specific feed hold
+- State 109 is NOT a stop state, it's macro hold with jog
+- For detecting ANY hold condition, check: 101, 103, 201, 207
+- For detecting ANY running condition, check: 100, 102, 200
+```
+
+### Axis Constants
+```
+mc.X_AXIS = 0    X axis index
+mc.Y_AXIS = 1    Y axis index
+mc.Z_AXIS = 2    Z axis index
+mc.A_AXIS = 3    A axis index
+mc.B_AXIS = 4    B axis index
+mc.C_AXIS = 5    C axis index
+```
+
+---
+
+## SCREEN LOAD INITIALIZATION v2.0
+
+```pseudo
+ON SCREEN LOAD:
+    // Initialize core systems
+    PopulateTools()                         // Build dropdown from tool table
+    mc.mcToolSetCurrent(inst, 0)           // Force T0
+    mc.mcCntlGcodeExecuteWait("G49")       // Cancel any H offset
+    ValidateVirtualToolConfig()            // Check/repair virtual tool offsets
+    
+    // Define global RetractVirtualTool function with G68 support
+    function RetractVirtualTool():
+        state = #406
+        IF state < 90 OR state > 99:
+            RETURN false                     // No virtual tool active
+        
+        xDelta = #407
+        yDelta = #408
+        
+        // Check for active G68 rotation
+        currentRotState = #4016
+        g68NeedsAdjustment = false
+        
+        IF currentRotState == 68:
+            // Store G68 parameters for later restoration
+            currentG68X = #1245
+            currentG68Y = #1246
+            currentG68R = #1247
+            
+            // Calculate adjusted center for non-offset coordinates
+            adjustedX = currentG68X + xDelta
+            adjustedY = currentG68Y + yDelta
+            
+            // Store for restoration
+            #440 = adjustedX
+            #441 = adjustedY
+            #442 = currentG68R
+            #443 = 1                         // Flag: needs adjustment
+            
+            g68NeedsAdjustment = true
+            mc.mcCntlGcodeExecuteWait("G69") // Cancel temporarily
+        
+        // Validate deltas (sanity check for corruption)
+        IF xDelta < -1e300 OR yDelta < -1e300:
+            LOG "WARNING: Virtual tool deltas corrupted"
+            GOTO hardware_off
+        
+        // Restore work offsets (reverse the applied deltas)
+        FOR i = 0 TO 5:
+            baseVar = 5221 + (i * 20)
+            currentX = #[baseVar]
+            currentY = #[baseVar + 1]
+            IF |currentX| < 1000 AND |currentY| < 1000:  // Sanity check
+                #[baseVar] = currentX + xDelta
+                #[baseVar + 1] = currentY + yDelta
+        
+        // Reapply G68 with adjusted center if needed
+        IF g68NeedsAdjustment:
+            origX = #440
+            origY = #441
+            origAngle = #442
+            mc.mcCntlGcodeExecuteWait("G68 X" + origX + " Y" + origY + " R" + origAngle)
+            #443 = 0                         // Clear flag
+        
+        hardware_off:
+        // Turn off hardware based on tool type
+        IF state == 90:
+            OUTPUT7 = 0                      // Probe off
+        ELIF state == 91:
+            OUTPUT1 = 0                      // Laser off
+        
+        // Clear state variables
+        #406 = 0  // Clear virtual tool state
+        #407 = 0  // Clear X delta
+        #408 = 0  // Clear Y delta
+        #444 = 0  // Clear apply counter
+        #445 = 0  // Clear atomic flag
+        mc.mcToolSetCurrent(0)
+        mc.mcCntlGcodeExecute("G49")
+        
+        RETURN true
+    
+    // Machine Enable Signal Handler (Enhanced)
+    ON MACHINE_ENABLED CHANGE:
+        IF state == DISABLED:
+            // Reset homing bypass
+            _G.HOMING_WARNING_IGNORED = false
+            
+            // Clear tool selection
+            _G.selectedToolIndex = nil
+            
+            // Clear M6 automation flags
+            #481 = 0
+            _G.waitingForMotionAfterToolChange = false
+            _G.motionHasStarted = false
+            
+            // IMMEDIATE virtual tool output shutdown
+            virtualState = #406
+            IF virtualState >= 90 AND virtualState <= 99:
+                OUTPUT7 = 0                  // Probe off
+                OUTPUT1 = 0                  // Laser off
+                LOG "Disable: Virtual tool outputs secured"
+        
+        ELIF state == ENABLED:
+            // Refresh tool dropdown
+            PopulateTools()
+            
+            // Cancel any rotation and fix H offset state
+            mc.mcCntlGcodeExecute("G69")
+            currentTool = mc.mcToolGetCurrent()
+            mc.mcCntlGcodeExecute("G49")    // Clear first
+            IF currentTool > 0 AND currentTool < 90:
+                mc.mcCntlGcodeExecute("G43 H" + currentTool)
+            
+            // Recovery: Check for orphaned virtual tool
+            virtualState = #406
+            IF virtualState >= 90 AND virtualState <= 99:
+                LOG "Recovery: Virtual tool was active, retracting..."
+                RetractVirtualTool()
+    
+    // Initialize automation systems
+    InitDustBoot()                          // Set up dust boot automation
+    #400 = 0  // Dust collection OFF by default
+    #401 = 0  // Vacuum auto OFF by default
+    #402 = 1  // Dust boot auto ON by default
+    
+    // Clear any stale flags
+    #481 = 0
+    #499 = 0
+    
+    // Enable soft limits by default
+    FOR axis = 0 TO 5:
+        IF mc.mcAxisIsEnabled(axis):
+            mc.mcSoftLimitSetState(axis, 1)
+    
+    // Initialize global tracking variables
+    _G.toolNumbers = {}                     // Tool dropdown mapping
+    _G.selectedToolIndex = nil              // User selection tracking
+    _G.HOMING_WARNING_IGNORED = false       // Homing bypass state
+```
+
+---
+
+## M6 TOOL CHANGE MACRO v2.1
+
+```pseudo
+FUNCTION m6():
+    // Entry checks and initialization
+    IF #499 == 1:
+        ERROR "M6 already running"
+        RETURN
+    
+    // Production mode control
+    PRODUCTION_MODE = true                  // Set false for debug output
+    
+    // Configuration
+    NO_MEASURE_TOOLS = {[1] = true}        // Tools to skip auto-measurement
+    
+    VIRTUAL_TOOLS = {
+        [90] = {
+            name = "Touch Probe",
+            output = mc.OSIG_OUTPUT7,
+            xOffsetVar = 301,
+            yOffsetVar = 302,
+            needsSpindleStop = true,
+            needsSafeZ = true,
+            hasHeight = true
+        },
+        [91] = {
+            name = "Laser Cross-hair",
+            output = mc.OSIG_OUTPUT1,
+            xOffsetVar = 318,
+            yOffsetVar = 319,
+            needsSpindleStop = true,
+            needsSafeZ = true,
+            hasHeight = true
+        }
+    }
+    
+    // Initialize flags and get tools
+    #498 = 1                                // Suppress dialogs
+    #499 = 1                                // M6 running
+    #483 = os.clock()                       // Store call time
+    
+    requestedTool = mc.mcToolGetSelected()
+    currentTool = mc.mcToolGetCurrent()
+    
+    // Always recover first (crash recovery)
+    recoverVirtualToolState()
+    
+    // ==========================================
+    // VIRTUAL TOOL DEPLOYMENT (T90-T99)
+    // ==========================================
+    IF requestedTool >= 90 AND requestedTool <= 99:
+        savedVirtualMode = #4003             // Save G90/G91 mode
+        mc.mcCntlGcodeExecute("G90")        // Force G90 for G53 moves
+        
+        // Return physical tool if loaded
+        IF currentTool > 0 AND currentTool < 90 AND ISIG_INPUT17 == 1:
+            #351 = currentTool               // Remember for later
+            returnPhysicalToolForVirtual(currentTool)
+            mc.mcToolSetCurrent(0)
+        
+        // Deploy virtual tool
+        deployVirtualTool(requestedTool):
+            config = VIRTUAL_TOOLS[requestedTool]
+            
+            // Check if already active
+            currentVirtual = #406
+            IF currentVirtual == requestedTool:
+                RETURN true                  // Already deployed
+            
+            // Retract different virtual if active
+            IF currentVirtual >= 90 AND currentVirtual <= 99:
+                RetractVirtualTool()
+            
+            // Pre-deployment: spindle stop, safe Z, boot up
+            IF config.needsSpindleStop AND spindle_running:
+                mc.mcSpindleSetDirection(0)
+                G4 P1
+            
+            IF config.needsSafeZ:
+                G53 G0 Z0
+            
+            // Raise dust boot for virtual tool
+            OUTPUT3 = 0                      // Boot UP
+            WAIT for ISIG_INPUT7 == 1       // Boot up sensor
+            
+            // Apply offsets with atomic operation tracking
+            #445 = 1                         // Atomic operation flag
+            #446 = 1                         // Type: applying offsets
+            
+            xOffset = #[config.xOffsetVar]
+            yOffset = #[config.yOffsetVar]
+            
+            // Validate offsets
+            IF |xOffset| > 12.0 OR |yOffset| > 12.0:
+                ERROR "Virtual tool offset too large"
+            
+            // Apply to all work coordinates
+            FOR i = 0 TO 5:
+                baseVar = 5221 + (i * 20)
+                #[baseVar] = #[baseVar] - xOffset
+                #[baseVar + 1] = #[baseVar + 1] - yOffset
+            
+            // Store state
+            #406 = requestedTool             // Virtual tool active
+            #407 = xOffset                   // X delta stored
+            #408 = yOffset                   // Y delta stored
+            #444 = #444 + 1                  // Apply counter
+            #445 = 0                         // Clear atomic flag
+            
+            // Turn on hardware
+            OUTPUT[config.output] = 1
+            
+            // Set tool and height
+            mc.mcToolSetCurrent(requestedTool)
+            G49
+            G43 H[requestedTool]
+        
+        GOTO CLEANUP
+    
+    // ==========================================
+    // VIRTUAL TOOL RETRACTION
+    // ==========================================
+    IF currentTool >= 90 AND currentTool <= 99:
+        savedMode = #4003
+        G90                                  // For G53 moves
+        RetractVirtualTool()                // Use global function
+        currentTool = 0
+        
+        // Restore G90/G91 mode
+        IF savedMode == 91:
+            G91
+    
+    // ==========================================
+    // PHYSICAL TOOL CHANGE
+    // ==========================================
+    
+    // Constants
+    TOOL_CHANGE_Z = #308 or -6.5
+    PULLOUT_DISTANCE = #309 or 1.75
+    APPROACH_FEED = #310 or 200
+    SPINDLE_SPINDOWN_DWELL_S = 3
+    
+    // Same tool check
+    IF requestedTool == currentTool:
+        IF currentTool > 0:
+            G43 H[currentTool]
+        ELSE:
+            G49
+        GOTO CLEANUP
+    
+    // Save current state
+    saved = {
+        fro: mc.mcCntlGetFRO(),
+        workOffset: #5220,
+        feedRate: mc.SV_FEEDRATE,
+        toolComp: #4008,
+        dustBoot: OUTPUT3_state,
+        plane: #4002,
+        absInc: #4003,
+        feedMode: #4001
+    }
+    
+    // Stop spindle with dwell
+    IF spindle_running:
+        mc.mcSpindleSetDirection(0)
+        G4 P[SPINDLE_SPINDOWN_DWELL_S]
+    
+    // Turn off all virtual tool outputs
+    OUTPUT7 = 0                              // Probe
+    OUTPUT1 = 0                              // Laser
+    
+    // Also disable ESS laser registers
+    hregActivate = mc.mcRegGetHandle("ESS/Laser/Test_Mode_Activate")
+    hregEnable = mc.mcRegGetHandle("ESS/Laser/Test_Mode_Enable")
+    IF hregActivate: mc.mcRegSetValue(hregActivate, 0)
+    IF hregEnable: mc.mcRegSetValue(hregEnable, 0)
+    
+    // Safety checks
+    IF ISIG_INPUT6 == 1: ERROR "Low air pressure"
+    IF NOT all_axes_homed: ERROR "Machine must be homed"
+    
+    // Set up for physical tool change
+    mc.mcCntlSetFRO(100)
+    G90
+    OUTPUT3 = 0                              // Raise dust boot
+    WAIT for ISIG_INPUT7 == 1
+    
+    G20 G94 G40 G17
+    G53 G0 Z0
+    
+    // Return current tool to rack
+    IF currentTool > 0 AND currentTool < 90 AND ISIG_INPUT17 == 1:
+        pos = getToolPosition(currentTool)
+        G53 G0 X[pos.X] Y[pos.Y - PULLOUT_DISTANCE]
+        G53 G1 Z[pos.Z] F[APPROACH_FEED]
+        G53 G1 Y[pos.Y] F[APPROACH_FEED]
+        
+        OUTPUT2 = 1                          // Open clamp
+        WAIT for ISIG_INPUT16 == 1
+        
+        G53 G0 Z[TOOL_CHANGE_Z]
+        mc.mcToolSetCurrent(0)
+        G49
+    
+    // Pick up new tool
+    IF requestedTool > 0:
+        pos = getToolPosition(requestedTool)
+        
+        // Move to tool position
+        G53 G0 X[pos.X] Y[pos.Y]
+        OUTPUT2 = 1                          // Open clamp
+        WAIT for ISIG_INPUT16 == 1
+        
+        // Grab tool
+        G53 G1 Z[pos.Z] F[APPROACH_FEED]
+        G0
+        OUTPUT2 = 0                          // Close clamp
+        G4 P0.5
+        
+        // Verify grabbed
+        IF ISIG_INPUT17 == 0:
+            OUTPUT2 = 1
+            ERROR "Tool not detected after clamp"
+        
+        // Pull out and up
+        G53 G1 Y[pos.Y - PULLOUT_DISTANCE] F[APPROACH_FEED]
+        G53 G0 Z0
+        
+        mc.mcToolSetCurrent(requestedTool)
+        
+        // Arm spindle spin-up delay
+        #495 = 1                             // Arm flag for PLC
+        #496 = 3                             // Delay seconds
+        
+        // Tool height measurement (unless configured to skip)
+        IF NOT NO_MEASURE_TOOLS[requestedTool]:
+            measureToolHeight():
+                // Move to probe station
+                G53 G0 X[#311] Y[#312]
+                
+                // Fast probe with validation
+                startZ = currentMachineZ
+                G53 G31 Z[#314] F[#315]
+                currentZ = currentMachineZ
+                
+                IF |currentZ - startZ| < 0.01:
+                    ERROR "Fast probe failed - no movement"
+                
+                IF currentZ <= (#314 + 0.1):
+                    ERROR "No probe contact within travel"
+                
+                // Retract and slow probe
+                G53 G0 Z[currentZ + #317]
+                G53 G31 Z[#314] F[#316]
+                G53 G0 Z0
+                
+                // Calculate and save height
+                finalZ = #5073
+                toolHeight = finalZ - #353
+                mc.mcToolSetData(MTOOL_MILL_HEIGHT, requestedTool, toolHeight)
+        
+        // Apply height offset
+        G49
+        G43 H[requestedTool]
+    
+    //===========================================
+    // CLEANUP (Always runs)
+    //===========================================
+    CLEANUP:
+        // Restore saved state
+        IF saved:
+            // Handle dust boot on completion/error
+            IF error_occurred:
+                OUTPUT3 = 0                  // Force UP for safety
+            ELSE:
+                OUTPUT3 = saved.dustBoot     // Restore original
+            
+            mc.mcCntlSetFRO(min(saved.fro, 100))  // Cap FRO at 100%
+            
+            // Build and execute restore G-code
+            restoreGcode = buildRestoreGcode(saved)
+            mc.mcCntlGcodeExecute(restoreGcode)
+        
+        // Restore virtual tool G90/G91 if saved
+        IF savedVirtualMode == 91:
+            G91
+        
+        // Clear flags
+        #498 = 0                             // Clear dialog suppression
+        #499 = 0                             // M6 done
+        
+        // Signal completion or log error
+        IF success:
+            mc.mcCntlSetLastError("M6 complete")
+        ELSE:
+            mc.mcCntlSetLastError("M6 failed")
+```
+
+---
+
+## PLC MONITORING LOOP v2.0
+
+```pseudo
+EVERY PLC CYCLE (~50ms):
+    
+    // Production mode control
+    PRODUCTION_MODE = true                  // Debug messages off in production
+    
+    // Initialize on first run
+    IF first_run:
+        initializePersistentGlobals()
+        setupSignalHandles()
+        setupToolPresenceMonitoring()
+        setupDustAutomation()
+        setupLowAirMonitoring()
+    
+    //===========================================
+    // ENHANCED DUST CONTROL SYSTEM
+    //===========================================
+    IF _G.dustHandles AND NOT laserRasterActive:
+        
+        // Check for laser raster interference
+        laserRasterActive = false
+        success, hregRasterActive = pcall(mc.mcRegGetHandle, "ESS/Laser/Raster/Active")
+        IF success AND hregRasterActive:
+            rasterActive = mc.mcRegGetValue(hregRasterActive)
+            IF rasterActive == 1:
+                laserRasterActive = true
+                SKIP dust_control                // Prevent PLC interference
+        
+        // Spindle state change detection
+        spindleOn = mc.mcSignalGetState(_G.dustHandles.spindleOn)
+        IF spindleOn != _G.lastSpindleState:
+            // Clear overrides on spindle START only
+            IF spindleOn == 1:
+                #405 = 0                     // Clear dust override
+                #410 = 0                     // Clear boot override
+            _G.lastSpindleState = spindleOn
+            _G.lastDustTarget = -1           // Force recalculation
+            _G.lastBootTarget = -1
+        
+        // DUST COLLECTION CONTROL
+        dustCollectAuto = #400
+        override = #405
+        laserToolActive = (mc.mcToolGetCurrent() == 91)  // RESTORED: Laser tool check
+        
+        IF dustCollectAuto == 1 AND override == 0 AND NOT laserToolActive:
+            newTarget = (inCycle == 1 OR spindleOn == 1) and 1 or 0
+            #404 = newTarget                 // Update target
+        
+        // Apply dust collection target
+        target = #404
+        IF target != _G.lastDustTarget:
+            mc.mcSignalSetState(_G.dustHandles.dustCollect, target)
+            _G.lastDustTarget = target
+        
+        // DUST BOOT CONTROL WITH EMERGENCY HANDLING
+        isEmergency = (currentState == 109 OR currentState == 103) OR (machEnabled == 0)
+        
+        IF isEmergency:
+            // Emergency - force boot up and laser off (once per event)
+            IF NOT _G.emergencyLaserShutoff:
+                mc.mcSignalSetState(_G.dustHandles.dustBoot, 0)  // UP
+                #403 = 0
+                _G.lastBootTarget = 0
+                
+                // Emergency laser shutoff
+                success1, hregActivate = pcall(mc.mcRegGetHandle, "ESS/Laser/Test_Mode_Activate")
+                success2, hregEnable = pcall(mc.mcRegGetHandle, "ESS/Laser/Test_Mode_Enable")
+                
+                IF success1 AND hregActivate: mc.mcRegSetValue(hregActivate, 0)
+                IF success2 AND hregEnable: mc.mcRegSetValue(hregEnable, 0)
+                
+                _G.emergencyLaserShutoff = true
+                LOG "EMERGENCY: Laser deactivated and disarmed"
+        ELSE:
+            // Normal operation
+            _G.emergencyLaserShutoff = false
+            
+            virtualTool = #406
+            bootAuto = #402
+            bootOverride = #410
+            m6Flag = #499
+            
+            bootTarget = -1
+            
+            // Priority: M6/Virtual > Auto > Manual
+            IF m6Flag == 1 OR virtualTool >= 90:
+                bootTarget = 0               // Force UP
+            ELIF bootAuto == 1 AND bootOverride == 0:
+                // Auto mode with transition delay
+                IF (m6Flag == 0 AND _G.lastM6Running == 1) OR 
+                   (virtualTool < 90 AND _G.lastVirtualActive >= 90):
+                    _G.bootTransitionBlock = os.clock() + 0.5
+                
+                IF os.clock() < _G.bootTransitionBlock:
+                    bootTarget = _G.lastBootTarget  // Maintain current
+                ELSE:
+                    bootTarget = spindleOn and 1 or 0  // Follow spindle
+            ELSE:
+                bootTarget = #403            // Manual/override mode
+            
+            // Update tracking
+            _G.lastM6Running = m6Flag
+            _G.lastVirtualActive = virtualTool
+            
+            // Apply boot target
+            IF bootTarget != _G.lastBootTarget:
+                mc.mcSignalSetState(_G.dustHandles.dustBoot, bootTarget)
+                #403 = bootTarget
+                _G.lastBootTarget = bootTarget
+        
+        // Update UI button states
+        UpdateAllDustButtons()
+    
+    //===========================================
+    // TOOL PRESENCE MONITORING WITH DEBOUNCING
+    //===========================================
+    IF machEnabled AND _G.toolPresentHandle:
+        toolPresent = mc.mcSignalGetState(_G.toolPresentHandle)
+        currentTool = mc.mcToolGetCurrent()
+        
+        // Tool insertion detection
+        IF toolPresent == 1 AND currentTool == 0:
+            m6Running = #499
+            suppressPrompt = #498
+            
+            IF NOT suppressPrompt AND NOT m6Running:
+                // BLOCKING ISSUE: This blocks the entire PLC!
+                promptToolSelection(false)   // Should be moved to Screen Load
+                
+                // PROPOSED SOLUTION:
+                // _G.needToolPrompt = true
+                // Let Screen Load timer handle dialog
+        
+        // Tool removal detection
+        IF toolPresent == 0 AND _G.lastToolSensorState == 1:
+            mc.mcToolSetCurrent(0)
+            mc.mcCntlGcodeExecuteWait("G49")
+            IF UpdateToolPreview: UpdateToolPreview()
+            LOG "Tool removed - T0 set"
+        
+        _G.lastToolSensorState = toolPresent
+    
+    //===========================================
+    // LOW AIR PRESSURE SAFETY SYSTEM
+    //===========================================
+    IF _G.lowAirHandle:
+        rawAirState = mc.mcSignalGetState(_G.lowAirHandle)
+        
+        // Debounce air pressure signal
+        IF rawAirState != _G.lastLowAirState:
+            _G.lowAirDebounceCount = _G.lowAirDebounceCount + 1
+            
+            IF _G.lowAirDebounceCount >= 3:  // 3 cycle debounce
+                _G.lowAirDebounceCount = 0
+                
+                IF rawAirState == 1:         // Low pressure detected
+                    IF NOT _G.lowAirDisabled:
+                        // Emergency shutdown sequence
+                        IF inCycle: mc.mcCntlFeedHold(); mc.mcCntlCycleStop()
+                        IF spindle_running: mc.mcSpindleSetDirection(0)
+                        mc.mcCntlEnable(0)   // Disable machine
+                        
+                        _G.lowAirDisabled = true
+                        LOG "*** MACHINE DISABLED: LOW AIR PRESSURE DETECTED ***"
+                        
+                        // Show dialog via coroutine (non-blocking)
+                        ShowLowAirDialog()
+                
+                ELSE:                        // Pressure restored
+                    IF _G.lowAirDisabled:
+                        LOG "Air pressure restored - machine can be re-enabled"
+                        _G.lowAirDisabled = false
+                        ShowAirRestoredDialog()
+                
+                _G.lastLowAirState = rawAirState
+        ELSE:
+            _G.lowAirDebounceCount = 0
+        
+        // Update UI indicators
+        IF testcount % 10 == 0:
+            UpdateAirPressureButton(rawAirState)
+    
+    //===========================================
+    // BUTTON INPUT MIRRORING (Protected)
+    //===========================================
+    // Input 8 → Output 2 (Tool release button)
+    input8State = mc.mcSignalGetState(ISIG_INPUT8)
+    m6Running = #499
+    
+    // Only mirror if M6 is NOT running (prevents interference)
+    IF m6Running != 1:
+        mc.mcSignalSetState(OSIG_OUTPUT2, input8State)
+    
+    // Tool check after button release
+    IF input8State == 0 AND _G.lastInput8State == 1:
+        _G.toolCheckPending = true
+        _G.toolCheckTime = os.clock() + 1.0  // 1 second delay
+    
+    _G.lastInput8State = input8State
+    
+    //===========================================
+    // HOMING STATE MONITORING
+    //===========================================
+    allHomed = true
+    FOR axis = 0 TO 5:
+        enabled = mc.mcAxisIsEnabled(axis)
+        homed = mc.mcAxisIsHomed(axis)
+        IF enabled == 1 AND homed != 1:
+            allHomed = false
+            BREAK
+    
+    // Update homing button with flash animation
+    flashOn = (math.floor(testcount / 6) % 2) == 0
+    
+    IF NOT allHomed:
+        color = flashOn and "#FFFF00" or "#4B4B4B"  // Yellow flash
+        scr.SetProperty("btnRefAllAxes", "Bg Color", color)
+        scr.SetProperty("btnRefAllAxes", "Label", "HOME\nREQUIRED")
+    ELSE:
+        scr.SetProperty("btnRefAllAxes", "Bg Color", "#4B4B4B")
+        scr.SetProperty("btnRefAllAxes", "Label", "Ref All\nAxis")
+        
+        // Reset homing bypass on successful homing
+        IF _G.HOMING_WARNING_IGNORED:
+            _G.HOMING_WARNING_IGNORED = false
+    
+    _G.AXES_HOMED = allHomed
+    
+    //===========================================
+    // UI STATE SYNCHRONIZATION
+    //===========================================
+    
+    // Work offset monitoring
+    currentOffset = #5220
+    IF currentOffset != _G.lastWorkOffset:
+        UpdateWorkOffsetButtons()
+        
+        IF currentOffset >= 54 AND currentOffset <= 59:
+            LOG "Work Offset: G" + currentOffset
+        ELIF |currentOffset - 54.1| < 0.01:
+            pNumber = #5219
+            LOG "WARNING: G54.1 P" + pNumber + " active - not shown in UI"
+        
+        _G.lastWorkOffset = currentOffset
+    
+    // Soft limits state monitoring
+    softLimitsEnabled = getActualSoftLimitsEnabled()
+    IF softLimitsEnabled != _G.lastSoftLimitsState:
+        color = softLimitsEnabled == 1 and "#00FF00" or "#FF0000"
+        label = softLimitsEnabled == 1 and "Soft Limits\nENABLED" or "Soft Limits\nDISABLED"
+        scr.SetProperty("btnSoftLimits", "Bg Color", color)
+        scr.SetProperty("btnSoftLimits", "Label", label)
+        _G.lastSoftLimitsState = softLimitsEnabled
+    
+    // Virtual tool button state monitoring
+    UpdateVirtualToolButtons()
+    
+    // Tab-based UI refresh
+    IF _G.tabMonitor.needsRefresh:
+        UpdateWorkOffsetButtons()
+        SyncSoftLimitsButton()
+        SyncDustButtons()
+        _G.tabMonitor.needsRefresh = false
+    
+    //===========================================
+    // COROUTINE MANAGEMENT
+    //===========================================
+    IF wait AND machState == 0:
+        state = coroutine.status(wait)
+        IF state == "suspended":
+            coroutine.resume(wait)
+```
+
+---
+
+## Known Issues & Solutions v2.0
+
+### Issue 1: PLC Tool Selection Blocking
+**Status: CRITICAL - Still Present**
+```
+Problem: promptToolSelection() in PLC blocks entire system
+Current: PLC calls dialog with wx blocking calls
+Impact: No dust control, no safety monitoring during dialog
+
+SOLUTION (Recommended):
+1. Move promptToolSelection() from PLC to Screen Load
+2. PLC sets flag: _G.needToolPrompt = true  
+3. Screen Load timer checks flag and shows dialog
+4. Dialog updates tool and clears flag
+
+Implementation:
+PLC: IF toolPresent AND currentTool == 0: _G.needToolPrompt = true
+ScreenLoad: Timer checks _G.needToolPrompt and shows non-blocking dialog
+```
+
+### Issue 2: Laser Raster vs Dust Control
+**Status: FIXED - Dual Protection**
+```
+Problem: PLC dust control interferes with laser raster operations
+Solution 1: Skip entire dust control when raster active
+Solution 2: Restore laserToolActive check for dust collection
+
+Current Implementation: Both protections active
+- Line 521-529: Skip dust control if raster register active  
+- Line 566-569: Skip dust collection if T91 active
+```
+
+### Issue 3: G68 Rotation with Virtual Tools  
+**Status: ENHANCED - Full Support**
+```
+Problem: G68 rotation applied during probe operations creates coordinate conflicts
+Solution: Enhanced RetractVirtualTool() with G68 adjustment
+
+New Features:
+- Detects active G68 during virtual tool retraction
+- Calculates adjusted rotation center for non-offset coordinates
+- Temporarily cancels G68, restores offsets, reapplies adjusted G68
+- Stores adjustment data in #440-#443 for debugging
+```
+
+### Issue 4: Emergency State Handling
+**Status: COMPREHENSIVE**
+```
+Enhanced emergency detection and response:
+- Low air pressure: Machine disable, spindle stop, dialog
+- Machine disable: Immediate virtual tool output shutdown
+- Emergency states (109, 103): Dust boot up, laser shutoff
+- Recovery procedures on machine re-enable
+
+Safety Features:
+- One-shot emergency actions prevent repeated execution
+- Coroutine-based dialogs prevent PLC blocking
+- State restoration on pressure recovery
+```
+
+### Issue 5: Atomic Virtual Tool Operations
+**Status: IMPLEMENTED**
+```
+Problem: Virtual tool offset corruption during crashes
+Solution: Atomic operation tracking
+
+New Variables:
+#445 = Operation in progress flag
+#446 = Operation type (1=apply, 2=remove)  
+#444 = Apply counter for debugging
+
+Benefits:
+- Crash recovery can detect incomplete operations
+- Debug information for troubleshooting
+- Prevents double-application of offsets
+```
+
+---
+
+## Configuration Tables
+
+### Virtual Tool Configuration
+```lua
+VIRTUAL_TOOLS = {
+    [90] = {
+        name = "Touch Probe",
+        output = mc.OSIG_OUTPUT7,
+        xOffsetVar = 301,               -- #301 Probe X offset
+        yOffsetVar = 302,               -- #302 Probe Y offset  
+        needsSpindleStop = true,
+        needsSafeZ = true,
+        hasHeight = true
+    },
+    [91] = {
+        name = "Laser Cross-hair",
+        output = mc.OSIG_OUTPUT1, 
+        xOffsetVar = 318,               -- #318 Laser X offset
+        yOffsetVar = 319,               -- #319 Laser Y offset
+        needsSpindleStop = true,
+        needsSafeZ = true,
+        hasHeight = true
+    }
+}
+```
+
+### Tool Measurement Configuration
+```lua
+-- Tools that skip automatic height measurement during M6
+NO_MEASURE_TOOLS = {
+    [1] = true,   -- Tool 1: Skip measurement
+    -- Add more tools as needed:
+    -- [5] = true,
+    -- [12] = true,
+}
+```
+
+### Tool Table Extended Data Fields
+```
+Physical tools (T1-T89) require rack position data:
+  XToolChange     Tool rack X position (machine coordinates)
+  YToolChange     Tool rack Y position (machine coordinates)
+  ZToolChange     Tool rack Z position (tool grab height)
+
+CRITICAL: If XToolChange == 0 AND YToolChange == 0, M6 will error!
+This prevents crashes from unconfigured tools.
+
+Access via:
+  mc.mcToolGetDataExDbl(inst, toolNum, "XToolChange")
+  mc.mcToolGetDataExDbl(inst, toolNum, "YToolChange") 
+  mc.mcToolGetDataExDbl(inst, toolNum, "ZToolChange")
+```
+
+---
+
+## Critical Functions & Locations v2.0
+
+| Function | Defined In | Called By | Purpose | Status |
+|----------|------------|-----------|---------|---------|
+| `RetractVirtualTool()` | Screen Load | M6, PLC, Recovery | Single source virtual tool cleanup with G68 support | ✓ Enhanced |
+| `PopulateTools()` | Screen Load | Machine enable | Build tool dropdown from table | ✓ Stable |
+| `UpdateToolPreview()` | Screen Load | Tool changes | Update UI display | ✓ Stable |
+| `promptToolSelection()` | PLC | PLC | Get tool number | ⚠ BLOCKS PLC |
+| `CheckHomingBeforeMove()` | Screen Load | Cycle start | Enforce homing safety | ✓ Enhanced |
+| `UpdateDustBoot()` | Screen Load | PLC | Simplified dust boot control | ✓ New |
+| `UpdateAllDustButtons()` | PLC | PLC | Sync dust button UI states | ✓ Optimized |
+| `ShowHomingRequiredDialog()` | Screen Load | Movement commands | Homing warning with bypass | ✓ Enhanced |
+| `ValidateVirtualToolConfig()` | Screen Load | Startup | Check/repair virtual tool offsets | ✓ New |
+
+---
+
+## Recovery & Safety Systems v2.0
+
+### E-Stop/Crash Recovery
+```
+Machine Disabled:
+  1. Virtual tool outputs OFF immediately (prevent Mach4 memory issues)
+  2. State preserved in #406/#407/#408 for recovery
+  3. M6 flags cleared (#499, #498)
+  4. Tool selection cleared
+  5. Motion flags reset
+
+Machine Re-enabled:  
+  1. Check #406 for orphaned virtual tool
+  2. If found, call enhanced RetractVirtualTool() with G68 support
+  3. Resync H offsets (G49 then G43 if needed)
+  4. Cancel rotation (G69) 
+  5. Check homing state
+  6. Refresh tool dropdown
+```
+
+### Enhanced Homing Safety
+```
+Before any movement:
+  1. Check all enabled axes for homing status
+  2. If any unhomed, show enhanced dialog:
+     - HOME ALL (green, default, Enter key)
+     - Ignore Warning → Confirmation → Bypass if confirmed
+  3. Block movement unless homed or explicitly bypassed
+  4. Reset bypass on successful homing or machine disable
+  5. Visual indicators: Flashing yellow "HOME REQUIRED" button
+```
+
+### Virtual Tool Offset Mechanics v2.0
+```
+Deploy (T90/T91):
+  1. Validate offsets are reasonable (< 12.0)
+  2. Set atomic operation flag (#445 = 1, #446 = 1)
+  3. FOR each fixture G54-G59:
+       X = X - offset  // Tool appears at spindle position
+       Y = Y - offset
+  4. Store deltas in #407, #408 and increment counter #444
+  5. Clear atomic flag (#445 = 0)
+
+Retract (Enhanced):
+  1. Check for active G68 rotation (#4016 == 68)
+  2. If G68 active:
+     - Calculate adjusted center: currentCenter + deltas
+     - Store adjustment data (#440-#443)
+     - Cancel G68 temporarily
+  3. FOR each fixture G54-G59:
+       X = X + offset  // Restore original zeros
+       Y = Y + offset  
+  4. If G68 was active:
+     - Reapply with adjusted center
+     - Clear adjustment flags
+  5. Clear state (#406, #407, #408, #444, #445)
+```
+
+### Low Air Pressure Safety v2.0
+```
+Detection (3-cycle debounce):
+  1. ISIG_INPUT6 == 1 detected for 3 consecutive PLC cycles
+  
+Response Sequence:
+  1. If in cycle: Feed hold → Cycle stop
+  2. If spindle running: Stop spindle  
+  3. Disable machine (mc.mcCntlEnable(0))
+  4. Set _G.lowAirDisabled = true
+  5. Show non-blocking dialog via coroutine
+  6. Update UI: Red "Air Pressure LOW!" button
+
+Recovery:
+  1. ISIG_INPUT6 == 0 detected (pressure restored)
+  2. Clear _G.lowAirDisabled = false
+  3. Show "Air Pressure Restored" dialog
+  4. User must manually re-enable machine
+  5. Update UI: Green "Air Pressure NORMAL" button
+```
+
+---
+
+## Execution Flow Summary v2.0
+
+```
+1. STARTUP SEQUENCE
+   └─> Screen Load initializes → Validate configs → Define globals → 
+       Check recovery needed → Enable soft limits → Initialize dust system
+
+2. NORMAL CUTTING WORKFLOW  
+   └─> M6 T[n] → Measure (unless NO_MEASURE) → Arm spindle delay (#495) →
+       Program start (state 100) → Spindle ON → PLC detects → Pause if armed →
+       Resume after delay → Motion detected → Boot down (auto) → 
+       Cutting → Program end (state 0) → Boot up, dust off
+
+3. VIRTUAL TOOL WORKFLOW
+   └─> M6 T90 → Return physical if loaded → Apply offsets (atomic) → 
+       Activate probe → G31 operations (state 102) → Process results →
+       M6 T[physical] → Enhanced retract with G68 support → Continue
+
+4. PROBING WITH G68 ROTATION
+   └─> G68 X Y R → M6 T90 → Enhanced deployment → Probing operations →
+       M6 T[physical] → Detect G68 → Calculate adjustments → 
+       Restore offsets → Reapply adjusted G68 → Continue
+
+5. EMERGENCY SCENARIOS
+   └─> Low air detected → Emergency shutdown → Dialogs → Restore → Re-enable
+   └─> Machine disable → Secure outputs → Recovery check on re-enable
+   └─> E-stop → Crash recovery → Virtual tool cleanup → State restoration
+
+6. TOOL MANAGEMENT
+   └─> Manual insertion → PLC detects → Tool selection dialog (BLOCKING ISSUE) →
+       Update dropdown → Sync H offset → Ready
+
+7. HOMING SAFETY
+   └─> Movement command → Check homing → Show dialog if needed →
+       HOME ALL or Ignore → Bypass tracking → Continue or block
+```
+
+---
+
+## Debug and Troubleshooting
+
+### Production Mode Control
+```
+M6 Macro: PRODUCTION_MODE = true/false (line 44)
+PLC Script: _G.PRODUCTION_MODE = true/false (line 33)
+
+Debug Messages When PRODUCTION_MODE = false:
+- M6: Detailed tool change steps, measurements, recovery actions
+- PLC: Dust control decisions, state changes, emergency actions
+- All debug output goes to mc.mcCntlSetLastError()
+```
+
+### Key Debug Variables
+```
+#483  = M6 call timestamp (os.clock())
+#444  = Virtual tool apply counter
+#445  = Atomic operation in progress (0=idle, 1=active)  
+#446  = Atomic operation type (1=apply, 2=remove)
+_G.dustDebug.cycleCount = PLC cycle counter
+
+Tracking Variables:
+_G.lastSpindleState = Previous spindle state
+_G.lastDustTarget = Previous dust collection target
+_G.lastBootTarget = Previous boot target  
+_G.emergencyLaserShutoff = Emergency state tracking
+```
+
+### Common Issues and Solutions
+```
+1. "Virtual tool already active" - Check #406, may need manual RetractVirtualTool()
+2. "Tool rack XY is (0,0)" - Set XToolChange/YToolChange in tool table
+3. "Fast probe failed - no movement" - Check soft limits, probe parameters
+4. "G68 center will adjust" - Normal with virtual tools, shows coordinate preservation
+5. Dust boot not responding - Check auto mode #402, override #410, M6 state #499
+6. Tool dropdown not updating - Check _G.toolNumbers population, UpdateToolPreview()
+```
+
+---
+
+## System Integration Notes
+
+This system now provides:
+- **Comprehensive virtual tool support** with G68 rotation preservation
+- **Enhanced safety systems** with emergency detection and recovery
+- **Production-ready operation** with debug capabilities
+- **Laser compatibility** with dual protection against interference  
+- **Robust error handling** with atomic operations and crash recovery
+- **Advanced UI synchronization** with optimized button updates
+
+The architecture maintains backward compatibility while adding sophisticated new capabilities. The main remaining issue is the blocking tool selection dialog in the PLC, which should be moved to the Screen Load script for proper non-blocking operation.
+
+**Total system complexity: ~3000 lines of logic across 3 scripts**
+**Key improvement from v1.0: 5x more comprehensive with production-ready features**

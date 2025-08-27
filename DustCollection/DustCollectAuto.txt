@@ -1,0 +1,12 @@
+local inst = mc.mcGetInstance()
+local currentMode = mc.mcCntlGetPoundVar(inst, 400)
+if currentMode == 0 then
+    mc.mcCntlSetPoundVar(inst, 400, 1)
+    mc.mcCntlSetPoundVar(inst, 405, 0)  -- Clear any override
+    scr.SetProperty("btnDustCollectAuto", "Bg Color", "#00FF00")
+    mc.mcCntlSetLastError(inst, "Dust collection AUTO mode")
+else
+    mc.mcCntlSetPoundVar(inst, 400, 0)
+    scr.SetProperty("btnDustCollectAuto", "Bg Color", "#FF0000")
+    mc.mcCntlSetLastError(inst, "Dust collection MANUAL mode")
+end

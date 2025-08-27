@@ -1,0 +1,1821 @@
+-- Outside Center Probe v3.2 - Button Left-Down Script for Mach4
+
+-- Required Pound Variables:
+-- #300 = Probe tip diameter
+-- #301 = X offset from spindle center to probe tip
+-- #302 = Y offset from spindle center to probe tip
+-- #303 = Fast feedrate for probing
+-- #304 = Slow feedrate for final probe
+-- #305 = Maximum probe travel distance
+-- #320 = Z offset for probe calibration
+-- #321 = Probe lift height (height above surface for XY moves)
+-- #391 = M311 output: Edge position (adjusted for probe radius)
+-- #394 = M311 output: TRUE surface Z (H-compensated) for datum setting
+
+-- Required Macro:
+-- m311.mcs must exist in your profile's Macros folder
+
+local inst = mc.mcGetInstance()
+if not inst then 
+    return 
+end
+
+-- ============================================
+-- CONSTANTS
+-- ============================================
+local PROBE_SIGNAL = mc.ISIG_PROBE1   -- Touch probe, NOT tool setter
+local SENTINEL_VALUE = -999999.0      -- Impossible machine position for failure detection
+local PROBE_SETTLE_MS = 100          -- Probe signal settle time
+
+-- ============================================
+-- SOFT LIMIT MANAGEMENT
+-- ============================================
+function GetMaxSafeTravel(axis, direction, currentMachPos)
+    local softMin, rc1 = mc.mcAxisGetSoftlimitMin(inst, axis)
+    local softMax, rc2 = mc.mcAxisGetSoftlimitMax(inst, axis)
+    local softEnabled = mc.mcSoftLimitGetState(inst, axis)
+    
+    if softEnabled ~= 1 or rc1 ~= mc.MERROR_NOERROR or rc2 ~= mc.MERROR_NOERROR then
+        return 999  -- No soft limits, return large number
+    end
+    
+    local safetyBuffer = 0.010  -- Safety margin from soft limits
+    
+    if direction > 0 then
+        -- Moving positive
+        local available = softMax - currentMachPos - safetyBuffer
+        return math.max(0, available)
+    else
+        -- Moving negative
+        local available = currentMachPos - softMin - safetyBuffer
+        return math.max(0, available)
+    end
+end
+
+-- ============================================
+-- UI CONFIGURATION VARIABLES
+-- Customize the dialog appearance and behavior by adjusting these values
+-- All UI parameters are centralized here for easy maintenance
+-- ============================================
+local UI_CONFIG = {
+    -- Main dialog window dimensions
+    DIALOG_WIDTH = 450,           -- Width of the setup dialog in pixels
+    DIALOG_HEIGHT = 700,          -- Height of the setup dialog (adjusted for removed note text)
+    
+    -- Spacing constants for consistent layout (all values in pixels)
+    SPACING = {
+        TINY = 2,                 -- Minimal spacing between very close elements
+        SMALL = 5,                -- Standard small spacing for related controls
+        MEDIUM = 10,              -- Medium spacing for general layout
+        LARGE = 15,               -- Large spacing for major visual separation
+        SECTION_GAP = 10,         -- Space between major sections (axis selection, parameters, options)
+        RADIO_BUTTON_GAP = 15,    -- Space between "Probe Axes" and "Probe Order" radio groups
+        CONTROL_PADDING = 5,      -- Internal padding within grouped controls
+        LABEL_TO_INPUT = 5,       -- Space between a label and its input field
+        RANGE_TEXT_INDENT = 10,   -- Left indent for range display text (gray italic text)
+        TAB_INDENT = 25,          -- Tab-like indent for subordinate controls (probe order)
+    },
+    
+    -- Input field widths (horizontal size in pixels)
+    INPUT_WIDTHS = {
+        TRAVEL = 70,              -- Width for -X/+X/-Y/+Y travel distance input fields
+        WIDTH = 100,              -- Width for X/Y width fields in center mode
+        COMMON = -1,              -- Width for common fields (offset, probe depth, z drop) - -1 means full width
+    },
+    
+    -- Button dimensions for OK and Cancel
+    BUTTON = {
+        WIDTH = 90,               -- Standard button width in pixels
+        HEIGHT = 30,              -- Standard button height in pixels
+    },
+    
+    -- Font sizes for different text elements
+    FONTS = {
+        NORMAL = 9,               -- Standard text size for labels and controls
+        SMALL = 8,                -- Smaller text for notes and range displays
+        INSTRUCTION = 9,          -- Size for instruction text at top of dialog
+    },
+    
+    -- Color definitions (RGB values 0-255)
+    COLORS = {
+        RANGE_TEXT = {64, 64, 64},       -- Gray color for range display text
+        DISABLED = {128, 128, 128},      -- Gray color for disabled control labels
+        NORMAL = {0, 0, 0},              -- Black color for normal enabled text
+    },
+    
+    -- Layout behavior flags
+    LAYOUT = {
+        MERGE_AXIS_CONTAINERS = true,    -- If true, combines "Probe Axes" and "Probe Order" in single container
+        CONSISTENT_FIELD_SPACING = true,  -- If true, maintains same field positions when switching modes
+    }
+}
+
+-- Helper function to create consistent spacing flags
+-- Usage: GetSpacing(left, right, top, bottom) where each parameter is pixels
+-- Returns wx flags that can be used in sizer:Add() calls
+local function GetSpacing(left, right, top, bottom)
+    left = left or 0
+    right = right or 0
+    top = top or 0
+    bottom = bottom or 0
+    return wx.wxLEFT * left + wx.wxRIGHT * right + wx.wxTOP * top + wx.wxBOTTOM * bottom
+end
+
+-- ============================================
+-- TOOL CHECK
+-- ============================================
+-- Check if T90 (probe) is active
+local currentTool = mc.mcToolGetCurrent(inst)
+-- Check if probe is physically deployed (output 7)
+local probeDownHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7)
+local probeDeployed = mc.mcSignalGetState(probeDownHandle)
+
+-- Check both conditions - T90 is current AND probe is deployed
+if currentTool ~= 90 or probeDeployed ~= 1 then
+    -- Determine parent window
+    local parent = wx.NULL
+    local app = wx.wxGetApp()
+    if app then
+        local ok, top = pcall(function() return app:GetTopWindow() end)
+        if ok and top then parent = top end
+    end
+    
+    -- Show error dialog
+    local dlgW, dlgH = 340, 200
+    local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
+    local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
+    local posX = math.floor((sw - dlgW) / 2)
+    local posY = math.floor((sh - dlgH) / 2)
+    
+    local errorDlg = wx.wxDialog(parent, wx.wxID_ANY,
+        "Probe Not Active",
+        wx.wxPoint(posX, posY), wx.wxSize(dlgW, dlgH),
+        wx.wxDEFAULT_DIALOG_STYLE)
+    
+    local panel = wx.wxPanel(errorDlg, wx.wxID_ANY)
+    local sizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    -- Error message
+    local msg = wx.wxStaticText(panel, wx.wxID_ANY,
+        "Please activate T90 (probe) before using outside center probe.\n\n" ..
+        "Click 'Change Tool to T90' to activate the probe,\n" ..
+        "or 'Cancel' to exit.")
+    msg:SetFont(wx.wxFont(10, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
+    sizer:Add(msg, 1, wx.wxALL + wx.wxALIGN_CENTER, 20)
+    
+    -- Button sizer
+    local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    
+    -- Change Tool button
+    local changeBtn = wx.wxButton(panel, wx.wxID_ANY, "Change Tool to T90")
+    changeBtn:SetMinSize(wx.wxSize(130, UI_CONFIG.BUTTON.HEIGHT))
+    btnSizer:Add(changeBtn, 0, wx.wxRIGHT, 10)
+    
+    -- Cancel button
+    local cancelBtn = wx.wxButton(panel, wx.wxID_CANCEL, "Cancel")
+    cancelBtn:SetMinSize(wx.wxSize(UI_CONFIG.BUTTON.WIDTH, UI_CONFIG.BUTTON.HEIGHT))
+    btnSizer:Add(cancelBtn, 0, wx.wxLEFT, 0)
+    
+    sizer:Add(btnSizer, 0, wx.wxALIGN_CENTER + wx.wxBOTTOM, 15)
+    
+    -- Handle Change Tool button
+    changeBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function(event)
+        errorDlg:EndModal(wx.wxID_YES)  -- Use YES as indicator to change tool
+    end)
+    
+    panel:SetSizer(sizer)
+    errorDlg:Centre()
+    
+    local result = errorDlg:ShowModal()
+    errorDlg:Destroy()
+    
+    if result == wx.wxID_YES then
+        -- Execute tool change and exit - user will need to click probe again
+        mc.mcCntlGcodeExecuteWait(inst, "T90 M6")
+        mc.mcCntlSetLastError(inst, "T90 activated - click Outside Center Probe again to continue")
+        return
+    else
+        return  -- User cancelled
+    end
+end
+
+-- ============================================
+-- PROFILE STORAGE HELPERS
+-- ============================================
+local function ProfileGetInt(section, key, default)
+    local strValue = mc.mcProfileGetString(inst, section, key, tostring(default))
+    return tonumber(strValue) or default
+end
+
+local function ProfileGetFloat(section, key, default)
+    local strValue = mc.mcProfileGetString(inst, section, key, tostring(default))
+    return tonumber(strValue) or default
+end
+
+local function ProfileSetInt(section, key, value)
+    return mc.mcProfileWriteString(inst, section, key, tostring(value))
+end
+
+local function ProfileSetFloat(section, key, value)
+    return mc.mcProfileWriteString(inst, section, key, tostring(value))
+end
+
+-- ============================================
+-- LOAD SAVED SETTINGS
+-- ============================================
+local lastAxisMode = ProfileGetInt("OutsideCenter", "AxisMode", 3)  -- 1=X, 2=Y, 3=Both
+local lastAxisOrder = ProfileGetInt("OutsideCenter", "AxisOrder", 0)  -- 0=X first, 1=Y first
+-- Keep individual and center values completely separate
+local lastPlusXMin = ProfileGetFloat("OutsideCenter", "IndividualPlusXMin", 0.5)
+local lastMinusXMin = ProfileGetFloat("OutsideCenter", "IndividualMinusXMin", 0.5)
+local lastPlusYMin = ProfileGetFloat("OutsideCenter", "IndividualPlusYMin", 0.5)
+local lastMinusYMin = ProfileGetFloat("OutsideCenter", "IndividualMinusYMin", 0.5)
+local lastXWidth = ProfileGetFloat("OutsideCenter", "CenterXWidth", 1.0)
+local lastYWidth = ProfileGetFloat("OutsideCenter", "CenterYWidth", 1.0)
+local lastOffset = ProfileGetFloat("OutsideCenter", "Offset", 1.0)
+local lastProbeDepth = ProfileGetFloat("OutsideCenter", "ProbeDepth", 0.1)
+local lastZDrop = ProfileGetFloat("OutsideCenter", "ZDrop", 0.5)  -- Keep Z Drop value
+local lastAction = ProfileGetInt("OutsideCenter", "ActionMode", 1)
+local lastAutoCenter = ProfileGetInt("OutsideCenter", "AutoCenter", 0)
+local lastPerformZProbe = ProfileGetInt("OutsideCenter", "PerformZProbe", 1)  -- Default enabled
+
+-- ============================================
+-- CREATE DIALOG
+-- ============================================
+-- Determine parent window
+local parent = wx.NULL
+local app = wx.wxGetApp()
+if app then
+    local ok, top = pcall(function() return app:GetTopWindow() end)
+    if ok and top then parent = top end
+end
+
+-- Create separate storage for each mode to maintain values when switching
+local modeValues = {
+    individual = {
+        plusX = lastPlusXMin,
+        minusX = lastMinusXMin,
+        plusY = lastPlusYMin,
+        minusY = lastMinusYMin
+    },
+    center = {
+        xWidth = lastXWidth,
+        yWidth = lastYWidth
+    }
+}
+
+-- Dialog dimensions
+local dlgW, dlgH = UI_CONFIG.DIALOG_WIDTH, UI_CONFIG.DIALOG_HEIGHT
+local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
+local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
+local posX = math.floor((sw - dlgW) / 2)
+local posY = math.floor((sh - dlgH) / 2)
+
+-- Create main dialog
+local dlg = wx.wxDialog(parent, wx.wxID_ANY,
+    "Outside Center Probe Setup",
+    wx.wxPoint(posX, posY), wx.wxSize(dlgW, dlgH),
+    wx.wxDEFAULT_DIALOG_STYLE)
+
+-- Main panel
+local panel = wx.wxPanel(dlg, wx.wxID_ANY)
+local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+
+-- Declare all UI elements
+local datumText, instructText, axisRadio, actionRadio
+local autoCenterCheck, axisOrderRadio, zProbeCheck
+local minusXLabel, minusXInput, plusXLabel, plusXInput, xMaxText
+local minusYLabel, minusYInput, plusYLabel, plusYInput, yMaxText
+local xWidthLabel, xWidthInput, xCenterRangeText
+local yWidthLabel, yWidthInput, yCenterRangeText
+local offsetLabel, offsetInput, probeDepthLabel, probeDepthInput
+local zDropLabel, zDropInput
+
+-- Create controls
+datumText = wx.wxStaticText(panel, wx.wxID_ANY, "")
+datumText:SetFont(wx.wxFont(UI_CONFIG.FONTS.NORMAL, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
+
+instructText = wx.wxStaticText(panel, wx.wxID_ANY,
+    "Position the probe above the rectangular feature before starting:\n" ..
+    "• Probe will first measure the top surface (if enabled)\n" ..
+    "• Then probe outward and measure the edges\n" ..
+    "• Ensure adequate clearance for probe movements")
+instructText:SetFont(wx.wxFont(UI_CONFIG.FONTS.INSTRUCTION, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
+
+-- Create axis radio with EMPTY title
+local axisChoices = {"X Axis Only", "Y Axis Only", "Both Axes"}
+axisRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
+    "", wx.wxDefaultPosition, wx.wxDefaultSize,  -- Empty title
+    axisChoices, 3, wx.wxRA_SPECIFY_COLS)
+axisRadio:SetSelection(lastAxisMode - 1)
+
+-- Axis order selection with EMPTY title (will be greyed out when not Both Axes)
+local axisOrderChoices = {"X First, Then Y    ", "Y First, Then X"}  -- Added padding to first option
+axisOrderRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
+    "", wx.wxDefaultPosition, wx.wxDefaultSize,  -- Empty title
+    axisOrderChoices, 2, wx.wxRA_SPECIFY_COLS)
+axisOrderRadio:SetSelection(lastAxisOrder)
+-- Initially disable if not Both Axes
+axisOrderRadio:Enable(lastAxisMode == 3)
+
+local actionChoices = {"Set Datum", "Print Coords"}
+actionRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
+    "Action", wx.wxDefaultPosition, wx.wxDefaultSize,
+    actionChoices, 2, wx.wxRA_SPECIFY_COLS)
+actionRadio:SetSelection(lastAction - 1)
+
+-- Z Probe checkbox
+zProbeCheck = wx.wxCheckBox(panel, wx.wxID_ANY, "Probe Z")
+zProbeCheck:SetValue(lastPerformZProbe == 1)
+zProbeCheck:SetToolTip("Probe the top surface first to establish Z reference")
+
+-- Function to update datum description
+local function UpdateDatumDescription()
+    local action = actionRadio:GetSelection() + 1
+    local axisSel = axisRadio:GetSelection() + 1
+    local performZProbe = zProbeCheck:GetValue()
+    
+    local axisStr = ""
+    if axisSel == 1 then
+        axisStr = "X"
+    elseif axisSel == 2 then
+        axisStr = "Y"
+    else
+        axisStr = "X Y"
+    end
+    
+    local description = ""
+    if action == 1 then  -- Set Datum
+        if performZProbe then
+            description = string.format("Datum will be set to:\n• Z0 at top surface (Probe Z enabled)\n• %s at rectangle center", 
+                                       axisStr)
+        else
+            description = string.format("Datum will be set to:\n• Z unchanged (Probe Z disabled)\n• %s at rectangle center",
+                                       axisStr)
+        end
+    else  -- Print Coords
+        if performZProbe then
+            description = string.format("Will print coordinates of:\n• Top surface (Z)\n• Rectangle center (%s)",
+                                       axisStr)
+        else
+            description = string.format("Will print coordinates of:\n• Rectangle center (%s) only",
+                                       axisStr)
+        end
+    end
+    datumText:SetLabel(description)
+    panel:Layout()
+end
+
+-- Function to update Z field enable states
+local function UpdateZFieldStates()
+    local performZProbe = zProbeCheck:GetValue()
+    
+    -- Enable/disable probe depth (enabled when Z probe is checked)
+    probeDepthInput:Enable(performZProbe)
+    probeDepthLabel:SetForegroundColour(performZProbe and wx.wxBLACK or wx.wxColour(UI_CONFIG.COLORS.DISABLED[1], UI_CONFIG.COLORS.DISABLED[2], UI_CONFIG.COLORS.DISABLED[3]))
+    
+    -- Enable/disable Z drop (enabled when Z probe is unchecked)
+    zDropInput:Enable(not performZProbe)
+    zDropLabel:SetForegroundColour(performZProbe and wx.wxColour(UI_CONFIG.COLORS.DISABLED[1], UI_CONFIG.COLORS.DISABLED[2], UI_CONFIG.COLORS.DISABLED[3]) or wx.wxBLACK)
+    
+    UpdateDatumDescription()
+    panel:Layout()
+end
+
+-- Build the UI layout
+-- Instructions
+mainSizer:Add(instructText, 0, wx.wxALL, UI_CONFIG.SPACING.MEDIUM)
+
+-- Axis selection - SINGLE CONTAINER without labels
+local axisBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Axis Selection")
+
+-- Add axis radio directly (no label)
+axisBox:Add(axisRadio, 0, wx.wxEXPAND + GetSpacing(UI_CONFIG.SPACING.SMALL, UI_CONFIG.SPACING.SMALL, UI_CONFIG.SPACING.SMALL, UI_CONFIG.SPACING.SMALL))
+
+-- Add smaller spacer between radio groups
+axisBox:Add(0, UI_CONFIG.SPACING.MEDIUM, 0, wx.wxEXPAND)  -- Reduced from RADIO_BUTTON_GAP (15) to MEDIUM (10)
+
+-- Add probe order radio with tab-like indent (subordinate to axis selection)
+axisBox:Add(axisOrderRadio, 0, wx.wxEXPAND + GetSpacing(UI_CONFIG.SPACING.TAB_INDENT, UI_CONFIG.SPACING.SMALL, 0, UI_CONFIG.SPACING.SMALL))
+
+mainSizer:Add(axisBox, 0, wx.wxALL + wx.wxEXPAND, UI_CONFIG.SPACING.SECTION_GAP)
+
+-- Distance parameters section
+local paramBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Distance Parameters")
+local paramSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+
+-- Auto-center checkbox
+autoCenterCheck = wx.wxCheckBox(panel, wx.wxID_ANY, "Start From Center Mode (enter total width)")
+autoCenterCheck:SetValue(lastAutoCenter == 1)
+paramSizer:Add(autoCenterCheck, 0, wx.wxALL, UI_CONFIG.SPACING.SMALL)
+
+-- X axis inputs on one line
+local xSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+
+minusXLabel = wx.wxStaticText(panel, wx.wxID_ANY, "-X Travel:")
+xSizer:Add(minusXLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, UI_CONFIG.SPACING.SMALL)
+minusXInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastMinusXMin),
+                           wx.wxDefaultPosition, wx.wxSize(UI_CONFIG.INPUT_WIDTHS.TRAVEL, -1))
+minusXInput:SetToolTip("Minimum distance to move in -X")
+xSizer:Add(minusXInput, 0, wx.wxRIGHT, UI_CONFIG.SPACING.MEDIUM)
+
+plusXLabel = wx.wxStaticText(panel, wx.wxID_ANY, "+X Travel:")
+xSizer:Add(plusXLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, UI_CONFIG.SPACING.SMALL)
+plusXInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastPlusXMin), 
+                          wx.wxDefaultPosition, wx.wxSize(UI_CONFIG.INPUT_WIDTHS.TRAVEL, -1))
+plusXInput:SetToolTip("Minimum distance to move in +X")
+xSizer:Add(plusXInput, 0, wx.wxRIGHT, UI_CONFIG.SPACING.MEDIUM)
+
+paramSizer:Add(xSizer, 0, wx.wxEXPAND + GetSpacing(UI_CONFIG.SPACING.SMALL, UI_CONFIG.SPACING.SMALL, UI_CONFIG.SPACING.SMALL, 0))
+
+-- X range display
+xMaxText = wx.wxStaticText(panel, wx.wxID_ANY, "")
+xMaxText:SetForegroundColour(wx.wxColour(UI_CONFIG.COLORS.RANGE_TEXT[1], UI_CONFIG.COLORS.RANGE_TEXT[2], UI_CONFIG.COLORS.RANGE_TEXT[3]))
+xMaxText:SetFont(wx.wxFont(UI_CONFIG.FONTS.SMALL, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
+paramSizer:Add(xMaxText, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, UI_CONFIG.SPACING.SMALL)
+
+-- X width input for center mode - positioned consistently
+local xWidthSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+xWidthLabel = wx.wxStaticText(panel, wx.wxID_ANY, "X Width:")
+xWidthSizer:Add(xWidthLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, UI_CONFIG.SPACING.SMALL)
+xWidthInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastXWidth),
+                           wx.wxDefaultPosition, wx.wxSize(UI_CONFIG.INPUT_WIDTHS.WIDTH, -1))
+xWidthInput:SetToolTip("Total width of the feature in X")
+xWidthSizer:Add(xWidthInput, 0, wx.wxRIGHT, UI_CONFIG.SPACING.MEDIUM)
+xWidthSizer:AddStretchSpacer()
+
+xWidthLabel:Hide()
+xWidthInput:Hide()
+
+paramSizer:Add(xWidthSizer, 0, wx.wxEXPAND + GetSpacing(
+    UI_CONFIG.SPACING.SMALL,    -- left
+    UI_CONFIG.SPACING.SMALL,    -- right  
+    UI_CONFIG.SPACING.SMALL,    -- top
+    0                           -- bottom
+))
+
+-- X range display for center mode
+xCenterRangeText = wx.wxStaticText(panel, wx.wxID_ANY, "")
+xCenterRangeText:SetForegroundColour(wx.wxColour(UI_CONFIG.COLORS.RANGE_TEXT[1], UI_CONFIG.COLORS.RANGE_TEXT[2], UI_CONFIG.COLORS.RANGE_TEXT[3]))
+xCenterRangeText:SetFont(wx.wxFont(UI_CONFIG.FONTS.SMALL, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
+xCenterRangeText:Hide()
+paramSizer:Add(xCenterRangeText, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, UI_CONFIG.SPACING.SMALL)
+
+-- Y axis inputs on one line
+local ySizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+
+minusYLabel = wx.wxStaticText(panel, wx.wxID_ANY, "-Y Travel:")
+ySizer:Add(minusYLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, UI_CONFIG.SPACING.SMALL)
+minusYInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastMinusYMin),
+                           wx.wxDefaultPosition, wx.wxSize(UI_CONFIG.INPUT_WIDTHS.TRAVEL, -1))
+minusYInput:SetToolTip("Minimum distance to move in -Y")
+ySizer:Add(minusYInput, 0, wx.wxRIGHT, UI_CONFIG.SPACING.MEDIUM)
+
+plusYLabel = wx.wxStaticText(panel, wx.wxID_ANY, "+Y Travel:")
+ySizer:Add(plusYLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, UI_CONFIG.SPACING.SMALL)
+plusYInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastPlusYMin),
+                          wx.wxDefaultPosition, wx.wxSize(UI_CONFIG.INPUT_WIDTHS.TRAVEL, -1))
+plusYInput:SetToolTip("Minimum distance to move in +Y")
+ySizer:Add(plusYInput, 0, wx.wxRIGHT, UI_CONFIG.SPACING.MEDIUM)
+
+paramSizer:Add(ySizer, 0, wx.wxEXPAND + GetSpacing(UI_CONFIG.SPACING.SMALL, UI_CONFIG.SPACING.SMALL, UI_CONFIG.SPACING.SMALL, 0))
+
+-- Y range display
+yMaxText = wx.wxStaticText(panel, wx.wxID_ANY, "")
+yMaxText:SetForegroundColour(wx.wxColour(UI_CONFIG.COLORS.RANGE_TEXT[1], UI_CONFIG.COLORS.RANGE_TEXT[2], UI_CONFIG.COLORS.RANGE_TEXT[3]))
+yMaxText:SetFont(wx.wxFont(UI_CONFIG.FONTS.SMALL, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
+paramSizer:Add(yMaxText, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, UI_CONFIG.SPACING.SMALL)
+
+-- Y width input for center mode - MUST USE IDENTICAL SPACING as X
+local yWidthSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+yWidthLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Y Width:")
+yWidthSizer:Add(yWidthLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, UI_CONFIG.SPACING.SMALL)
+yWidthInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastYWidth),
+                            wx.wxDefaultPosition, wx.wxSize(UI_CONFIG.INPUT_WIDTHS.WIDTH, -1))
+yWidthInput:SetToolTip("Total width of the feature in Y")
+yWidthSizer:Add(yWidthInput, 0, wx.wxRIGHT, UI_CONFIG.SPACING.MEDIUM)
+yWidthSizer:AddStretchSpacer()
+
+yWidthLabel:Hide()
+yWidthInput:Hide()
+
+paramSizer:Add(yWidthSizer, 0, wx.wxEXPAND + GetSpacing(
+    UI_CONFIG.SPACING.SMALL,    -- left
+    UI_CONFIG.SPACING.SMALL,    -- right
+    UI_CONFIG.SPACING.SMALL,    -- top  
+    0                           -- bottom
+))
+
+-- Y range display for center mode
+yCenterRangeText = wx.wxStaticText(panel, wx.wxID_ANY, "")
+yCenterRangeText:SetForegroundColour(wx.wxColour(UI_CONFIG.COLORS.RANGE_TEXT[1], UI_CONFIG.COLORS.RANGE_TEXT[2], UI_CONFIG.COLORS.RANGE_TEXT[3]))
+yCenterRangeText:SetFont(wx.wxFont(UI_CONFIG.FONTS.SMALL, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
+yCenterRangeText:Hide()
+paramSizer:Add(yCenterRangeText, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, UI_CONFIG.SPACING.SMALL)
+
+-- Offset, Probe Depth, and Z Drop in grid
+local commonGrid = wx.wxFlexGridSizer(3, 2, UI_CONFIG.SPACING.SMALL, UI_CONFIG.SPACING.MEDIUM)  -- 3 rows now
+
+-- Offset input
+offsetLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Offset:")
+offsetInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastOffset))
+offsetInput:SetToolTip("Added to all min distances to get max search distance")
+commonGrid:Add(offsetLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxALIGN_RIGHT)
+commonGrid:Add(offsetInput, 0, wx.wxEXPAND)
+
+-- Probe Depth input (enabled when Z probe is checked)
+probeDepthLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Probe Depth:")
+probeDepthInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastProbeDepth))
+probeDepthInput:SetToolTip("Distance below surface for XY probing (when surface probed)")
+commonGrid:Add(probeDepthLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxALIGN_RIGHT)
+commonGrid:Add(probeDepthInput, 0, wx.wxEXPAND)
+
+-- Z Drop input (enabled when Z probe is unchecked)
+zDropLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Z Drop:")
+zDropInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastZDrop))
+zDropInput:SetToolTip("Fixed Z drop distance for XY probing (positive value, moves down)")
+commonGrid:Add(zDropLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxALIGN_RIGHT)
+commonGrid:Add(zDropInput, 0, wx.wxEXPAND)
+
+commonGrid:AddGrowableCol(1)
+paramSizer:Add(commonGrid, 0, wx.wxEXPAND + wx.wxALL, UI_CONFIG.SPACING.SMALL)
+
+paramBox:Add(paramSizer, 0, wx.wxEXPAND + wx.wxALL, 0)
+mainSizer:Add(paramBox, 0, wx.wxALL + wx.wxEXPAND, UI_CONFIG.SPACING.MEDIUM)
+
+-- Options section
+local optionsBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Options")
+optionsBox:Add(zProbeCheck, 0, wx.wxALL, UI_CONFIG.SPACING.SMALL)
+optionsBox:Add(actionRadio, 0, wx.wxEXPAND + wx.wxALL, UI_CONFIG.SPACING.SMALL)
+mainSizer:Add(optionsBox, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM + wx.wxEXPAND, UI_CONFIG.SPACING.MEDIUM)
+
+-- Function to update max distance display
+local function UpdateMaxDisplay()
+    local offset = tonumber(offsetInput:GetValue()) or 0
+    
+    if autoCenterCheck:GetValue() then
+        -- Auto-center mode - show ranges from center
+        local xWidth = tonumber(xWidthInput:GetValue()) or 0
+        local yWidth = tonumber(yWidthInput:GetValue()) or 0
+        local axisSel = axisRadio:GetSelection() + 1
+        
+        -- Update X range for center mode
+        if (axisSel == 1 or axisSel == 3) and xWidth > 0 and offset > 0 then
+            local halfX = xWidth / 2
+            xCenterRangeText:SetLabel(string.format("X Range: ±%.3f to ±%.3f from center", 
+                                                   halfX, halfX + offset))
+        else
+            xCenterRangeText:SetLabel("")
+        end
+        
+        -- Update Y range for center mode
+        if (axisSel == 2 or axisSel == 3) and yWidth > 0 and offset > 0 then
+            local halfY = yWidth / 2
+            yCenterRangeText:SetLabel(string.format("Y Range: ±%.3f to ±%.3f from center", 
+                                                   halfY, halfY + offset))
+        else
+            yCenterRangeText:SetLabel("")
+        end
+        
+        xMaxText:SetLabel("")
+        yMaxText:SetLabel("")
+    else
+        -- Normal mode
+        xCenterRangeText:SetLabel("")
+        yCenterRangeText:SetLabel("")
+        
+        local plusXMin = tonumber(plusXInput:GetValue()) or 0
+        local minusXMin = tonumber(minusXInput:GetValue()) or 0
+        if plusXMin >= 0 and minusXMin >= 0 and offset > 0 then
+            xMaxText:SetLabel(string.format("Range: +X %.3f-%.3f, -X %.3f-%.3f", 
+                                          plusXMin, plusXMin + offset,
+                                          minusXMin, minusXMin + offset))
+        else
+            xMaxText:SetLabel("")
+        end
+        
+        local plusYMin = tonumber(plusYInput:GetValue()) or 0
+        local minusYMin = tonumber(minusYInput:GetValue()) or 0
+        if plusYMin >= 0 and minusYMin >= 0 and offset > 0 then
+            yMaxText:SetLabel(string.format("Range: +Y %.3f-%.3f, -Y %.3f-%.3f", 
+                                          plusYMin, plusYMin + offset,
+                                          minusYMin, minusYMin + offset))
+        else
+            yMaxText:SetLabel("")
+        end
+    end
+end
+
+-- Function to update visibility based on axis selection
+local function UpdateVisibility()
+    local axisSel = axisRadio:GetSelection() + 1
+    local isAutoCenter = autoCenterCheck:GetValue()
+    
+    -- Enable/disable axis order selection based on whether Both Axes is selected
+    -- When disabled, it will appear greyed out but remain visible
+    axisOrderRadio:Enable(axisSel == 3)  -- Only enabled when Both Axes selected
+    
+    -- Show/hide X inputs
+    local showX = (axisSel == 1 or axisSel == 3)
+    
+    -- For X axis controls - maintain spacing by showing/hiding entire sections
+    if showX then
+        -- Individual mode controls
+        minusXLabel:Show(not isAutoCenter)
+        minusXInput:Show(not isAutoCenter)
+        plusXLabel:Show(not isAutoCenter)
+        plusXInput:Show(not isAutoCenter)
+        xMaxText:Show(not isAutoCenter)
+        
+        -- Center mode controls
+        xWidthLabel:Show(isAutoCenter)
+        xWidthInput:Show(isAutoCenter)
+        xCenterRangeText:Show(isAutoCenter)
+    else
+        -- Hide all X controls
+        minusXLabel:Hide()
+        minusXInput:Hide()
+        plusXLabel:Hide()
+        plusXInput:Hide()
+        xMaxText:Hide()
+        xWidthLabel:Hide()
+        xWidthInput:Hide()
+        xCenterRangeText:Hide()
+    end
+    
+    -- Show/hide Y inputs
+    local showY = (axisSel == 2 or axisSel == 3)
+    
+    -- For Y axis controls - maintain spacing by showing/hiding entire sections
+    if showY then
+        -- Individual mode controls
+        minusYLabel:Show(not isAutoCenter)
+        minusYInput:Show(not isAutoCenter)
+        plusYLabel:Show(not isAutoCenter)
+        plusYInput:Show(not isAutoCenter)
+        yMaxText:Show(not isAutoCenter)
+        
+        -- Center mode controls
+        yWidthLabel:Show(isAutoCenter)
+        yWidthInput:Show(isAutoCenter)
+        yCenterRangeText:Show(isAutoCenter)
+    else
+        -- Hide all Y controls
+        minusYLabel:Hide()
+        minusYInput:Hide()
+        plusYLabel:Hide()
+        plusYInput:Hide()
+        yMaxText:Hide()
+        yWidthLabel:Hide()
+        yWidthInput:Hide()
+        yCenterRangeText:Hide()
+    end
+    
+    -- Update max displays
+    UpdateMaxDisplay()
+    
+    -- Refresh layout
+    panel:Layout()
+    dlg:Layout()
+end
+
+-- Function to handle auto-center mode with PROPER VALUE PERSISTENCE
+local function UpdateAutoCenter()
+    local isChecked = autoCenterCheck:GetValue()
+    
+    if isChecked then
+        -- Save current individual values
+        modeValues.individual.plusX = tonumber(plusXInput:GetValue()) or modeValues.individual.plusX
+        modeValues.individual.minusX = tonumber(minusXInput:GetValue()) or modeValues.individual.minusX
+        modeValues.individual.plusY = tonumber(plusYInput:GetValue()) or modeValues.individual.plusY
+        modeValues.individual.minusY = tonumber(minusYInput:GetValue()) or modeValues.individual.minusY
+        
+        -- Restore center mode values
+        xWidthInput:SetValue(string.format("%.4f", modeValues.center.xWidth))
+        yWidthInput:SetValue(string.format("%.4f", modeValues.center.yWidth))
+    else
+        -- Save current center values
+        modeValues.center.xWidth = tonumber(xWidthInput:GetValue()) or modeValues.center.xWidth
+        modeValues.center.yWidth = tonumber(yWidthInput:GetValue()) or modeValues.center.yWidth
+        
+        -- Restore individual values
+        plusXInput:SetValue(string.format("%.4f", modeValues.individual.plusX))
+        minusXInput:SetValue(string.format("%.4f", modeValues.individual.minusX))
+        plusYInput:SetValue(string.format("%.4f", modeValues.individual.plusY))
+        minusYInput:SetValue(string.format("%.4f", modeValues.individual.minusY))
+    end
+    
+    UpdateVisibility()
+end
+
+-- Connect events
+plusXInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateMaxDisplay)
+minusXInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateMaxDisplay)
+plusYInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateMaxDisplay)
+minusYInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateMaxDisplay)
+xWidthInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, function(event)
+    modeValues.center.xWidth = tonumber(xWidthInput:GetValue()) or modeValues.center.xWidth
+    UpdateMaxDisplay()
+end)
+yWidthInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, function(event)
+    modeValues.center.yWidth = tonumber(yWidthInput:GetValue()) or modeValues.center.yWidth
+    UpdateMaxDisplay()
+end)
+offsetInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateMaxDisplay)
+probeDepthInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateDatumDescription)
+zDropInput:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateDatumDescription)
+autoCenterCheck:Connect(wx.wxEVT_COMMAND_CHECKBOX_CLICKED, UpdateAutoCenter)
+
+zProbeCheck:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_CHECKBOX_CLICKED, function(event)
+    UpdateZFieldStates()
+end)
+
+actionRadio:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_RADIOBOX_SELECTED, function(event)
+    UpdateDatumDescription()
+end)
+
+axisRadio:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_RADIOBOX_SELECTED, function(event)
+    UpdateDatumDescription()
+    UpdateVisibility()
+end)
+
+-- Initial updates
+UpdateVisibility()
+UpdateMaxDisplay()
+UpdateZFieldStates()  -- Set initial Z field states
+UpdateDatumDescription()
+
+-- Add datum text at bottom
+mainSizer:Add(datumText, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxTOP + wx.wxALIGN_CENTER, UI_CONFIG.SPACING.MEDIUM)
+
+-- Spacer
+mainSizer:Add(0, UI_CONFIG.SPACING.SMALL, 0, wx.wxEXPAND)
+
+-- Buttons
+local buttonSizer = wx.wxStdDialogButtonSizer()
+local okBtn = wx.wxButton(panel, wx.wxID_OK, "OK")
+local cancelBtn = wx.wxButton(panel, wx.wxID_CANCEL, "Cancel")
+
+okBtn:SetMinSize(wx.wxSize(UI_CONFIG.BUTTON.WIDTH, UI_CONFIG.BUTTON.HEIGHT))
+cancelBtn:SetMinSize(wx.wxSize(UI_CONFIG.BUTTON.WIDTH, UI_CONFIG.BUTTON.HEIGHT))
+
+buttonSizer:AddButton(okBtn)
+buttonSizer:AddButton(cancelBtn)
+buttonSizer:Realize()
+
+mainSizer:Add(buttonSizer, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM + wx.wxALIGN_CENTER, UI_CONFIG.SPACING.MEDIUM)
+
+-- Apply layout (Fix A1: attach a dialog sizer so panel expands)
+panel:SetSizer(mainSizer)
+
+local dlgSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+dlgSizer:Add(panel, 1, wx.wxEXPAND)
+dlg:SetSizer(dlgSizer)
+
+dlg:SetMinSize(wx.wxSize(UI_CONFIG.DIALOG_WIDTH, UI_CONFIG.DIALOG_HEIGHT))
+dlg:SetSize(wx.wxSize(UI_CONFIG.DIALOG_WIDTH, UI_CONFIG.DIALOG_HEIGHT))
+dlg:Layout()
+dlg:Centre()
+
+-- ============================================
+-- SHOW DIALOG AND PROCESS
+-- ============================================
+if dlg:ShowModal() == wx.wxID_OK then
+    -- Get values
+    local axisSel = axisRadio:GetSelection() + 1
+    local axisOrder = axisOrderRadio:GetSelection()  -- 0=X first, 1=Y first
+    local isAutoCenter = autoCenterCheck:GetValue()
+    local offset = tonumber(offsetInput:GetValue())
+    local probeDepth = tonumber(probeDepthInput:GetValue())
+    local zDrop = tonumber(zDropInput:GetValue())
+    local actionSel = actionRadio:GetSelection() + 1
+    local performZProbe = zProbeCheck:GetValue()
+    
+    -- Handle auto-center mode
+    local plusXMin, minusXMin, plusYMin, minusYMin
+    
+    if isAutoCenter then
+        -- In auto-center mode, the input is total width
+        local xWidth = tonumber(xWidthInput:GetValue()) or 0
+        local yWidth = tonumber(yWidthInput:GetValue()) or 0
+        plusXMin = xWidth / 2
+        minusXMin = xWidth / 2
+        plusYMin = yWidth / 2
+        minusYMin = yWidth / 2
+    else
+        -- Normal mode - read all values
+        plusXMin = tonumber(plusXInput:GetValue())
+        minusXMin = tonumber(minusXInput:GetValue())
+        plusYMin = tonumber(plusYInput:GetValue())
+        minusYMin = tonumber(minusYInput:GetValue())
+    end
+    
+    -- Validate inputs based on axis selection
+    if axisSel == 1 or axisSel == 3 then  -- X or Both
+        if not plusXMin or plusXMin < 0 then
+            wx.wxMessageBox("Invalid +X minimum distance", "Input Error", wx.wxOK + wx.wxICON_ERROR)
+            dlg:Destroy()
+            return
+        end
+        if not minusXMin or minusXMin < 0 then
+            wx.wxMessageBox("Invalid -X minimum distance", "Input Error", wx.wxOK + wx.wxICON_ERROR)
+            dlg:Destroy()
+            return
+        end
+    end
+    
+    if axisSel == 2 or axisSel == 3 then  -- Y or Both
+        if not plusYMin or plusYMin < 0 then
+            wx.wxMessageBox("Invalid +Y minimum distance", "Input Error", wx.wxOK + wx.wxICON_ERROR)
+            dlg:Destroy()
+            return
+        end
+        if not minusYMin or minusYMin < 0 then
+            wx.wxMessageBox("Invalid -Y minimum distance", "Input Error", wx.wxOK + wx.wxICON_ERROR)
+            dlg:Destroy()
+            return
+        end
+    end
+    
+    if not offset or offset <= 0 then
+        wx.wxMessageBox("Invalid offset value", "Input Error", wx.wxOK + wx.wxICON_ERROR)
+        dlg:Destroy()
+        return
+    end
+    
+    -- Validate Z parameters based on checkbox state
+    if performZProbe then
+        if not probeDepth or probeDepth <= 0 then
+            wx.wxMessageBox("Invalid probe depth value", "Input Error", wx.wxOK + wx.wxICON_ERROR)
+            dlg:Destroy()
+            return
+        end
+    else
+        -- Validate Z drop is positive (downward)
+        if zDrop and zDrop < 0 then
+            wx.wxMessageBox("Z Drop must be a positive value (downward distance)", 
+                           "Input Error", wx.wxOK + wx.wxICON_ERROR)
+            dlg:Destroy()
+            return
+        end
+        if not zDrop or zDrop <= 0 then
+            wx.wxMessageBox("Invalid Z drop value", "Input Error", wx.wxOK + wx.wxICON_ERROR)
+            dlg:Destroy()
+            return
+        end
+    end
+    
+    -- Save settings
+    ProfileSetInt("OutsideCenter", "AxisMode", axisSel)
+    ProfileSetInt("OutsideCenter", "AxisOrder", axisOrder)
+    ProfileSetInt("OutsideCenter", "AutoCenter", isAutoCenter and 1 or 0)
+    ProfileSetFloat("OutsideCenter", "ProbeDepth", probeDepth)
+    ProfileSetFloat("OutsideCenter", "ZDrop", zDrop)
+    ProfileSetFloat("OutsideCenter", "Offset", offset)
+    ProfileSetInt("OutsideCenter", "ActionMode", actionSel)
+    ProfileSetInt("OutsideCenter", "PerformZProbe", performZProbe and 1 or 0)
+    
+    -- Save both individual AND center values separately
+    if isAutoCenter then
+        -- Save center mode values
+        local xWidth = tonumber(xWidthInput:GetValue()) or 0
+        local yWidth = tonumber(yWidthInput:GetValue()) or 0
+        ProfileSetFloat("OutsideCenter", "CenterXWidth", xWidth)
+        ProfileSetFloat("OutsideCenter", "CenterYWidth", yWidth)
+        -- Also save the individual values that were preserved
+        ProfileSetFloat("OutsideCenter", "IndividualPlusXMin", modeValues.individual.plusX)
+        ProfileSetFloat("OutsideCenter", "IndividualMinusXMin", modeValues.individual.minusX)
+        ProfileSetFloat("OutsideCenter", "IndividualPlusYMin", modeValues.individual.plusY)
+        ProfileSetFloat("OutsideCenter", "IndividualMinusYMin", modeValues.individual.minusY)
+    else
+        -- Save individual mode values
+        ProfileSetFloat("OutsideCenter", "IndividualPlusXMin", plusXMin or 0.5)
+        ProfileSetFloat("OutsideCenter", "IndividualMinusXMin", minusXMin or 0.5)
+        ProfileSetFloat("OutsideCenter", "IndividualPlusYMin", plusYMin or 0.5)
+        ProfileSetFloat("OutsideCenter", "IndividualMinusYMin", minusYMin or 0.5)
+        -- Also save the center values that were preserved
+        ProfileSetFloat("OutsideCenter", "CenterXWidth", modeValues.center.xWidth)
+        ProfileSetFloat("OutsideCenter", "CenterYWidth", modeValues.center.yWidth)
+    end
+    
+    dlg:Destroy()
+    
+    -- ============================================
+    -- MAIN PROBE EXECUTION
+    -- ============================================
+    local function ExecuteOutsideCenterProbe()
+        -- Save state BEFORE any operations - SIMPLIFIED (no G68)
+        local startState = {
+            -- Machine positions for ALL movements
+            machX = mc.mcAxisGetMachinePos(inst, 0),
+            machY = mc.mcAxisGetMachinePos(inst, 1),
+            machZ = mc.mcAxisGetMachinePos(inst, 2),
+            
+            -- Work positions for display/logging ONLY
+            workX = mc.mcAxisGetPos(inst, mc.X_AXIS),
+            workY = mc.mcAxisGetPos(inst, mc.Y_AXIS),
+            workZ = mc.mcAxisGetPos(inst, mc.Z_AXIS),
+            
+            -- Action mode
+            actionMode = actionSel
+        }
+        
+        -- Save critical pound variables for rollback
+        local savedPoundVars = {
+            [305] = mc.mcCntlGetPoundVar(inst, 305),  -- Max travel
+            [395] = mc.mcCntlGetPoundVar(inst, 395),  -- Surface Z
+            [396] = mc.mcCntlGetPoundVar(inst, 396),  -- Safe plane
+            [397] = mc.mcCntlGetPoundVar(inst, 397)   -- Probe plane
+        }
+        
+        -- Main probe sequence variables
+        local success = false
+        local datumWasSet = false
+        local errorMsg = nil
+        
+        -- CRITICAL: Use xpcall for better error handling
+        local ok, err = xpcall(
+            function()
+                                
+                -- Initialize probe log
+                local profileName = mc.mcProfileGetName(inst)
+                local probeLogPath = mc.mcCntlGetMachDir(inst) .. "\\Profiles\\" .. profileName .. "\\ProbeLog.csv"
+                local logFile = io.open(probeLogPath, "a")
+                if logFile then
+                    -- Write header if file is new/empty
+                    local fileSize = logFile:seek("end")
+                    if fileSize == 0 then
+                        logFile:write("Timestamp,Method,X,Y,Z\n")
+                    end
+                    logFile:close()
+                end
+                
+                -- Helper function to log probe events
+                local function LogProbeEvent(method, x, y, z)
+                    local ok, err = pcall(function()
+                        local logFile = io.open(probeLogPath, "a")
+                        if logFile then
+                            local timestamp = os.date("%Y-%m-%d %H:%M:%S")
+                            local logEntry = string.format("%s,%s,%.4f,%.4f,%.4f\n",
+                                timestamp, method, x, y, z)
+                            logFile:write(logEntry)
+                            logFile:close()
+                        end
+                    end)
+                end
+                
+                -- Get probe parameters from pound variables
+                local xProbeOffset = mc.mcCntlGetPoundVar(inst, 301)
+                local yProbeOffset = mc.mcCntlGetPoundVar(inst, 302)
+                local fastFeed = mc.mcCntlGetPoundVar(inst, 303)
+                local slowFeed = mc.mcCntlGetPoundVar(inst, 304)
+                local maxTravel = mc.mcCntlGetPoundVar(inst, 305)
+                local liftHeight = mc.mcCntlGetPoundVar(inst, 321) or 1.0  -- Default to 1" if not set
+                
+                -- Validate and set defaults
+                if type(xProbeOffset) ~= "number" then xProbeOffset = 0 end
+                if type(yProbeOffset) ~= "number" then yProbeOffset = 0 end
+                if type(fastFeed) ~= "number" or fastFeed <= 0 then fastFeed = 30 end
+                if type(slowFeed) ~= "number" or slowFeed <= 0 then slowFeed = 5 end
+                if type(maxTravel) ~= "number" or maxTravel <= 0 then maxTravel = 1.0 end
+                if type(liftHeight) ~= "number" or liftHeight <= 0 then liftHeight = 1.0 end
+                
+                -- Check for uninitialized pound variables
+                if xProbeOffset < -1e300 or yProbeOffset < -1e300 or fastFeed < -1e300 or 
+                   slowFeed < -1e300 or maxTravel < -1e300 then
+                    local msg = "PROBE CONFIGURATION ERROR\n\n" ..
+                                "Probe parameters not initialized.\n\n" ..
+                                "Please set pound variables:\n" ..
+                                "#301 = X offset from spindle to probe\n" ..
+                                "#302 = Y offset from spindle to probe\n" ..
+                                "#303 = Fast probe feedrate\n" ..
+                                "#304 = Slow probe feedrate\n" ..
+                                "#305 = Maximum probe travel distance"
+                    wx.wxMessageBox(msg, "Configuration Error", wx.wxOK + wx.wxICON_ERROR)
+                    error("Probe parameters not initialized. Set #301-305")
+                end
+                
+                -- Show initial status
+                local modeStr = isAutoCenter and "Start From Center" or "Individual distances"
+                local zProbeStr = performZProbe and "with surface probe" or "without surface probe"
+                --mc.mcCntlSetLastError(inst, string.format("Outside center probe starting (%s mode, %s)", modeStr, zProbeStr))
+                
+                -- ============================================
+                -- PHASE 1: CONDITIONAL Z PROBE
+                -- ============================================
+                local surfaceMachZ, safePlaneMachZ, probePlaneMachZ
+                local surfaceWorkZ  -- For display only
+                
+                if performZProbe then
+					--mc.mcCntlSetLastError(inst, "Probing surface...")
+					
+					-- Enable sentinel mode for M311 v1.4.0+
+					mc.mcCntlSetPoundVar(inst, 388, 1)  -- NEW: Set sentinel mode flag
+					
+					-- Set sentinel values before probe
+					mc.mcCntlSetPoundVar(inst, 389, SENTINEL_VALUE)
+					mc.mcCntlSetPoundVar(inst, 390, SENTINEL_VALUE)
+					mc.mcCntlSetPoundVar(inst, 391, SENTINEL_VALUE)
+					mc.mcCntlSetPoundVar(inst, 392, SENTINEL_VALUE)
+					
+					-- Perform Z probe using S5 M311
+					local rc = mc.mcCntlGcodeExecuteWait(inst, "S5 M311")
+					
+					-- Clear sentinel mode flag (M311 v1.4.0 does this but be explicit)
+                    mc.mcCntlSetPoundVar(inst, 388, 0)  -- NEW: Clear flag after probe
+                    
+                    -- Check for probe failure using sentinel
+                    surfaceMachZ = mc.mcCntlGetPoundVar(inst, 389)  -- Machine coordinate
+                    if surfaceMachZ == SENTINEL_VALUE then
+                        local msg = string.format(
+                            "Z PROBE FAILURE\n\n" ..
+                            "The probe did not make contact within %.3f inches.\n\n" ..
+                            "Possible causes:\n" ..
+                            "• Probe not connected or not triggered\n" ..
+                            "• Surface is beyond probe travel distance\n" ..
+                            "• Probe may be damaged or disconnected\n\n" ..
+                            "The probe sequence has stopped.",
+                            maxTravel or 0.5)
+                        
+                        wx.wxMessageBox(msg, "Probe Failure", wx.wxOK + wx.wxICON_ERROR)
+                        -- REMOVED: mc.mcCntlCycleStop(inst)
+                        error("Z probe failed - no surface detected")
+                    end
+                    
+                    -- Get work coordinate for display
+                    surfaceWorkZ = mc.mcCntlGetPoundVar(inst, 391)
+                    
+                    -- Log the Z probe
+                    LogProbeEvent("S5 M311", startState.workX, startState.workY, surfaceWorkZ)
+                    
+                    -- Calculate working planes in MACHINE coordinates
+                    safePlaneMachZ = surfaceMachZ + liftHeight
+                    probePlaneMachZ = surfaceMachZ - probeDepth
+                    
+                    -- For display, show work coordinates
+                  --  mc.mcCntlSetLastError(inst, string.format("Surface at Z%.4f, safe plane at Z%.4f", 
+                    --                                         surfaceWorkZ, surfaceWorkZ + liftHeight))
+                else
+                    -- No Z probe - use current MACHINE position and Z drop
+                   -- mc.mcCntlSetLastError(inst, "Skipping surface probe - using fixed Z drop")
+                    surfaceMachZ = nil  -- No surface reference
+                    safePlaneMachZ = startState.machZ  -- Current position is safe plane
+                    probePlaneMachZ = startState.machZ - zDrop  -- Simple drop from current
+                    
+                  --  mc.mcCntlSetLastError(inst, string.format("Using Z drop: %.4f from current position", zDrop))
+                end
+                
+                -- Check if planes exceed Z soft limits
+                local zSoftMin, rc1 = mc.mcAxisGetSoftlimitMin(inst, mc.Z_AXIS)
+                local zSoftMax, rc2 = mc.mcAxisGetSoftlimitMax(inst, mc.Z_AXIS)
+                local zSoftEnabled = mc.mcSoftLimitGetState(inst, mc.Z_AXIS)
+                
+                 if zSoftEnabled == 1 and rc1 == mc.MERROR_NOERROR and rc2 == mc.MERROR_NOERROR then
+                    if safePlaneMachZ > zSoftMax - 0.010 then
+                        local msg = string.format(
+                            "Z SOFT LIMIT ERROR\n\n" ..
+                            "Safe plane (Z%.3f) would exceed Z soft limit (%.3f).\n\n" ..
+                            "Possible solutions:\n" ..
+                            "• Lower the probe start position\n" ..
+                            "• Reduce lift height (#321)\n" ..
+                            "• Adjust Z soft limits if safe to do so",
+                            safePlaneMachZ, zSoftMax)
+                        wx.wxMessageBox(msg, "Soft Limit Error", wx.wxOK + wx.wxICON_ERROR)
+                        error(string.format("Safe plane would exceed Z soft limit"))
+                    end
+                    
+                    if probePlaneMachZ < zSoftMin + 0.010 then
+                        local msg = string.format(
+                            "Z SOFT LIMIT ERROR\n\n" ..
+                            "Probe plane (Z%.3f) would exceed Z soft limit (%.3f).\n\n" ..
+                            "Possible solutions:\n" ..
+                            "• Raise the probe start position\n" ..
+                            "• Reduce probe depth setting\n" ..
+                            "• Adjust Z soft limits if safe to do so",
+                            probePlaneMachZ, zSoftMin)
+                        wx.wxMessageBox(msg, "Soft Limit Error", wx.wxOK + wx.wxICON_ERROR)
+                        error(string.format("Probe plane would exceed Z soft limit"))
+                    end
+                end
+                
+                -- Store for error recovery
+                mc.mcCntlSetPoundVar(inst, 395, surfaceMachZ or -1e308)  -- Surface reference (or invalid if not probed)
+                mc.mcCntlSetPoundVar(inst, 396, safePlaneMachZ)  -- Safe plane
+                mc.mcCntlSetPoundVar(inst, 397, probePlaneMachZ) -- Probe plane
+                
+                -- Move to safe plane if we performed Z probe (upward move, no collision protection needed)
+                if performZProbe then
+                    mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 Z%.4f", safePlaneMachZ))
+                end
+                -- If no Z probe, we're already at safe plane (current position)
+                
+                -- ============================================
+                -- PHASE 2: XY PROBING
+                -- ============================================
+                -- Store probe results in BOTH machine and work coordinates
+                local probePoints = {}
+                local probeMachinePoints = {}  -- Store machine coordinates
+                
+                -- Track probe progress for error reporting
+                local probeProgress = {
+                    attempted = {},
+                    completed = {},
+                    failed = nil
+                }
+                
+                -- Define probe directions based on axis selection
+                local directions = {}
+                
+                if axisSel == 1 or axisSel == 3 then  -- X or Both
+                    table.insert(directions, {name = "+X", axis = mc.X_AXIS, x = 1, y = 0, 
+                                             probe = "S2 M311", minDist = plusXMin, maxDist = plusXMin + offset})
+                    table.insert(directions, {name = "-X", axis = mc.X_AXIS, x = -1, y = 0, 
+                                             probe = "S1 M311", minDist = minusXMin, maxDist = minusXMin + offset})
+                end
+                
+                if axisSel == 2 or axisSel == 3 then  -- Y or Both
+                    table.insert(directions, {name = "+Y", axis = mc.Y_AXIS, x = 0, y = 1, 
+                                             probe = "S4 M311", minDist = plusYMin, maxDist = plusYMin + offset})
+                    table.insert(directions, {name = "-Y", axis = mc.Y_AXIS, x = 0, y = -1, 
+                                             probe = "S3 M311", minDist = minusYMin, maxDist = minusYMin + offset})
+                end
+                
+                -- Apply axis order if both axes selected
+                if axisSel == 3 and axisOrder == 1 then  -- Y first
+                    -- Swap X and Y pairs
+                    local temp = {directions[1], directions[2]}
+                    directions[1] = directions[3]
+                    directions[2] = directions[4]
+                    directions[3] = temp[1]
+                    directions[4] = temp[2]
+                end
+                
+                -- Calculate smart retreat distance based on probe capability
+                local function CalculateSmartRetreat(probeMaxTravel, remainingDist)
+                    -- Use 1" intervals if probe can handle it, else 90% of probe max
+                    local retryInterval
+                    if probeMaxTravel >= 1.0 then
+                        retryInterval = 1.0  -- Standard 1" retry interval
+                    else
+                        retryInterval = probeMaxTravel * 0.9  -- Limited probe, use 90% of capability
+                    end
+                    
+                    -- Don't exceed remaining distance
+                    return math.min(retryInterval, remainingDist)
+                end
+                
+                -- Probe each direction
+                for i, dir in ipairs(directions) do
+                    table.insert(probeProgress.attempted, dir.name)
+                    
+                    local currentDist = dir.minDist
+                    local maxDist = dir.maxDist
+                    
+                    -- Check soft limits and clamp if needed
+                    local currentMachPos = mc.mcAxisGetMachinePos(inst, dir.axis)
+                    local maxSafeTravel = GetMaxSafeTravel(dir.axis, dir.x + dir.y, currentMachPos)
+                    
+                    if maxSafeTravel < currentDist then
+                        local msg = string.format(
+                            "%s SOFT LIMIT ERROR\n\n" ..
+                            "Cannot reach minimum probe distance (%.3f\") due to soft limits.\n" ..
+                            "Available travel: %.3f\"\n\n" ..
+                            "Possible solutions:\n" ..
+                            "• Move probe closer to the part\n" ..
+                            "• Reduce the minimum probe distance\n" ..
+                            "• Adjust soft limits if safe to do so",
+                            dir.name, currentDist, maxSafeTravel)
+                        wx.wxMessageBox(msg, "Soft Limit Error", wx.wxOK + wx.wxICON_ERROR)
+                        error(string.format("Cannot reach minimum probe distance for %s due to soft limits", dir.name))
+                    end
+                    
+                    -- Clamp maximum distance to soft limit
+                    if maxSafeTravel < maxDist then
+                        mc.mcCntlSetLastError(inst, string.format(
+                            "%s probe distance reduced from %.3f to %.3f due to soft limits",
+                            dir.name, maxDist, maxSafeTravel))
+                        maxDist = maxSafeTravel
+                    end
+                    
+                    local success = false
+                    local attemptNum = 0
+                    local maxAttempts = 10  -- Reasonable limit
+                    
+                    -- Use MACHINE coordinates for all movements
+                    local probeStartMachX = startState.machX
+                    local probeStartMachY = startState.machY
+                    
+                    if (dir.name == "+Y" or dir.name == "-Y") and probeMachinePoints.xPlus and probeMachinePoints.xMinus then
+                        -- Center on X using MACHINE coordinates
+                        probeStartMachX = (probeMachinePoints.xPlus + probeMachinePoints.xMinus) / 2.0
+                        -- Move to X center at safe height using G53
+                        mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 X%.4f", probeStartMachX))
+                    elseif (dir.name == "+X" or dir.name == "-X") and probeMachinePoints.yPlus and probeMachinePoints.yMinus then
+                        -- Center on Y using MACHINE coordinates
+                        probeStartMachY = (probeMachinePoints.yPlus + probeMachinePoints.yMinus) / 2.0
+                        mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 Y%.4f", probeStartMachY))
+                    end
+                    
+                    while not success and currentDist <= maxDist and attemptNum < maxAttempts do
+                        attemptNum = attemptNum + 1
+                        
+                        -- 1. Move to distance position at safe plane using MACHINE coordinates
+                        local targetMachX = probeStartMachX + (dir.x * currentDist)
+                        local targetMachY = probeStartMachY + (dir.y * currentDist)
+                        local moveCmd = string.format("G53 G0 X%.4f Y%.4f", targetMachX, targetMachY)
+                        mc.mcCntlGcodeExecuteWait(inst, moveCmd)
+                        
+                        -- Verify probe not triggered before Z drop (no movement attempt)
+                        if mc.mcSignalGetState(inst, PROBE_SIGNAL) == 1 then
+                            local msg = string.format(
+                                "%s PROBE STUCK\n\n" ..
+                                "Probe is already triggered before Z drop.\n\n" ..
+                                "Possible causes:\n" ..
+                                "• Probe tip is touching something\n" ..
+                                "• Probe cable fault or short circuit\n" ..
+                                "• Probe needs to be reset\n\n" ..
+                                "Clear the probe and retry.",
+                                dir.name)
+                            wx.wxMessageBox(msg, "Probe Stuck", wx.wxOK + wx.wxICON_ERROR)
+                            error(string.format("Probe stuck triggered before %s Z drop - aborting", dir.name))
+                        end
+                        
+                        -- 2. Drop to probe plane with collision detection using MACHINE coordinates
+                        local zProbeCmd = string.format("G53 G31.1 Z%.4f F%.1f", probePlaneMachZ, fastFeed)
+                        mc.mcCntlGcodeExecuteWait(inst, zProbeCmd)
+                        
+                        -- Check if we hit something during Z drop
+                        local actualMachZ = mc.mcAxisGetMachinePos(inst, mc.Z_AXIS)
+                        if math.abs(actualMachZ - probePlaneMachZ) > 0.001 then
+                            -- Hit something - log the Z collision
+                            LogProbeEvent("G31.1-Z", 
+                                mc.mcAxisGetPos(inst, mc.X_AXIS),
+                                mc.mcAxisGetPos(inst, mc.Y_AXIS),
+                                mc.mcAxisGetPos(inst, mc.Z_AXIS))
+                            
+							-- Return to safe plane using MACHINE coordinates
+                            mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 Z%.4f", safePlaneMachZ))
+                            
+                            -- Calculate smart retreat
+                            local remainingDist = maxDist - currentDist
+                            local retreat = CalculateSmartRetreat(maxTravel, remainingDist)
+                            local nextDist = currentDist + retreat
+                            
+                            -- Check if we can extend further
+                            if nextDist > maxDist then
+                                -- Recalculate current position for accurate soft limit check
+                                local freshMachPos = mc.mcAxisGetMachinePos(inst, dir.axis)
+                                local maxSafe = GetMaxSafeTravel(dir.axis, dir.x + dir.y, freshMachPos)
+                                
+                                if maxSafe > currentDist + 0.010 then
+                                    nextDist = math.min(maxSafe, maxDist)
+                                    mc.mcCntlSetLastError(inst, string.format(
+                                        "%s collision - extending to soft limit (%.3f)", 
+                                        dir.name, nextDist))
+                                else
+                                    local msg = string.format(
+                                        "%s PROBE BLOCKED\n\n" ..
+                                        "Probe collided with part while extending to soft limit.\n" ..
+                                        "Cannot probe any further in this direction.\n\n" ..
+                                        "Possible solutions:\n" ..
+                                        "• Check part positioning\n" ..
+                                        "• Verify probe is above the correct feature\n" ..
+                                        "• Increase the offset distance if part is larger than expected",
+                                        dir.name)
+                                    wx.wxMessageBox(msg, "Probe Blocked", wx.wxOK + wx.wxICON_ERROR)
+                                    error(string.format("Z collision at %s soft limit - cannot probe further", dir.name))
+                                end
+                            else
+                                mc.mcCntlSetLastError(inst, string.format(
+                                    "%s collision - retrying at %.3f (attempt %d/%d)", 
+                                    dir.name, nextDist, attemptNum, maxAttempts))
+                            end
+                            
+                            -- Check if we're stuck at the same position
+                            if math.abs(nextDist - currentDist) < 0.001 then
+                                local msg = string.format(
+                                    "%s PROBE BLOCKED\n\n" ..
+                                    "Cannot extend probe beyond %.3f\" due to repeated collisions.\n" ..
+                                    "Part edge is beyond reachable distance.\n\n" ..
+                                    "Possible solutions:\n" ..
+                                    "• Move probe closer to the part center\n" ..
+                                    "• Verify probe is positioned above the part\n" ..
+                                    "• Check that part size matches expectations",
+                                    dir.name, currentDist)
+                                wx.wxMessageBox(msg, "Probe Blocked", wx.wxOK + wx.wxICON_ERROR)
+                                error(string.format("%s probe blocked - cannot make progress", dir.name))
+                            end
+                            
+                            currentDist = nextDist
+                        else
+                            -- Z drop successful, proceed with probe
+                            success = true
+                            
+                            -- 3. Enable sentinel mode and set values before probe
+							mc.mcCntlSetPoundVar(inst, 388, 1)  -- Set sentinel mode flag
+							mc.mcCntlSetPoundVar(inst, 389, SENTINEL_VALUE)
+							mc.mcCntlSetPoundVar(inst, 390, SENTINEL_VALUE)
+							mc.mcCntlSetPoundVar(inst, 391, SENTINEL_VALUE)
+							mc.mcCntlSetPoundVar(inst, 392, SENTINEL_VALUE)
+							
+							-- Probe inward
+							local rc = mc.mcCntlGcodeExecuteWait(inst, dir.probe)
+							
+							-- Clear sentinel mode flag
+							mc.mcCntlSetPoundVar(inst, 388, 0)  -- NEW: Clear flag after probe
+							
+							-- Check for probe failure using sentinel
+                            local edgeMachine = mc.mcCntlGetPoundVar(inst, 389)  -- Machine coordinate
+                            local edgeWork = mc.mcCntlGetPoundVar(inst, 391)     -- Work coordinate for display
+                            
+                            if edgeMachine == SENTINEL_VALUE then
+                                local msg = string.format(
+                                    "%s PROBE FAILURE\n\n" ..
+                                    "The probe did not make contact within %.3f inches.\n\n" ..
+                                    "Possible causes:\n" ..
+                                    "• Probe not connected or not triggered\n" ..
+                                    "• Edge is beyond probe travel distance\n" ..
+                                    "• Part may be missing or misaligned\n\n" ..
+                                    "The probe sequence has stopped.",
+                                    dir.name, maxTravel or 0.5)
+                                
+                                wx.wxMessageBox(msg, "Probe Failure", wx.wxOK + wx.wxICON_ERROR)
+                                -- REMOVED: mc.mcCntlCycleStop(inst)
+                                error(string.format("%s probe failed", dir.name))
+                            end
+                            
+                            -- Log the probe trigger
+                            local logX = mc.mcAxisGetPos(inst, mc.X_AXIS)
+                            local logY = mc.mcAxisGetPos(inst, mc.Y_AXIS)
+                            local logZ = mc.mcAxisGetPos(inst, mc.Z_AXIS)
+                            
+                            if dir.name == "+X" or dir.name == "-X" then
+                                logX = edgeWork
+                            else
+                                logY = edgeWork
+                            end
+                            
+                            LogProbeEvent(dir.probe, logX, logY, logZ)
+                            
+                            -- Store BOTH machine and work coordinates
+                            if dir.name == "+X" then
+                                probeMachinePoints.xPlus = edgeMachine
+                                probePoints.xPlus = edgeWork
+                            elseif dir.name == "-X" then
+                                probeMachinePoints.xMinus = edgeMachine
+                                probePoints.xMinus = edgeWork
+                            elseif dir.name == "+Y" then
+                                probeMachinePoints.yPlus = edgeMachine
+                                probePoints.yPlus = edgeWork
+                            else
+                                probeMachinePoints.yMinus = edgeMachine
+                                probePoints.yMinus = edgeWork
+                            end
+                            
+                            -- Record successful probe
+                            table.insert(probeProgress.completed, dir.name)
+                        end
+                        
+                        -- 4. Always return to safe plane using MACHINE coordinates (upward move, no collision protection)
+                        mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 Z%.4f", safePlaneMachZ))
+                    end
+                    
+                    if not success then
+                        -- Record what failed and what succeeded
+                        probeProgress.failed = dir.name
+                        
+                        local completedStr = "None"
+                        if #probeProgress.completed > 0 then
+                            completedStr = table.concat(probeProgress.completed, ", ")
+                        end
+                        
+                        local msg = string.format(
+                            "Probe sequence aborted at: %s\n\n" ..
+                            "Successfully completed: %s\n" ..
+                            "Failed: %s\n\n" ..
+                            "NO DATUM HAS BEEN SET.\n" ..
+                            "Machine stopped at current position.",
+                            dir.name, completedStr, dir.name)
+                        
+                        wx.wxMessageBox(msg, "Probe Sequence Aborted", wx.wxOK + wx.wxICON_ERROR)
+                        error(string.format("Probe sequence aborted at %s - no datum set", dir.name))
+                    end
+                end
+                
+                -- ============================================
+                -- PHASE 2.5: VALIDATE ALL REQUIRED DATA COLLECTED
+                -- ============================================
+                local allProbesSucceeded = true
+                local missingProbes = {}
+                
+                -- Check what we expected vs what we got
+                if axisSel == 1 or axisSel == 3 then  -- Expected X
+                    if not probeMachinePoints.xPlus or not probeMachinePoints.xMinus then
+                        allProbesSucceeded = false
+                        table.insert(missingProbes, "X")
+                    end
+                end
+                
+                if axisSel == 2 or axisSel == 3 then  -- Expected Y
+                    if not probeMachinePoints.yPlus or not probeMachinePoints.yMinus then
+                        allProbesSucceeded = false
+                        table.insert(missingProbes, "Y")
+                    end
+                end
+                
+                if performZProbe and not surfaceMachZ then
+                    allProbesSucceeded = false
+                    table.insert(missingProbes, "Z")
+                end
+                
+                -- Only proceed if ALL expected probes succeeded
+                if not allProbesSucceeded then
+                    local msg = string.format(
+                        "PROBE INCOMPLETE - NO DATUM SET\n\n" ..
+                        "Missing data for: %s\n" ..
+                        "No changes were made to work offsets.\n\n" ..
+                        "Machine is stopped at current position.\n" ..
+                        "Clear any issues and retry the probe operation.",
+                        table.concat(missingProbes, ", "))
+                    wx.wxMessageBox(msg, "Probe Incomplete", wx.wxOK + wx.wxICON_WARNING)
+                    error("Probe sequence incomplete - datum not set")
+                end
+                
+             --   mc.mcCntlSetLastError(inst, "All probes successful - proceeding to calculate center")
+                
+                -- ============================================
+                -- PHASE 3: CALCULATE CENTER AND MOVE
+                -- ============================================
+                local centerMachX, centerMachY  -- Machine coordinates for movement
+                local centerWorkX, centerWorkY  -- Work coordinates for display
+                local widthX, widthY
+                
+                if probeMachinePoints.xPlus and probeMachinePoints.xMinus then
+                    centerMachX = (probeMachinePoints.xPlus + probeMachinePoints.xMinus) / 2.0
+                    centerWorkX = (probePoints.xPlus + probePoints.xMinus) / 2.0
+                    widthX = probePoints.xPlus - probePoints.xMinus
+                else
+                    centerMachX = startState.machX  -- Keep original machine X if not probed
+                    centerWorkX = startState.workX  -- Keep original work X for display
+                end
+                
+                if probeMachinePoints.yPlus and probeMachinePoints.yMinus then
+                    centerMachY = (probeMachinePoints.yPlus + probeMachinePoints.yMinus) / 2.0
+                    centerWorkY = (probePoints.yPlus + probePoints.yMinus) / 2.0
+                    widthY = probePoints.yPlus - probePoints.yMinus
+                else
+                    centerMachY = startState.machY  -- Keep original machine Y if not probed
+                    centerWorkY = startState.workY  -- Keep original work Y for display
+                end
+                
+                -- Validate widths are non-zero (probe must have moved)
+                if widthX and math.abs(widthX) <= 0.0001 then
+                    local msg = "INVALID X MEASUREMENT\n\n" ..
+                                "Both X probes contacted at the same point.\n" ..
+                                "Measured width: ~0.0000\"\n\n" ..
+                                "Possible causes:\n" ..
+                                "• Probe is not over the part\n" ..
+                                "• Part is missing or misaligned\n" ..
+                                "• Probe travel distance too small"
+                    wx.wxMessageBox(msg, "Measurement Error", wx.wxOK + wx.wxICON_ERROR)
+                    error("Invalid X measurement - probe hit same point. Check fixture and retry.")
+                end
+                if widthY and math.abs(widthY) <= 0.0001 then
+                    local msg = "INVALID Y MEASUREMENT\n\n" ..
+                                "Both Y probes contacted at the same point.\n" ..
+                                "Measured width: ~0.0000\"\n\n" ..
+                                "Possible causes:\n" ..
+                                "• Probe is not over the part\n" ..
+                                "• Part is missing or misaligned\n" ..
+                                "• Probe travel distance too small"
+                    wx.wxMessageBox(msg, "Measurement Error", wx.wxOK + wx.wxICON_ERROR)
+                    error("Invalid Y measurement - probe hit same point. Check fixture and retry.")
+                end
+                
+                -- Final dimension report
+                local dimMsg = "Rectangle dimensions:"
+                if widthX then dimMsg = dimMsg .. string.format(" X=%.4f", widthX) end
+                if widthY then dimMsg = dimMsg .. string.format(" Y=%.4f", widthY) end
+                if performZProbe and surfaceWorkZ then
+                    dimMsg = dimMsg .. string.format(", Surface Z=%.4f", surfaceWorkZ)
+                end
+                mc.mcCntlSetLastError(inst, dimMsg)
+                
+                -- Move to measured center using MACHINE coordinates
+                local moveCmd = "G53 G0"
+                if probeMachinePoints.xPlus and probeMachinePoints.xMinus then
+                    moveCmd = moveCmd .. string.format(" X%.4f", centerMachX)
+                end
+                if probeMachinePoints.yPlus and probeMachinePoints.yMinus then
+                    moveCmd = moveCmd .. string.format(" Y%.4f", centerMachY)
+                end
+                if moveCmd ~= "G53 G0" then
+                    mc.mcCntlGcodeExecuteWait(inst, moveCmd)
+                end
+                
+                -- ============================================
+                -- PHASE 4: VALIDATE ALL REQUIRED DATA COLLECTED
+                -- ============================================
+                local allProbesSucceeded = true
+                local missingProbes = {}
+                
+                -- Check what we expected vs what we got
+                if axisSel == 1 or axisSel == 3 then  -- Expected X
+                    if not probeMachinePoints.xPlus or not probeMachinePoints.xMinus then
+                        allProbesSucceeded = false
+                        table.insert(missingProbes, "X")
+                    end
+                end
+                
+                if axisSel == 2 or axisSel == 3 then  -- Expected Y
+                    if not probeMachinePoints.yPlus or not probeMachinePoints.yMinus then
+                        allProbesSucceeded = false
+                        table.insert(missingProbes, "Y")
+                    end
+                end
+                
+                if performZProbe and not surfaceMachZ then
+                    allProbesSucceeded = false
+                    table.insert(missingProbes, "Z")
+                end
+                
+                -- Only proceed if ALL expected probes succeeded
+                if not allProbesSucceeded then
+                    local msg = string.format(
+                        "PROBE INCOMPLETE - NO DATUM SET\n\n" ..
+                        "Missing data for: %s\n" ..
+                        "No changes were made to work offsets.\n\n" ..
+                        "Please retry the probe operation.",
+                        table.concat(missingProbes, ", "))
+                    wx.wxMessageBox(msg, "Probe Incomplete", wx.wxOK + wx.wxICON_WARNING)
+                    error("Probe sequence incomplete - datum not set")
+                end
+                
+                -- ============================================
+                -- PHASE 5: SET DATUM OR PRINT (only if all succeeded)
+                -- ============================================
+                if actionSel == 1 then  -- Set Datum
+                    -- Get current work offset
+                    local modalOffset = mc.mcCntlGetPoundVar(inst, 4014)
+                    local currentOffset = 54  -- Default G54
+                    if type(modalOffset) == "number" and modalOffset >= 54 and modalOffset <= 59 then
+                        currentOffset = math.floor(modalOffset + 0.5)
+                    end
+                    
+                    -- Work offset variable mapping
+                    local workOffsetVars = {
+                        [54] = {x = 5221, y = 5222, z = 5223},  -- G54
+                        [55] = {x = 5241, y = 5242, z = 5243},  -- G55
+                        [56] = {x = 5261, y = 5262, z = 5263},  -- G56
+                        [57] = {x = 5281, y = 5282, z = 5283},  -- G57
+                        [58] = {x = 5301, y = 5302, z = 5303},  -- G58
+                        [59] = {x = 5321, y = 5322, z = 5323}   -- G59
+                    }
+                    
+                    local offsets = workOffsetVars[currentOffset]
+                    if offsets then
+                        -- We already have machine positions from probing
+                        local datumMachX = nil
+                        local datumMachY = nil
+                        local datumMachZ = nil
+                        
+                        -- Use the machine coordinates we already calculated
+                        if probeMachinePoints.xPlus and probeMachinePoints.xMinus then
+                            datumMachX = centerMachX  -- Already calculated above
+                        end
+                        
+                        if probeMachinePoints.yPlus and probeMachinePoints.yMinus then
+                            datumMachY = centerMachY  -- Already calculated above
+                        end
+                        
+                        if performZProbe and surfaceMachZ then
+                            -- Use TRUE surface from #394 if available (H-compensated)
+                            local trueSurfaceZ = mc.mcCntlGetPoundVar(inst, 394)
+                            
+                            if type(trueSurfaceZ) == "number" and trueSurfaceZ > -1e300 then
+                                -- M311 provided H-compensated surface
+                                datumMachZ = trueSurfaceZ
+                            else
+                                -- Fallback: calculate compensation here
+                                local currentTool = mc.mcToolGetCurrent(inst)
+                                local currentH = mc.mcCntlGetPoundVar(inst, 4120)
+                                local hOffset = 0
+                                
+                                -- Only apply H compensation if T90 with H90 is active
+                                if currentTool == 90 and currentH == 90 then
+                                    hOffset = mc.mcToolGetData(inst, mc.MTOOL_MILL_HEIGHT, 90)
+                                    if type(hOffset) ~= "number" then hOffset = 0 end
+                                end
+                                datumMachZ = surfaceMachZ - hOffset
+                            end
+                        end
+                        
+                        -- NOW set the pound variables
+                        if datumMachX then
+                            mc.mcCntlSetPoundVar(inst, offsets.x, datumMachX)
+                        else
+                            -- Keep X unchanged if not probed
+                            local currentXOffset = mc.mcCntlGetPoundVar(inst, offsets.x)
+                            mc.mcCntlSetPoundVar(inst, offsets.x, currentXOffset)
+                        end
+                        
+                        if datumMachY then
+                            mc.mcCntlSetPoundVar(inst, offsets.y, datumMachY)
+                        else
+                            -- Keep Y unchanged if not probed
+                            local currentYOffset = mc.mcCntlGetPoundVar(inst, offsets.y)
+                            mc.mcCntlSetPoundVar(inst, offsets.y, currentYOffset)
+                        end
+                        
+                        if datumMachZ then
+                            -- Set Z to probed surface
+                            mc.mcCntlSetPoundVar(inst, offsets.z, datumMachZ)
+                        else
+                            -- Keep Z unchanged if surface not probed
+                            local currentZOffset = mc.mcCntlGetPoundVar(inst, offsets.z)
+                            mc.mcCntlSetPoundVar(inst, offsets.z, currentZOffset)
+                        end
+                        
+                        -- Build G10 L20 command (L20 for machine coordinates)
+						local offsetP = currentOffset - 53  -- G54=P1, G55=P2, etc.
+						local g10Command = string.format("G10 L20 P%d", offsetP)
+                        
+                        if datumMachX then
+                            g10Command = g10Command .. string.format(" X%.4f", datumMachX)
+                        end
+                        if datumMachY then
+                            g10Command = g10Command .. string.format(" Y%.4f", datumMachY)
+                        end
+                        if datumMachZ then
+                            g10Command = g10Command .. string.format(" Z%.4f", datumMachZ)
+                        end
+                        
+                        mc.mcCntlGcodeExecuteWait(inst, g10Command)
+                        
+                        -- Now activate the work offset
+                        local gcode = string.format("G%d", currentOffset)
+                        mc.mcCntlGcodeExecuteWait(inst, gcode)
+                        
+                        -- Report what was set
+                        local setMsg = string.format("Rectangle center set as %s", gcode)
+                        if datumMachX and datumMachY then
+                            setMsg = setMsg .. " X0 Y0"
+                        elseif datumMachX then
+                            setMsg = setMsg .. " X0"
+                        elseif datumMachY then
+                            setMsg = setMsg .. " Y0"
+                        end
+                        if datumMachZ then
+                            setMsg = setMsg .. " Z0"
+                        end
+                        mc.mcCntlSetLastError(inst, setMsg)
+                        
+                        datumWasSet = true
+                    else
+                        local msg = string.format(
+                            "INVALID WORK OFFSET\n\n" ..
+                            "Current work offset (G%d) is not valid.\n\n" ..
+                            "Please select a valid work offset (G54-G59)\n" ..
+                            "before running the probe routine.",
+                            currentOffset or 0)
+                        wx.wxMessageBox(msg, "Configuration Error", wx.wxOK + wx.wxICON_ERROR)
+                        error("Invalid work offset")
+                    end
+                else  -- Print Coords
+					-- Check if virtual tool (probe) is active to get offsets
+					local virtualTool = mc.mcCntlGetPoundVar(inst, 406)
+					local xOffset = 0
+					local yOffset = 0
+					
+					if virtualTool >= 90 and virtualTool <= 99 then
+						-- Get the virtual tool offsets that were applied
+						xOffset = mc.mcCntlGetPoundVar(inst, 407)  -- X delta
+						yOffset = mc.mcCntlGetPoundVar(inst, 408)  -- Y delta
+					end
+					
+					-- Print work coordinates first (already correct)
+					local workMsg = "Rectangle center (Work):"
+					
+					if centerWorkX then
+						workMsg = workMsg .. string.format(" X%.4f", centerWorkX)
+					end
+					
+					if centerWorkY then
+						workMsg = workMsg .. string.format(" Y%.4f", centerWorkY)
+					end
+					
+					if performZProbe and surfaceWorkZ then
+						workMsg = workMsg .. string.format(", Surface Z%.4f", surfaceWorkZ)
+					end
+					
+					mc.mcCntlSetLastError(inst, workMsg)
+					
+					-- Print machine coordinates with offset applied (spindle position)
+					local machMsg = "Rectangle center (Machine):"
+					
+					if centerMachX then
+						-- Add offset to show actual spindle position
+						machMsg = machMsg .. string.format(" X%.4f", centerMachX + xOffset)
+					end
+					
+					if centerMachY then
+						-- Add offset to show actual spindle position
+						machMsg = machMsg .. string.format(" Y%.4f", centerMachY + yOffset)
+					end
+					
+					if performZProbe and surfaceMachZ then
+						-- Get the TRUE surface machine Z (H-compensated if applicable)
+						local surfaceMachZDisplay = surfaceMachZ
+						local trueSurfaceZ = mc.mcCntlGetPoundVar(inst, 394)
+						if type(trueSurfaceZ) == "number" and trueSurfaceZ > -1e300 then
+							surfaceMachZDisplay = trueSurfaceZ
+						end
+						machMsg = machMsg .. string.format(", Surface Z%.4f", surfaceMachZDisplay)
+					end
+					
+					mc.mcCntlSetLastError(inst, machMsg)
+				end
+                
+                success = true
+            end,
+            debug.traceback  -- Get full stack trace on error
+        )
+        
+        if not ok then
+            errorMsg = tostring(err)
+            success = false
+        end
+        
+        -- ============================================
+        -- CLEANUP - ALWAYS RUNS
+        -- ============================================
+        local cleanupOk, cleanupErr = xpcall(
+            function()
+                ProbeCleanup(startState, success, datumWasSet, savedPoundVars, errorMsg)
+            end,
+            debug.traceback
+        )
+        
+        if not cleanupOk then
+            -- Emergency cleanup failed - try minimal restoration
+            pcall(function()
+                for var, value in pairs(savedPoundVars) do
+                    mc.mcCntlSetPoundVar(inst, var, value)
+                end
+            end)
+            
+            mc.mcCntlSetLastError(inst, "ERROR: Cleanup failed - " .. tostring(cleanupErr))
+        end
+        
+        return success
+    end
+    
+    -- ============================================
+    -- CLEANUP FUNCTION
+    -- ============================================
+    function ProbeCleanup(startState, success, datumWasSet, savedPoundVars, errorMsg)
+        -- Step 1: Check probe state but DO NOT MOVE
+        if mc.mcSignalGetState(inst, PROBE_SIGNAL) == 1 then
+            mc.mcCntlSetLastError(inst, "WARNING: Probe is triggered - manual intervention required")
+            -- DO NOT ATTEMPT ANY MOVEMENT
+        end
+        
+        -- Step 2: Report failure but DO NOT MOVE
+        if not success then
+            mc.mcCntlSetLastError(inst, "Probe sequence failed - see previous error for details")
+            if errorMsg then
+                mc.mcCntlSetLastError(inst, "Debug info: " .. errorMsg)
+            end
+            -- NO MOVEMENTS - User must manually recover
+            -- NO DIALOG - specific error already showed to user
+        end
+        
+        -- Step 3: Clear runtime variables (safe to do)
+        mc.mcCntlSetPoundVar(inst, 395, -1e308)
+        mc.mcCntlSetPoundVar(inst, 396, -1e308)
+        mc.mcCntlSetPoundVar(inst, 397, -1e308)
+        
+        -- Step 4: Final status
+        if success and not errorMsg then
+            if not datumWasSet then
+             --   mc.mcCntlSetLastError(inst, "Outside center probe completed successfully")
+            end
+        end
+    end
+    
+    -- Execute with error handling
+    local success, result = pcall(ExecuteOutsideCenterProbe)
+    
+    if not success then
+        mc.mcCntlSetLastError(inst, "ERROR: " .. tostring(result))
+        wx.wxMessageBox("Probe sequence failed:\n" .. tostring(result), 
+                       "Probe Error", wx.wxOK + wx.wxICON_ERROR)
+    elseif result == false then
+        -- User cancelled or probe failed with proper cleanup
+        -- Message already set by cleanup function
+    else
+        -- Success - message already set by probe function
+    end
+else
+    dlg:Destroy()
+end

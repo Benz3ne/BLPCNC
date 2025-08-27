@@ -1,0 +1,464 @@
+ProbeLibrary Implementation Plan
+=====================================
+Comprehensive Stepped Implementation for Probe Script Consolidation
+Generated: 2025-08-27
+
+OVERVIEW
+========
+This plan consolidates 8 Mach4 probe scripts (~8,135 lines) into a maintainable 
+library system with 65-70% code reduction while preserving all functionality.
+
+Combines best practices from:
+- Plan A: Comprehensive modular architecture  
+- Plan B: Safe scaffold approach with behavior preservation
+- Claude's Plan: Advanced runtime optimizations
+
+TARGET METRICS
+===============
+Before: 8,135 lines across 8 scripts
+After:  2,500-3,000 lines (2,000 library + 500-1,000 in scripts)
+Reduction: 65-70% fewer lines to maintain
+
+PHASE 0: PREPARATION & BACKUP
+==============================
+Duration: 1 day
+Risk: None
+
+Tasks:
+1. Create backup directory: Probing_Backup_[DATE]
+2. Copy all existing probe scripts to backup
+3. Create development branch structure:
+   - Probing/Development/
+   - Probing/Testing/
+   - Probing/Production/
+
+Deliverables:
+- Complete backup of working system
+- Development environment ready
+
+PHASE 1: FOUNDATION SCAFFOLD (SAFE)
+====================================
+Duration: 3 days  
+Risk: Very Low
+Approach: Based on Plan B - minimal functional changes
+
+1.1 Create ProbeLibrary.lua Core Structure
+-------------------------------------------
+Location: C:\Mach4Hobby\Profiles\BLP\Scripts\Probing\ProbeLibrary.lua
+
+```lua
+-- ProbeLibrary v1.0 - Core Foundation
+local ProbeLibrary = {
+    VERSION = "1.0.0",
+    Core = {},
+    Movement = {},
+    UI = {},
+    Storage = {},
+    Cleanup = {},
+    Logging = {},
+    Calculations = {}
+}
+
+-- Constants
+ProbeLibrary.CONSTANTS = {
+    PROBE_TOOL = 90,
+    PROBE_OUTPUT = mc.OSIG_OUTPUT7,
+    PROBE_SIGNAL = mc.ISIG_PROBE1,
+    SENTINEL_VALUE = -999999.0,
+    SENTINEL_FLAG_VAR = 388,
+    SENTINEL_VARS = {389, 390, 391, 392, 394},
+    POSITION_TOLERANCE = 0.001,
+    SOFT_LIMIT_BUFFER = 0.010,
+    PROBE_SETTLE_MS = 100
+}
+```
+
+1.2 Implement Core Safety Gates
+-------------------------------
+Functions to add:
+- ProbeLibrary.Core.GetInstance()
+- ProbeLibrary.Core.IsProbeActive(inst)  
+- ProbeLibrary.Core.ActivateProbeTool(inst)
+- ProbeLibrary.Core.IsProbeTriggered(inst)
+- ProbeLibrary.UI.ShowToolActivationDialog(scriptName)
+
+1.3 Create Pilot Integration Script  
+-----------------------------------
+Target: -ZProbe.txt (simplest script, 495 lines)
+Replace only tool activation logic initially
+Verify identical behavior
+
+1.4 Testing
+-----------
+- Dry run with probe not connected
+- Verify tool activation dialog appears correctly
+- Confirm script exits gracefully on cancel
+- Test with T90 already active
+
+Success Criteria:
+- -ZProbe.txt behavior identical to original
+- No new error messages
+- ProbeLibrary.lua loads without errors
+
+PHASE 2: MOVEMENT & SENTINEL SYSTEM  
+====================================
+Duration: 5 days
+Risk: Low-Medium
+Approach: Standardize probe execution across all scripts
+
+2.1 Sentinel Probe Wrapper
+---------------------------
+Add to ProbeLibrary.Movement:
+- EnableSentinel(inst)
+- ClearSentinel(inst)  
+- CheckSentinelFailure(inst)
+- ExecuteProbe(inst, command, direction, axis)
+
+Based on best implementation from InsideCorner.txt/ProbeBore.txt
+
+2.2 Soft Limit Integration
+---------------------------
+Add to ProbeLibrary.Movement:
+- GetSafeTravel(inst, axis, direction, currentMachPos, requestedTravel)
+- ValidateTravelDistance(axis, direction, requested, available)
+
+Unified from 5 different implementations across scripts
+
+2.3 Double-Tap Probe Sequence
+------------------------------
+Add to ProbeLibrary.Movement:
+- DoubleTapProbe(inst, axis, direction, params)
+- SmartRetreat(inst, currentRadius, maxRadius, probeMaxTravel)
+
+From M311 integration and Boss Probe's advanced logic
+
+2.4 Integration Testing
+-----------------------
+Scripts to update: -ZProbe.txt, ProbeXY.txt
+- Replace local probe execution with library calls
+- Verify identical probe results
+- Test sentinel failure detection
+- Test soft limit protection
+
+Success Criteria:
+- Probe sequences identical to original behavior
+- Soft limit protection working
+- Sentinel failure properly detected and reported
+
+PHASE 3: STORAGE & UI STANDARDIZATION
+======================================
+Duration: 4 days  
+Risk: Low
+Approach: Unify profile storage and dialog patterns
+
+3.1 Profile Storage System
+---------------------------
+Add to ProbeLibrary.Storage:
+- GetInt(inst, section, key, default)
+- GetFloat(inst, section, key, default)  
+- SetInt(inst, section, key, value)
+- SetFloat(inst, section, key, value)
+- CreateSettings(scriptName, defaults) -> settings object
+
+3.2 UI Helper Functions
+-----------------------
+Add to ProbeLibrary.UI:
+- GetParent()
+- CenterDialog(dlg, width, height)
+- CreateButtonSizer(panel, okText, cancelText)
+- CreateNumberInput(panel, label, value, min, max, tooltip)
+- ShowError(title, message, details)
+- ShowWarning(title, message)
+- ShowInfo(title, message)
+
+3.3 Script Updates
+------------------
+Update: InsideCenter.txt, InsideCorner.txt, ProbeBore.txt
+- Replace local ProfileGet/Set functions
+- Standardize dialog creation and layout
+- Unify button sizing and positioning
+
+Success Criteria:
+- Settings properly saved/loaded across sessions
+- Dialog layouts consistent between scripts
+- All validation working correctly
+
+PHASE 4: ADVANCED MOVEMENT & CALCULATIONS
+==========================================
+Duration: 6 days
+Risk: Medium
+Approach: Implement sophisticated probe algorithms
+
+4.1 Advanced Movement Functions
+-------------------------------
+Add to ProbeLibrary.Movement:
+- TraverseWithCollisionDetection(inst, targetX, targetY, feedrate)
+- RecoverStuckProbe(inst)
+- ExecuteMultiAxisProbe(inst, axes, directions, params)
+
+4.2 Calculation Library  
+-----------------------
+Add to ProbeLibrary.Calculations:
+- GetCenter(edge1, edge2)
+- GetWidth(edge1, edge2)
+- ApplyRadiusCompensation(contact, probeDiameter, direction)
+- GetAngle(x1, y1, x2, y2, referenceAxis)
+- CheckPerpendicularity(xWidth, yWidth, tolerance)
+- GetG68Parameters(angle, centerX, centerY, nearestAxis)
+- WorkToMachine(inst, axis, workPos)
+- MachineToWork(inst, axis, machinePos)
+- ValidateMeasurement(value, min, max, name)
+
+4.3 Script Updates
+------------------
+Update: ProbeBoss.txt, OutsideCenter.txt
+- Replace local calculation functions
+- Implement smart retreat logic  
+- Add collision detection for traversals
+- Standardize coordinate system handling
+
+Success Criteria:
+- Boss and rectangle center finding work identically
+- Smart retreat prevents collisions
+- All geometric calculations produce same results
+
+PHASE 5: COMPLEX INTEGRATION
+=============================
+Duration: 7 days
+Risk: Medium-High  
+Approach: Handle the most complex scripts
+
+5.1 Rotation Handling System
+----------------------------
+Add to ProbeLibrary.Core:
+- CheckRotationActive(inst)
+- GetRotationPolicy(scriptName) -> policy object
+- HandleRotationWarning(inst, policy)
+- ClearRotation(inst)
+
+5.2 Advanced Logging System
+----------------------------
+Add to ProbeLibrary.Logging:
+- InitLog(inst)
+- LogEvent(inst, method, x, y, z, notes)
+- LogError(inst, error, context)  
+- StartSession(inst, scriptName) -> session object
+- EndSession(inst, session, success)
+
+5.3 Script Updates
+------------------
+Update: FindAngle.txt (most complex - 1,702 lines)
+- Replace G68/G69 handling with library functions
+- Implement comprehensive logging
+- Replace M311 existence checking
+- Standardize all probe sequences
+
+Success Criteria:
+- FindAngle produces identical angle measurements
+- G68 rotation properly detected and handled
+- All probe events logged correctly
+
+PHASE 6: CLEANUP & OPTIMIZATION  
+================================
+Duration: 4 days
+Risk: Low
+Approach: Final cleanup and optimization
+
+6.1 Cleanup System Implementation
+---------------------------------
+Add to ProbeLibrary.Cleanup:
+- Standard(inst, savedVars, success, errorMsg)
+- CreateWrapper(cleanupFunc) -> wrapper function
+- RecoverStuckProbe(inst)
+- ResetRuntimeVariables(inst)
+
+6.2 Parameter Management
+------------------------  
+Add to ProbeLibrary.Core:
+- GetProbeParameters(inst) -> validated params object
+- ValidateProbeParameters(params) -> boolean, error
+- SaveProbeParameters(inst, params)
+
+6.3 Final Script Updates
+------------------------
+Update remaining: Any scripts not yet converted
+- Remove all duplicate local functions
+- Implement standardized cleanup
+- Add parameter validation
+- Optimize error handling
+
+Success Criteria:
+- No duplicate functions remain in individual scripts
+- All scripts use standardized parameter management
+- Cleanup system prevents stuck states
+
+PHASE 7: TESTING & VALIDATION
+==============================
+Duration: 5 days
+Risk: Low
+Approach: Comprehensive testing of entire system
+
+7.1 Unit Testing
+----------------
+Test each library module independently:
+- Core functions with simulated Mach4 instance
+- Movement functions with mock probe signals
+- Calculation functions with known test cases
+- Storage functions with temporary profile sections
+
+7.2 Integration Testing  
+-----------------------
+Test script combinations:
+- Run multiple probe scripts in sequence
+- Verify settings don't interfere between scripts
+- Test error recovery between different probe types
+- Validate coordinate system consistency
+
+7.3 On-Machine Testing
+---------------------
+Safe machine testing protocol:
+- Use soft materials (foam, wood)
+- High Z positions with plenty of clearance
+- Slow feed rates with feed override available
+- Test all probe types with known geometry
+
+Test Matrix:
+- Each script's happy path
+- Intentional probe failures  
+- Soft limit boundary conditions
+- Tool change scenarios
+- G68 rotation active scenarios
+
+7.4 Performance Validation
+--------------------------
+Measure and document:
+- Script execution time comparison
+- Memory usage comparison  
+- Load time for ProbeLibrary.lua
+- Error recovery time
+
+Success Criteria:
+- All 8 scripts produce identical results to originals
+- No performance regression
+- Error handling improved or identical
+- No new failure modes introduced
+
+PHASE 8: DEPLOYMENT & MONITORING
+=================================
+Duration: 3 days
+Risk: Very Low
+Approach: Staged deployment with rollback capability
+
+8.1 Staging Deployment
+----------------------
+1. Deploy to Development directory first
+2. Run complete test matrix in staging environment
+3. User acceptance testing with key operators
+4. Document any final behavioral differences
+
+8.2 Production Deployment
+-------------------------
+1. Schedule maintenance window
+2. Move original scripts to Backup directory
+3. Deploy ProbeLibrary.lua to Scripts/Probing/
+4. Deploy all updated probe scripts
+5. Update any button scripts that reference probe files
+
+8.3 Monitoring & Support
+------------------------
+First 30 days after deployment:
+- Daily check of probe log for errors
+- Monitor operator feedback
+- Track any support requests related to probe scripts
+- Document lessons learned
+
+8.4 Documentation Updates
+-------------------------
+Create/update documentation:
+- ProbeLibrary API reference
+- Script behavior change log (should be minimal)
+- Troubleshooting guide for new error messages
+- Developer guide for adding new probe types
+
+Success Criteria:
+- Zero unplanned downtime due to probe script issues
+- Operator satisfaction maintained or improved
+- Support requests not increased
+
+ROLLBACK PROCEDURES
+===================
+At any phase, rollback procedure:
+
+1. Stop all probe operations
+2. Copy original scripts from Backup directory back to Probing directory
+3. Remove or rename ProbeLibrary.lua
+4. Restart Mach4 to clear any cached modules
+5. Test one probe script to verify rollback successful
+6. Document rollback reason and lessons learned
+
+RISK MITIGATION
+================
+
+High Risk Items:
+1. Sentinel variable management - Test extensively in Phase 2
+2. Coordinate system conversions - Validate calculations in Phase 4  
+3. FindAngle complexity - Allow extra time in Phase 5
+4. On-machine testing safety - Use staged approach with soft materials
+
+Medium Risk Items:
+1. Profile storage compatibility - Test with existing profiles
+2. UI dialog behavior - Compare screenshots before/after
+3. Error message consistency - Document any changes
+
+Low Risk Items:
+1. Library load time - Acceptable if under 100ms
+2. Memory usage - Modern systems can handle library size
+3. Code organization - Internal changes, no external impact
+
+SUCCESS METRICS
+================
+Quantitative:
+- 65-70% code reduction achieved
+- Zero behavior changes for end users
+- Library load time < 100ms
+- All 8 scripts maintain identical results
+
+Qualitative:  
+- Code is more maintainable
+- Adding new probe types is easier
+- Error messages are more consistent
+- Documentation is improved
+
+MAINTENANCE PLAN
+================
+Post-deployment ongoing maintenance:
+
+Monthly:
+- Review probe logs for error patterns
+- Monitor library performance metrics
+- Check for any new duplicate code patterns
+
+Quarterly:
+- Review library API for potential improvements
+- Evaluate new probe type requests
+- Update documentation based on user feedback
+
+Annually:
+- Full review of library architecture
+- Performance optimization review
+- Security review of parameter handling
+- Consider additional consolidation opportunities
+
+CONCLUSION
+==========
+This implementation plan provides a structured, low-risk approach to consolidating
+8 probe scripts into a maintainable library system. The phased approach allows
+for validation at each step and provides clear rollback procedures if issues arise.
+
+The final system will be significantly more maintainable while preserving all
+existing functionality and user experience.
+
+Estimated total effort: 37 days
+Estimated code reduction: 65-70%
+Risk level: Low to Medium (well-controlled)
+ROI: High (maintenance effort reduction, consistency, reliability)

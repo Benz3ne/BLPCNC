@@ -1,0 +1,496 @@
+-- Target Move Script v2.3
+-- Universal Z-first option and reduced XY threshold
+-- Version: 2.3
+-- Date: 2024
+
+local inst = mc.mcGetInstance()
+
+-- Load user preferences from profile
+local lastCoordMode = mc.mcProfileGetString(inst, "TargetMove", "LastCoordMode", "work")
+local lastMoveType = mc.mcProfileGetString(inst, "TargetMove", "LastMoveType", "rapid")
+local lastFeedRate = mc.mcProfileGetString(inst, "TargetMove", "LastFeedRate", "100")
+local lastZFirst = mc.mcProfileGetString(inst, "TargetMove", "LastZFirst", "true") == "true"
+
+-- Check control state - must be idle
+local controlState = mc.mcCntlGetState(inst)
+if controlState ~= mc.MC_STATE_IDLE then
+    wx.wxMessageBox("Machine must be idle to use Target Move!\n\nCurrent state: " .. tostring(controlState), 
+                    "Machine Not Idle", wx.wxOK + wx.wxICON_ERROR)
+    return
+end
+
+-- Check if X, Y, Z axes are homed
+local allAxesHomed = true
+local unhomedAxes = {}
+
+-- Check only X, Y, Z axes (0, 1, 2)
+for axis = 0, 2 do
+    local axisEnabled = mc.mcAxisIsEnabled(inst, axis)
+    local axisHomed = mc.mcAxisIsHomed(inst, axis)
+    
+    if axisEnabled == 1 and axisHomed ~= 1 then
+        allAxesHomed = false
+        local axisNames = {[0] = "X", [1] = "Y", [2] = "Z"}
+        table.insert(unhomedAxes, axisNames[axis])
+    end
+end
+
+-- Show homing required dialog if not all homed
+if not allAxesHomed then
+    wx.wxMessageBox("Please home all axes before using Target Move", 
+                    "Homing Required", wx.wxOK + wx.wxICON_WARNING)
+    return
+end
+
+-- Get current work positions 
+local currentWorkX = mc.mcAxisGetPos(inst, mc.X_AXIS)
+local currentWorkY = mc.mcAxisGetPos(inst, mc.Y_AXIS)
+local currentWorkZ = mc.mcAxisGetPos(inst, mc.Z_AXIS)
+
+-- Get current machine positions
+local currentMachineX = mc.mcAxisGetMachinePos(inst, mc.X_AXIS)
+local currentMachineY = mc.mcAxisGetMachinePos(inst, mc.Y_AXIS)
+local currentMachineZ = mc.mcAxisGetMachinePos(inst, mc.Z_AXIS)
+
+-- Get current fixture offset (G54-G59)
+local currentFixture = mc.mcCntlGetPoundVar(inst, mc.SV_MOD_GROUP_14)
+local fixtureNumber = currentFixture - 53  -- Convert 54-59 to 1-6
+local fixtureText = string.format("G%d", currentFixture)
+
+-- Flag to prevent double-execution
+local executionInProgress = false
+
+-- Track if user has modified fields (to prevent overwriting their input)
+local userModifiedFields = false
+
+-- Store the last mode to detect mode changes
+local lastMode = lastCoordMode  -- Initialize from saved preference
+
+-- Create dialog with fixed size
+local dialogWidth = 450
+local dialogHeight = 360
+local dialog = wx.wxDialog(wx.NULL, wx.wxID_ANY, "Target Move", 
+                          wx.wxDefaultPosition, wx.wxSize(dialogWidth, dialogHeight),
+                          wx.wxDEFAULT_DIALOG_STYLE + wx.wxRESIZE_BORDER)
+
+-- Prevent dialog from auto-resizing
+dialog:SetMinSize(wx.wxSize(dialogWidth, dialogHeight))
+dialog:SetMaxSize(wx.wxSize(dialogWidth, dialogHeight))
+
+-- Add keyboard handling for Enter and Escape
+dialog:Connect(wx.wxEVT_CHAR_HOOK, function(event)
+    local keyCode = event:GetKeyCode()
+    if keyCode == wx.WXK_RETURN and not executionInProgress then
+        dialog:EndModal(wx.wxID_OK)
+    elseif keyCode == wx.WXK_ESCAPE then
+        dialog:EndModal(wx.wxID_CANCEL)
+    else
+        event:Skip()
+    end
+end)
+
+-- Main panel
+local panel = wx.wxPanel(dialog, wx.wxID_ANY)
+local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+
+-- Coordinate system selection (reorganized without label)
+local coordSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+local workRadio = wx.wxRadioButton(panel, wx.wxID_ANY, "Work Coords (" .. fixtureText .. ")", 
+                                   wx.wxDefaultPosition, wx.wxDefaultSize, wx.wxRB_GROUP)
+local machineRadio = wx.wxRadioButton(panel, wx.wxID_ANY, "Machine Coords")
+local relativeRadio = wx.wxRadioButton(panel, wx.wxID_ANY, "Relative Move")
+
+-- Set initial coordinate mode based on saved preference
+if lastCoordMode == "machine" then
+    machineRadio:SetValue(true)
+elseif lastCoordMode == "relative" then
+    relativeRadio:SetValue(true)
+else
+    workRadio:SetValue(true)
+end
+
+coordSizer:Add(workRadio, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 15)
+coordSizer:Add(machineRadio, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 15)
+coordSizer:Add(relativeRadio, 0, wx.wxALIGN_CENTER_VERTICAL)
+
+-- Feed mode selection
+local feedSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+local feedLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Move Type:")
+local rapidRadio = wx.wxRadioButton(panel, wx.wxID_ANY, "Rapid (G0)", 
+                                    wx.wxDefaultPosition, wx.wxDefaultSize, wx.wxRB_GROUP)
+local feedRadio = wx.wxRadioButton(panel, wx.wxID_ANY, "Feed Rate (G1):")
+local feedInput = wx.wxTextCtrl(panel, wx.wxID_ANY, lastFeedRate, 
+                                wx.wxDefaultPosition, wx.wxSize(80, -1))
+local feedUnit = wx.wxStaticText(panel, wx.wxID_ANY, "IPM")
+
+-- Set initial move type based on saved preference
+if lastMoveType == "feed" then
+    feedRadio:SetValue(true)
+    feedInput:Enable(true)
+else
+    rapidRadio:SetValue(true)
+    feedInput:Enable(false)
+end
+
+feedSizer:Add(feedLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 10)
+feedSizer:Add(rapidRadio, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 15)
+feedSizer:Add(feedRadio, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+feedSizer:Add(feedInput, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+feedSizer:Add(feedUnit, 0, wx.wxALIGN_CENTER_VERTICAL)
+
+-- Enable/disable feed rate input based on radio selection
+rapidRadio:Connect(wx.wxEVT_RADIOBUTTON, function(event)
+    feedInput:Enable(false)
+end)
+
+feedRadio:Connect(wx.wxEVT_RADIOBUTTON, function(event)
+    feedInput:Enable(true)
+    feedInput:SetFocus()
+    feedInput:SetSelection(-1, -1) -- Select all text
+end)
+
+-- Input fields
+local inputSizer = wx.wxFlexGridSizer(3, 3, 10, 10)
+inputSizer:AddGrowableCol(1)
+
+-- X coordinate
+local xLabel = wx.wxStaticText(panel, wx.wxID_ANY, "X:")
+local xInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", currentWorkX), 
+                              wx.wxDefaultPosition, wx.wxSize(150, -1))
+local xUnit = wx.wxStaticText(panel, wx.wxID_ANY, "in")
+
+-- Y coordinate
+local yLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Y:")
+local yInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", currentWorkY), 
+                              wx.wxDefaultPosition, wx.wxSize(150, -1))
+local yUnit = wx.wxStaticText(panel, wx.wxID_ANY, "in")
+
+-- Z coordinate
+local zLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Z:")
+local zInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", currentWorkZ), 
+                              wx.wxDefaultPosition, wx.wxSize(150, -1))
+local zUnit = wx.wxStaticText(panel, wx.wxID_ANY, "in")
+
+-- Update initial values based on saved coordinate mode preference
+if lastCoordMode == "relative" then
+    xInput:SetValue("0.0000")
+    yInput:SetValue("0.0000")
+    zInput:SetValue("0.0000")
+elseif lastCoordMode == "machine" then
+    xInput:SetValue(string.format("%.4f", currentMachineX))
+    yInput:SetValue(string.format("%.4f", currentMachineY))
+    zInput:SetValue(string.format("%.4f", currentMachineZ))
+-- else work mode, which is already set as default
+end
+
+inputSizer:Add(xLabel, 0, wx.wxALIGN_RIGHT + wx.wxALIGN_CENTER_VERTICAL)
+inputSizer:Add(xInput, 0, wx.wxEXPAND)
+inputSizer:Add(xUnit, 0, wx.wxALIGN_LEFT + wx.wxALIGN_CENTER_VERTICAL)
+
+inputSizer:Add(yLabel, 0, wx.wxALIGN_RIGHT + wx.wxALIGN_CENTER_VERTICAL)
+inputSizer:Add(yInput, 0, wx.wxEXPAND)
+inputSizer:Add(yUnit, 0, wx.wxALIGN_LEFT + wx.wxALIGN_CENTER_VERTICAL)
+
+inputSizer:Add(zLabel, 0, wx.wxALIGN_RIGHT + wx.wxALIGN_CENTER_VERTICAL)
+inputSizer:Add(zInput, 0, wx.wxEXPAND)
+inputSizer:Add(zUnit, 0, wx.wxALIGN_LEFT + wx.wxALIGN_CENTER_VERTICAL)
+
+-- Track when user modifies any field
+local function onFieldModified(event)
+    userModifiedFields = true
+    event:Skip()
+end
+
+xInput:Connect(wx.wxEVT_TEXT, onFieldModified)
+yInput:Connect(wx.wxEVT_TEXT, onFieldModified)
+zInput:Connect(wx.wxEVT_TEXT, onFieldModified)
+
+-- Set tab order
+yInput:MoveAfterInTabOrder(xInput)
+zInput:MoveAfterInTabOrder(yInput)
+feedInput:MoveAfterInTabOrder(zInput)
+
+-- Z-order checkbox (always visible for all modes)
+local zOrderSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+local zFirstCheckbox = wx.wxCheckBox(panel, wx.wxID_ANY, "Move Z first (safer for clearance)")
+zFirstCheckbox:SetValue(lastZFirst)  -- Use saved preference
+
+zOrderSizer:Add(zFirstCheckbox, 0, wx.wxALIGN_CENTER_VERTICAL)
+
+-- Update inputs on coord radio change
+workRadio:Connect(wx.wxEVT_RADIOBUTTON, function(event)
+    -- Always show current work position when work mode is selected
+    xInput:SetValue(string.format("%.4f", currentWorkX))
+    yInput:SetValue(string.format("%.4f", currentWorkY))
+    zInput:SetValue(string.format("%.4f", currentWorkZ))
+    userModifiedFields = false  -- Reset flag since we're showing defaults
+    lastMode = "work"
+    xInput:SetFocus()
+    xInput:SetSelection(-1, -1)
+end)
+
+machineRadio:Connect(wx.wxEVT_RADIOBUTTON, function(event)
+    -- Always show current machine position when machine mode is selected
+    xInput:SetValue(string.format("%.4f", currentMachineX))
+    yInput:SetValue(string.format("%.4f", currentMachineY))
+    zInput:SetValue(string.format("%.4f", currentMachineZ))
+    userModifiedFields = false  -- Reset flag since we're showing defaults
+    lastMode = "machine"
+    xInput:SetFocus()
+    xInput:SetSelection(-1, -1)
+end)
+
+relativeRadio:Connect(wx.wxEVT_RADIOBUTTON, function(event)
+    -- Always zero out for relative mode
+    xInput:SetValue("0.0000")
+    yInput:SetValue("0.0000")
+    zInput:SetValue("0.0000")
+    userModifiedFields = false  -- Reset flag since we're showing defaults
+    lastMode = "relative"
+    xInput:SetFocus()
+    xInput:SetSelection(-1, -1)
+end)
+
+-- Button sizer
+local buttonSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+local okButton = wx.wxButton(panel, wx.wxID_OK, "Execute Move")
+local cancelButton = wx.wxButton(panel, wx.wxID_CANCEL, "Cancel")
+
+-- Prevent double-execution
+okButton:Connect(wx.wxEVT_BUTTON, function(event)
+    if not executionInProgress then
+        executionInProgress = true
+        okButton:Enable(false)
+    end
+    event:Skip()
+end)
+
+buttonSizer:Add(okButton, 0, wx.wxRIGHT, 10)
+buttonSizer:Add(cancelButton, 0)
+
+-- Add everything to main sizer
+mainSizer:Add(coordSizer, 0, wx.wxALL + wx.wxEXPAND, 15)
+mainSizer:Add(wx.wxStaticLine(panel, wx.wxID_ANY), 0, wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT, 15)
+mainSizer:Add(feedSizer, 0, wx.wxALL + wx.wxEXPAND, 15)
+mainSizer:Add(wx.wxStaticLine(panel, wx.wxID_ANY), 0, wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT, 15)
+mainSizer:Add(inputSizer, 0, wx.wxALL + wx.wxEXPAND, 15)
+mainSizer:Add(zOrderSizer, 0, wx.wxALIGN_CENTER + wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, 15)
+mainSizer:Add(wx.wxStaticLine(panel, wx.wxID_ANY), 0, wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT, 15)
+mainSizer:Add(buttonSizer, 0, wx.wxALIGN_CENTER + wx.wxTOP + wx.wxBOTTOM, 15)
+
+panel:SetSizer(mainSizer)
+panel:Layout()
+
+-- Center dialog on screen and set initial focus
+dialog:Centre()
+xInput:SetFocus()
+xInput:SetSelection(-1, -1)
+
+-- Show dialog and process result
+if dialog:ShowModal() == wx.wxID_OK then
+    -- Get input values
+    local targetX = tonumber(xInput:GetValue())
+    local targetY = tonumber(yInput:GetValue())
+    local targetZ = tonumber(zInput:GetValue())
+    
+    -- Validate inputs
+    if not targetX or not targetY or not targetZ then
+        wx.wxMessageBox("Invalid coordinate values entered!", "Input Error", 
+                       wx.wxOK + wx.wxICON_ERROR)
+        dialog:Destroy()
+        return
+    end
+    
+    -- Check feed rate if using G1
+    local useRapid = rapidRadio:GetValue()
+    local feedRate = 0
+    
+    if not useRapid then
+        feedRate = tonumber(feedInput:GetValue())
+        if not feedRate or feedRate <= 0 then
+            wx.wxMessageBox("Invalid feed rate entered!", "Input Error", 
+                           wx.wxOK + wx.wxICON_ERROR)
+            dialog:Destroy()
+            return
+        end
+        
+        if feedRate > 500 then
+            wx.wxMessageBox("Feed rate must not exceed 500 IPM!", "Feed Rate Too High", 
+                           wx.wxOK + wx.wxICON_ERROR)
+            dialog:Destroy()
+            return
+        end
+    end
+    
+    -- Check coordinate mode
+    local useMachineCoords = machineRadio:GetValue()
+    local isRelative = relativeRadio:GetValue()
+    
+    -- Save preferences for next time
+    mc.mcProfileWriteString(inst, "TargetMove", "LastCoordMode", 
+                            isRelative and "relative" or (useMachineCoords and "machine" or "work"))
+    mc.mcProfileWriteString(inst, "TargetMove", "LastMoveType", useRapid and "rapid" or "feed")
+    mc.mcProfileWriteString(inst, "TargetMove", "LastFeedRate", feedInput:GetValue())
+    mc.mcProfileWriteString(inst, "TargetMove", "LastZFirst", tostring(zFirstCheckbox:GetValue()))
+    
+    -- Build G-code sequence
+    local gcode = ""
+    local moveZFirst = zFirstCheckbox:GetValue()
+    
+    if isRelative then
+        -- RELATIVE MODE
+        gcode = "G91  ; Switch to relative positioning\n"
+        
+        -- Set feed rate once if using G1
+        if not useRapid then
+            gcode = gcode .. string.format("F%.1f  ; Set feed rate\n", feedRate)
+        end
+        
+        if moveZFirst then
+            -- Z first (safer for clearance)
+            if targetZ ~= 0 then
+                if useRapid then
+                    gcode = gcode .. string.format("G0 Z%.4f  ; Z first for clearance\n", targetZ)
+                else
+                    gcode = gcode .. string.format("G1 Z%.4f  ; Z first for clearance\n", targetZ)
+                end
+            end
+            -- Then XY
+            if targetX ~= 0 or targetY ~= 0 then
+                if useRapid then
+                    gcode = gcode .. string.format("G0 X%.4f Y%.4f\n", targetX, targetY)
+                else
+                    gcode = gcode .. string.format("G1 X%.4f Y%.4f\n", targetX, targetY)
+                end
+            end
+        else
+            -- XY first then Z (user chose this order)
+            if targetX ~= 0 or targetY ~= 0 then
+                if useRapid then
+                    gcode = gcode .. string.format("G0 X%.4f Y%.4f\n", targetX, targetY)
+                else
+                    gcode = gcode .. string.format("G1 X%.4f Y%.4f\n", targetX, targetY)
+                end
+            end
+            if targetZ ~= 0 then
+                if useRapid then
+                    gcode = gcode .. string.format("G0 Z%.4f\n", targetZ)
+                else
+                    gcode = gcode .. string.format("G1 Z%.4f\n", targetZ)
+                end
+            end
+        end
+        
+        gcode = gcode .. "G90  ; Return to absolute positioning\n"
+        
+    else
+        -- ABSOLUTE MODE (Work or Machine)
+        gcode = "G90  ; Ensure absolute positioning\n"
+        
+        -- Calculate if we need to retract Z for safety
+        local currentX = useMachineCoords and currentMachineX or currentWorkX
+        local currentY = useMachineCoords and currentMachineY or currentWorkY
+        local deltaX = math.abs(targetX - currentX)
+        local deltaY = math.abs(targetY - currentY)
+        local xyTolerance = 0.1  -- 0.1 inch tolerance for Z retraction decision
+        local needsZRetract = deltaX > xyTolerance or deltaY > xyTolerance
+        
+        -- Get current Z position to check if we need to retract
+        local currentZMachine = mc.mcAxisGetMachinePos(inst, mc.Z_AXIS)
+        
+        -- Set feed rate once if using G1
+        if not useRapid then
+            gcode = gcode .. string.format("F%.1f  ; Set feed rate\n", feedRate)
+        end
+        
+        if moveZFirst then
+            -- User wants Z first movement pattern
+            -- Smart Z retraction - only if XY movement > tolerance AND we're below Z0
+            if needsZRetract and currentZMachine < 0 then
+                gcode = gcode .. "G53 G0 Z0  ; Retract for XY move > 0.1 inch\n"
+            end
+            
+            -- XY positioning (always move to target, regardless of distance)
+            if useMachineCoords then
+                if useRapid then
+                    gcode = gcode .. string.format("G53 G0 X%.4f Y%.4f\n", targetX, targetY)
+                else
+                    gcode = gcode .. string.format("G53 G1 X%.4f Y%.4f\n", targetX, targetY)
+                end
+            else
+                if useRapid then
+                    gcode = gcode .. string.format("G0 X%.4f Y%.4f\n", targetX, targetY)
+                else
+                    gcode = gcode .. string.format("G1 X%.4f Y%.4f\n", targetX, targetY)
+                end
+            end
+            
+            -- Z positioning
+            if useMachineCoords then
+                if useRapid then
+                    gcode = gcode .. string.format("G53 G0 Z%.4f\n", targetZ)
+                else
+                    gcode = gcode .. string.format("G53 G1 Z%.4f\n", targetZ)
+                end
+            else
+                if useRapid then
+                    gcode = gcode .. string.format("G0 Z%.4f\n", targetZ)
+                else
+                    gcode = gcode .. string.format("G1 Z%.4f\n", targetZ)
+                end
+            end
+        else
+            -- User wants XY first, then Z (no automatic retraction)
+            -- XY positioning first (always move to target)
+            if useMachineCoords then
+                if useRapid then
+                    gcode = gcode .. string.format("G53 G0 X%.4f Y%.4f\n", targetX, targetY)
+                else
+                    gcode = gcode .. string.format("G53 G1 X%.4f Y%.4f\n", targetX, targetY)
+                end
+            else
+                if useRapid then
+                    gcode = gcode .. string.format("G0 X%.4f Y%.4f\n", targetX, targetY)
+                else
+                    gcode = gcode .. string.format("G1 X%.4f Y%.4f\n", targetX, targetY)
+                end
+            end
+            
+            -- Then Z positioning
+            if useMachineCoords then
+                if useRapid then
+                    gcode = gcode .. string.format("G53 G0 Z%.4f\n", targetZ)
+                else
+                    gcode = gcode .. string.format("G53 G1 Z%.4f\n", targetZ)
+                end
+            else
+                if useRapid then
+                    gcode = gcode .. string.format("G0 Z%.4f\n", targetZ)
+                else
+                    gcode = gcode .. string.format("G1 Z%.4f\n", targetZ)
+                end
+            end
+        end
+    end
+    
+    -- Log move completion
+    local coordType = isRelative and "Relative" or (useMachineCoords and "Machine" or fixtureText)
+    local moveType = useRapid and "Rapid" or string.format("Feed@%.1f", feedRate)
+    mc.mcCntlSetLastError(inst, string.format("Target Move: %s %s to X%.4f Y%.4f Z%.4f", 
+                          coordType, moveType, targetX, targetY, targetZ))
+    
+    -- Execute the move (Mach4 will check soft limits automatically)
+    local rc = mc.mcCntlGcodeExecuteWait(inst, gcode)
+    
+    -- Ensure we return to absolute mode even on error (for relative moves)
+    if isRelative and rc ~= mc.MERROR_NOERROR then
+        mc.mcCntlGcodeExecuteWait(inst, "G90")
+    end
+    
+    if rc ~= mc.MERROR_NOERROR then
+        wx.wxMessageBox("Error executing target move!\n\nError code: " .. tostring(rc), 
+                       "Execution Error", wx.wxOK + wx.wxICON_ERROR)
+    end
+end
+
+dialog:Destroy()

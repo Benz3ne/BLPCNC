@@ -1,0 +1,1703 @@
+-- Find Angle Probe v1.7.3
+
+-- Required Pound Variables:
+-- #300 = Probe tip diameter
+-- #301 = X offset from spindle center to probe tip
+-- #302 = Y offset from spindle center to probe tip
+-- #303 = Fast feedrate for probing
+-- #304 = Slow feedrate for final probe
+-- #305 = Maximum probe travel distance
+-- #320 = Z offset for probe calibration
+-- #321 = Probe lift height (height above surface for XY moves)
+-- #388 = Probe mode state (0=normal, 1=sentinel mode active)
+-- #389 = Machine coordinate of final probe contact
+-- #391 = Edge position (adjusted for probe radius)
+-- #394 = TRUE surface Z (H-compensated) for datum setting [Z only]
+-- #395-397 = Runtime state storage
+
+-- Required Macro:
+-- m311.mcs must exist in your profile's Macros folder
+
+-- ==================== INSTANCE CHECK ====================
+local inst = mc.mcGetInstance()
+if not inst then 
+    wx.wxMessageBox("No Mach4 instance found!", "Error", wx.wxOK + wx.wxICON_ERROR)
+    return 
+end
+
+-- ==================== M311 EXISTENCE CHECK ====================
+local function CheckM311Exists()
+    -- Try to verify M311 exists by checking macro folder
+    local profileName = mc.mcProfileGetName(inst)
+    local macroPath = mc.mcCntlGetMachDir(inst) .. "\\Profiles\\" .. profileName .. "\\Macros\\m311.mcs"
+    local file = io.open(macroPath, "r")
+    if not file then
+        mc.mcCntlSetLastError(inst, "ERROR: m311.mcs not found in Macros folder")
+        return false
+    end
+    file:close()
+    return true
+end
+
+-- FIX #1: Exit if M311 doesn't exist to prevent confusing failures
+if not CheckM311Exists() then
+    wx.wxMessageBox(
+        "Required macro M311 not found!\n\n" ..
+        "The M311 probe macro must be installed in your profile's Macros folder.\n" ..
+        "Please install the macro and restart the script.",
+        "Missing Required Macro", 
+        wx.wxOK + wx.wxICON_ERROR)
+    return
+end
+
+if not CheckRotationWithPrompt("Warning: Probing will reset all coordinate rotations (G68→G69).\nProceed?") then
+    return
+end
+
+-- ==================== CONSTANTS ====================
+local PROBE_TOOL_NUMBER = 90
+local PROBE_OUTPUT_SIGNAL = mc.OSIG_OUTPUT7
+local MIN_TRAVERSE_DISTANCE = 0.1
+local MIN_DISTANCE_ALLOWED = 0.001  -- Prevent zero distance
+local PROFILE_SECTION = "FindAngleProbe"
+local DEBUG_MODE = false  -- Set to true for diagnostic output
+
+-- Sentinel and timing constants
+local SENTINEL_VALUE = -999999.0
+local PROBE_SETTLE_MS = 100  -- Reduced from 200ms
+local PROBE_SIGNAL = mc.ISIG_PROBE1
+
+-- Magic numbers as constants
+local POSITION_TOLERANCE = 0.001
+local WIDTH_TOLERANCE = 0.0001
+local SOFT_LIMIT_BUFFER = 0.010
+local MAX_ANGLE_FROM_AXIS = 45.0  -- Maximum reasonable angle from nearest axis
+
+-- ==================== BUTTON IDS ====================
+local BUTTON_IDS = {
+    PLUS_X = wx.wxNewId(),
+    MINUS_X = wx.wxNewId(),
+    PLUS_Y = wx.wxNewId(),
+    MINUS_Y = wx.wxNewId()
+}
+
+-- ==================== HELPER FUNCTIONS ====================
+local function ProfileGetInt(key, default)
+    local strValue = mc.mcProfileGetString(inst, PROFILE_SECTION, key, tostring(default))
+    return tonumber(strValue) or default
+end
+
+local function ProfileGetFloat(key, default)
+    local strValue = mc.mcProfileGetString(inst, PROFILE_SECTION, key, tostring(default))
+    return tonumber(strValue) or default
+end
+
+local function ProfileSetInt(key, value)
+    return mc.mcProfileWriteString(inst, PROFILE_SECTION, key, tostring(value))
+end
+
+local function ProfileSetFloat(key, value)
+    return mc.mcProfileWriteString(inst, PROFILE_SECTION, key, tostring(value))
+end
+
+local function DebugLog(message)
+    if DEBUG_MODE then
+        mc.mcCntlSetLastError(inst, "DEBUG: " .. message)
+    end
+end
+
+-- ==================== SOFT LIMIT MANAGEMENT ====================
+local function GetMaxSafeTravel(axis, direction, currentMachPos)
+    local softMin, rc1 = mc.mcAxisGetSoftlimitMin(inst, axis)
+    local softMax, rc2 = mc.mcAxisGetSoftlimitMax(inst, axis)
+    local softEnabled = mc.mcSoftLimitGetState(inst, axis)
+    
+    if softEnabled ~= 1 or rc1 ~= mc.MERROR_NOERROR or rc2 ~= mc.MERROR_NOERROR then
+        return 999  -- No soft limits, return large number
+    end
+    
+    if direction > 0 then
+        -- Moving positive
+        local available = softMax - currentMachPos - SOFT_LIMIT_BUFFER
+        return math.max(0, available)
+    else
+        -- Moving negative
+        local available = currentMachPos - softMin - SOFT_LIMIT_BUFFER
+        return math.max(0, available)
+    end
+end
+
+-- ==================== PROBE STATE CHECK ====================
+local function CheckProbeState()
+    if mc.mcSignalGetState(inst, PROBE_SIGNAL) == 1 then
+        wx.wxMessageBox(
+            "Probe is already triggered!\n\n" ..
+            "Please check:\n" ..
+            "• Probe tip is not touching anything\n" ..
+            "• Probe cable is connected properly\n" ..
+            "• Probe is not damaged",
+            "Probe Stuck", wx.wxOK + wx.wxICON_ERROR)
+        return false
+    end
+    return true
+end
+
+-- ==================== CSV LOGGING ====================
+local function LogProbeEvent(method, x, y, z)
+    pcall(function()
+        local profileName = mc.mcProfileGetName(inst)
+        local probeLogPath = mc.mcCntlGetMachDir(inst) .. "\\Profiles\\" .. 
+                           profileName .. "\\ProbeLog.csv"
+        
+        local logFile = io.open(probeLogPath, "a")
+        if logFile then
+            local fileSize = logFile:seek("end")
+            if fileSize == 0 then
+                logFile:write("Timestamp,Method,X,Y,Z\n")
+            end
+            
+            local timestamp = os.date("%Y-%m-%d %H:%M:%S")
+            logFile:write(string.format("%s,%s,%.4f,%.4f,%.4f\n",
+                timestamp, method, x, y, z))
+            logFile:close()
+        end
+    end)
+end
+
+-- ==================== PROBE CHECK ====================
+local currentTool = mc.mcToolGetCurrent(inst)
+local probeDownHandle = mc.mcSignalGetHandle(inst, PROBE_OUTPUT_SIGNAL)
+local probeDeployed = mc.mcSignalGetState(probeDownHandle)
+
+if currentTool ~= PROBE_TOOL_NUMBER or probeDeployed ~= 1 then
+    local parent = wx.NULL
+    local app = wx.wxGetApp()
+    if app then
+        local ok, top = pcall(function() return app:GetTopWindow() end)
+        if ok and top then 
+            parent = top
+        end
+    end
+    
+    local dlgW, dlgH = 360, 220
+    local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
+    local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
+    local posX = math.floor((sw - dlgW) / 2)
+    local posY = math.floor((sh - dlgH) / 2)
+    
+    local errorDlg = wx.wxDialog(parent, wx.wxID_ANY,
+        "Probe Not Active",
+        wx.wxPoint(posX, posY), wx.wxSize(dlgW, dlgH),
+        wx.wxDEFAULT_DIALOG_STYLE)
+    
+    local panel = wx.wxPanel(errorDlg, wx.wxID_ANY)
+    local sizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    local msg = wx.wxStaticText(panel, wx.wxID_ANY,
+        string.format("Please activate T%d (probe) before using angle finding.\n\n" ..
+                     "The probe must be both selected and deployed.\n\n" ..
+                     "Click 'Change Tool' to activate the probe,\n" ..
+                     "or 'Cancel' to exit.", PROBE_TOOL_NUMBER))
+    msg:SetFont(wx.wxFont(10, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
+    sizer:Add(msg, 1, wx.wxALL + wx.wxALIGN_CENTER, 20)
+    
+    local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    
+    local changeBtn = wx.wxButton(panel, wx.wxID_ANY, string.format("Change Tool to T%d", PROBE_TOOL_NUMBER))
+    changeBtn:SetMinSize(wx.wxSize(140, 28))
+    btnSizer:Add(changeBtn, 0, wx.wxRIGHT, 10)
+    
+    local cancelBtn = wx.wxButton(panel, wx.wxID_CANCEL, "Cancel")
+    cancelBtn:SetMinSize(wx.wxSize(90, 28))
+    btnSizer:Add(cancelBtn, 0, wx.wxLEFT, 0)
+    
+    sizer:Add(btnSizer, 0, wx.wxALIGN_CENTER + wx.wxBOTTOM, 15)
+    
+    changeBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function(event)
+        errorDlg:EndModal(wx.wxID_YES)
+    end)
+    
+    panel:SetSizer(sizer)
+    errorDlg:Centre()
+    
+    local result = errorDlg:ShowModal()
+    errorDlg:Destroy()
+    
+    if result == wx.wxID_YES then
+        mc.mcCntlGcodeExecuteWait(inst, string.format("T%d M6", PROBE_TOOL_NUMBER))
+        mc.mcCntlSetLastError(inst, string.format("T%d activated - click Find Angle Probe again", PROBE_TOOL_NUMBER))
+        return
+    else
+        return
+    end
+end
+
+-- ==================== LOAD SAVED SETTINGS ====================
+local lastPlaneMode = ProfileGetInt("PlaneMode", 1)
+local lastProbeDirection = ProfileGetInt("ProbeDirection", 1)
+local lastTraverseSign = ProfileGetInt("TraverseSign", 1)
+local lastDistance = ProfileGetFloat("Distance", 1.0)
+local lastActionMode = ProfileGetInt("ActionMode", 1)
+
+if lastProbeDirection < 1 or lastProbeDirection > 4 then
+    lastProbeDirection = 1
+end
+
+-- ==================== CREATE MAIN DIALOG ====================
+local parent = wx.NULL
+local app = wx.wxGetApp()
+if app then
+    local ok, top = pcall(function() return app:GetTopWindow() end)
+    if ok and top then parent = top end
+end
+
+local dlgW = 380
+local dlgH = 650
+local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
+local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
+local posX = math.floor((sw - dlgW) / 2)
+local posY = math.floor((sh - dlgH) / 2)
+
+local dlg = wx.wxDialog(parent, wx.wxID_ANY,
+    "Find Angle Probe Setup",
+    wx.wxPoint(posX, posY), wx.wxSize(dlgW, dlgH),
+    wx.wxDEFAULT_DIALOG_STYLE)
+
+if not dlg then
+    wx.wxMessageBox("Failed to create dialog", "Error", wx.wxOK + wx.wxICON_ERROR)
+    return
+end
+
+dlg:SetMinSize(wx.wxSize(380, 650))
+
+local panel = wx.wxPanel(dlg, wx.wxID_ANY)
+local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+
+-- ==================== UI CONTROLS ====================
+local instructText, distanceLabel, validationLabel
+
+-- Instruction text
+instructText = wx.wxStaticText(panel, wx.wxID_ANY, "")
+instructText:SetFont(wx.wxFont(9, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
+mainSizer:Add(instructText, 0, wx.wxALL, 10)
+
+-- Plane selection radio
+local planeChoices = {"Vertical Edge", "Horizontal Surface"}
+local planeRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
+    "Measurement Mode", wx.wxDefaultPosition, wx.wxDefaultSize,
+    planeChoices, 2, wx.wxRA_SPECIFY_COLS)
+planeRadio:SetSelection(lastPlaneMode - 1)
+mainSizer:Add(planeRadio, 0, wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, 10)
+
+-- Direction buttons
+local directionBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Probe Direction")
+local directionGrid = wx.wxGridSizer(3, 3, 5, 5)
+
+-- Create direction buttons with unique IDs
+directionGrid:Add(wx.wxStaticText(panel, wx.wxID_ANY, ""), 0, wx.wxEXPAND)
+
+local btnPlusY = wx.wxToggleButton(panel, BUTTON_IDS.PLUS_Y, "+Y")
+btnPlusY:SetMinSize(wx.wxSize(50, 30))
+directionGrid:Add(btnPlusY, 0, wx.wxEXPAND)
+directionGrid:Add(wx.wxStaticText(panel, wx.wxID_ANY, ""), 0, wx.wxEXPAND)
+
+local btnMinusX = wx.wxToggleButton(panel, BUTTON_IDS.MINUS_X, "-X")
+btnMinusX:SetMinSize(wx.wxSize(50, 30))
+directionGrid:Add(btnMinusX, 0, wx.wxEXPAND)
+directionGrid:Add(wx.wxStaticText(panel, wx.wxID_ANY, ""), 0, wx.wxEXPAND)
+
+local btnPlusX = wx.wxToggleButton(panel, BUTTON_IDS.PLUS_X, "+X")
+btnPlusX:SetMinSize(wx.wxSize(50, 30))
+directionGrid:Add(btnPlusX, 0, wx.wxEXPAND)
+
+directionGrid:Add(wx.wxStaticText(panel, wx.wxID_ANY, ""), 0, wx.wxEXPAND)
+local btnMinusY = wx.wxToggleButton(panel, BUTTON_IDS.MINUS_Y, "-Y")
+btnMinusY:SetMinSize(wx.wxSize(50, 30))
+directionGrid:Add(btnMinusY, 0, wx.wxEXPAND)
+directionGrid:Add(wx.wxStaticText(panel, wx.wxID_ANY, ""), 0, wx.wxEXPAND)
+
+directionBox:Add(directionGrid, 0, wx.wxALL + wx.wxALIGN_CENTER_HORIZONTAL, 10)
+mainSizer:Add(directionBox, 0, wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, 10)
+
+-- Store buttons in a table indexed by their IDs
+local buttons = {
+    [BUTTON_IDS.PLUS_X] = {btn = btnPlusX, index = 1, label = "+X"},
+    [BUTTON_IDS.MINUS_X] = {btn = btnMinusX, index = 2, label = "-X"},
+    [BUTTON_IDS.PLUS_Y] = {btn = btnPlusY, index = 3, label = "+Y"},
+    [BUTTON_IDS.MINUS_Y] = {btn = btnMinusY, index = 4, label = "-Y"}
+}
+
+-- Separator
+local separator1 = wx.wxStaticLine(panel, wx.wxID_ANY)
+mainSizer:Add(separator1, 0, wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT, 10)
+
+-- Traverse direction panel
+local traversePanel = wx.wxPanel(panel, wx.wxID_ANY)
+local traversePanelSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+
+local traverseBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, traversePanel, "Traverse Direction")
+
+-- Create a grid for traverse direction buttons in cross pattern
+local traverseGrid = wx.wxGridSizer(3, 3, 5, 5)
+
+-- Create all four traverse buttons
+traverseGrid:Add(wx.wxStaticText(traversePanel, wx.wxID_ANY, ""), 0, wx.wxEXPAND)
+local btnTraverseUp = wx.wxToggleButton(traversePanel, wx.wxNewId(), "+Y")
+btnTraverseUp:SetMinSize(wx.wxSize(50, 30))
+traverseGrid:Add(btnTraverseUp, 0, wx.wxEXPAND)
+traverseGrid:Add(wx.wxStaticText(traversePanel, wx.wxID_ANY, ""), 0, wx.wxEXPAND)
+
+local btnTraverseLeft = wx.wxToggleButton(traversePanel, wx.wxNewId(), "-X")
+btnTraverseLeft:SetMinSize(wx.wxSize(50, 30))
+traverseGrid:Add(btnTraverseLeft, 0, wx.wxEXPAND)
+traverseGrid:Add(wx.wxStaticText(traversePanel, wx.wxID_ANY, ""), 0, wx.wxEXPAND)
+local btnTraverseRight = wx.wxToggleButton(traversePanel, wx.wxNewId(), "+X")
+btnTraverseRight:SetMinSize(wx.wxSize(50, 30))
+traverseGrid:Add(btnTraverseRight, 0, wx.wxEXPAND)
+
+traverseGrid:Add(wx.wxStaticText(traversePanel, wx.wxID_ANY, ""), 0, wx.wxEXPAND)
+local btnTraverseDown = wx.wxToggleButton(traversePanel, wx.wxNewId(), "-Y")
+btnTraverseDown:SetMinSize(wx.wxSize(50, 30))
+traverseGrid:Add(btnTraverseDown, 0, wx.wxEXPAND)
+traverseGrid:Add(wx.wxStaticText(traversePanel, wx.wxID_ANY, ""), 0, wx.wxEXPAND)
+
+traverseBox:Add(traverseGrid, 0, wx.wxALL + wx.wxALIGN_CENTER_HORIZONTAL, 10)
+
+-- Store traverse buttons
+local traverseButtons = {
+    {btn = btnTraverseRight, axis = "X", dir = 1, label = "+X"},
+    {btn = btnTraverseLeft, axis = "X", dir = -1, label = "-X"},
+    {btn = btnTraverseUp, axis = "Y", dir = 1, label = "+Y"},
+    {btn = btnTraverseDown, axis = "Y", dir = -1, label = "-Y"}
+}
+
+-- Correct decoding from storage format
+local selectedTraverse
+if lastTraverseSign == 2 then
+    selectedTraverse = -1  -- Negative direction
+else
+    selectedTraverse = 1   -- Positive direction (default)
+end
+
+traversePanelSizer:Add(traverseBox, 1, wx.wxEXPAND)
+traversePanel:SetSizer(traversePanelSizer)
+mainSizer:Add(traversePanel, 0, wx.wxEXPAND + wx.wxALL, 10)
+
+-- Distance input
+local distanceSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+distanceLabel = wx.wxStaticText(panel, wx.wxID_ANY, "Traverse Distance:")
+distanceSizer:Add(distanceLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 10)
+
+local distanceInput = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", lastDistance))
+distanceInput:SetMinSize(wx.wxSize(100, -1))
+distanceSizer:Add(distanceInput, 1, wx.wxEXPAND)
+
+local unitsLabel = wx.wxStaticText(panel, wx.wxID_ANY, "in")
+unitsLabel:SetForegroundColour(wx.wxColour(100, 100, 100))
+distanceSizer:Add(unitsLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxLEFT, 5)
+
+-- Validation feedback label
+validationLabel = wx.wxStaticText(panel, wx.wxID_ANY, "")
+validationLabel:SetFont(wx.wxFont(8, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
+
+mainSizer:Add(distanceSizer, 0, wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, 10)
+mainSizer:Add(validationLabel, 0, wx.wxLEFT + wx.wxRIGHT, 10)
+
+-- Real-time distance validation
+distanceInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_UPDATED, function(event)
+    local value = tonumber(distanceInput:GetValue())
+    if not value then
+        validationLabel:SetLabel("Invalid number")
+        validationLabel:SetForegroundColour(wx.wxColour(255, 0, 0))
+    elseif value < MIN_TRAVERSE_DISTANCE then
+        validationLabel:SetLabel(string.format("Minimum distance is %.2f\"", MIN_TRAVERSE_DISTANCE))
+        validationLabel:SetForegroundColour(wx.wxColour(255, 128, 0))
+    else
+        validationLabel:SetLabel("")
+    end
+    panel:Layout()
+end)
+
+-- Separator 2
+local separator2 = wx.wxStaticLine(panel, wx.wxID_ANY)
+mainSizer:Add(separator2, 0, wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT, 10)
+
+-- Action selection
+local actionChoices = {"Print Angle Only", "Apply Coordinate Rotation"}
+local actionRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
+    "After Measurement", wx.wxDefaultPosition, wx.wxDefaultSize,
+    actionChoices, 2, wx.wxRA_SPECIFY_COLS)
+actionRadio:SetSelection(lastActionMode - 1)
+mainSizer:Add(actionRadio, 0, wx.wxEXPAND + wx.wxALL, 10)
+
+-- ==================== BUTTON HANDLING ====================
+local selectedButton = lastProbeDirection
+-- Ensure valid probe direction
+if not selectedButton or selectedButton < 1 or selectedButton > 4 then
+    selectedButton = nil  -- No default selection, user must choose
+end
+
+-- UpdateButtonColors function
+local function UpdateButtonColors()
+    for id, info in pairs(buttons) do
+        local btn = info.btn
+        local index = info.index
+        
+        if btn then
+            if selectedButton and index == selectedButton then
+                btn:SetValue(true)
+                btn:SetBackgroundColour(wx.wxColour(135, 180, 225))
+                btn:SetForegroundColour(wx.wxColour(255, 255, 255))
+            else
+                btn:SetValue(false)
+                btn:SetBackgroundColour(wx.wxSystemSettings.GetColour(wx.wxSYS_COLOUR_BTNFACE))
+                btn:SetForegroundColour(wx.wxSystemSettings.GetColour(wx.wxSYS_COLOUR_BTNTEXT))
+            end
+            
+            btn:Refresh()
+            btn:Update()
+        end
+    end
+    panel:Refresh()
+    panel:Update()
+end
+
+-- Set initial selection
+if selectedButton then
+    UpdateButtonColors()
+end
+
+-- UpdateTraverseDisplay function
+local UpdateTraverseDisplay = function()
+    if planeRadio:GetSelection() == 1 then
+        -- Horizontal mode - hide traverse panel
+        traversePanel:Show(false)
+        return
+    end
+    
+    traversePanel:Show(true)
+    
+    -- If no probe direction selected, disable all traverse buttons
+    if not selectedButton or selectedButton < 1 or selectedButton > 4 then
+        for _, info in ipairs(traverseButtons) do
+            info.btn:Enable(false)
+            info.btn:SetValue(false)
+            info.btn:SetForegroundColour(wx.wxColour(180, 180, 180))
+            info.btn:SetBackgroundColour(wx.wxSystemSettings.GetColour(wx.wxSYS_COLOUR_BTNFACE))
+            info.btn:Refresh()
+        end
+        traversePanel:Layout()
+        return
+    end
+    
+    local probeDir = selectedButton
+    local probingAxis = (probeDir <= 2) and "X" or "Y"
+    local traverseAxis = (probingAxis == "X") and "Y" or "X"
+    
+    -- Update button states based on probe direction
+    for _, info in ipairs(traverseButtons) do
+        if info.axis == traverseAxis then
+            -- Enable buttons for traverse axis
+            info.btn:Enable(true)
+            info.btn:SetForegroundColour(wx.wxSystemSettings.GetColour(wx.wxSYS_COLOUR_BTNTEXT))
+            -- Set selection state
+            if info.dir == selectedTraverse then
+                info.btn:SetValue(true)
+                info.btn:SetBackgroundColour(wx.wxColour(135, 180, 225))
+                info.btn:SetForegroundColour(wx.wxColour(255, 255, 255))
+            else
+                info.btn:SetValue(false)
+                info.btn:SetBackgroundColour(wx.wxSystemSettings.GetColour(wx.wxSYS_COLOUR_BTNFACE))
+            end
+        else
+            -- Disable buttons for probe axis
+            info.btn:Enable(false)
+            info.btn:SetValue(false)
+            info.btn:SetForegroundColour(wx.wxColour(180, 180, 180))
+            info.btn:SetBackgroundColour(wx.wxSystemSettings.GetColour(wx.wxSYS_COLOUR_BTNFACE))
+        end
+        info.btn:Refresh()
+        info.btn:Update()
+    end
+    
+    traversePanel:Layout()
+    traversePanel:Refresh()
+    traversePanel:Update()
+end
+
+-- Traverse button event handler
+local function OnTraverseButton(event)
+    local clickedId = event:GetId()
+    
+    -- Find which button was clicked by ID
+    for _, info in ipairs(traverseButtons) do
+        if info.btn:GetId() == clickedId and info.btn:IsEnabled() then
+            selectedTraverse = info.dir
+            UpdateTraverseDisplay()
+            break
+        end
+    end
+    
+    event:Skip()
+end
+
+-- Connect traverse button events with proper IDs
+for _, info in ipairs(traverseButtons) do
+    local btnId = info.btn:GetId()
+    info.btn:Connect(btnId, wx.wxEVT_COMMAND_TOGGLEBUTTON_CLICKED, OnTraverseButton)
+end
+
+-- Update UI based on plane mode
+local function UpdatePlaneMode()
+    local mode = planeRadio:GetSelection() + 1
+    
+    if mode == 1 then  -- Vertical
+        instructText:SetLabel(
+            "Probe two points along a vertical edge:\n" ..
+            "• First probe in selected direction\n" ..
+            "• Traverse perpendicular to second position\n" ..
+            "• Second probe in same direction")
+        
+        traversePanel:Show(true)
+        separator2:Show(true)
+        actionRadio:Show(true)
+        distanceLabel:SetLabel("Traverse Distance:")
+        
+        UpdateTraverseDisplay()
+        dlg:SetSize(wx.wxSize(380, 650))
+    else  -- Horizontal
+        instructText:SetLabel(
+            "Probe two points on a horizontal surface:\n" ..
+            "• First probe down at current position\n" ..
+            "• Move in selected direction\n" ..
+            "• Second probe down to measure height difference")
+        
+        traversePanel:Show(false)
+        separator2:Show(false)
+        actionRadio:Show(false)
+        distanceLabel:SetLabel("Movement Distance:")
+        
+        dlg:SetSize(wx.wxSize(380, 480))
+    end
+    
+    panel:Layout()
+    dlg:Centre()
+end
+
+-- Button event handler
+local function OnDirectionButton(event)
+    local id = event:GetId()
+    local clickedInfo = buttons[id]
+    
+    if clickedInfo then
+        selectedButton = clickedInfo.index
+        UpdateButtonColors()
+        
+        if planeRadio:GetSelection() == 0 then
+            UpdateTraverseDisplay()
+        end
+    end
+    
+    event:Skip()
+end
+
+-- Connect button events
+for id, info in pairs(buttons) do
+    if info.btn then
+        info.btn:Connect(id, wx.wxEVT_COMMAND_TOGGLEBUTTON_CLICKED, OnDirectionButton)
+    end
+end
+
+-- Connect plane radio event
+planeRadio:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_RADIOBOX_SELECTED, function(event)
+    UpdatePlaneMode()
+end)
+
+-- Dialog buttons
+mainSizer:Add(0, 0, 1, wx.wxEXPAND)  -- This pushes buttons toward bottom
+local buttonSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+local startBtn = wx.wxButton(panel, wx.wxID_OK, "Start Probe")
+local cancelBtn = wx.wxButton(panel, wx.wxID_CANCEL, "Cancel")
+startBtn:SetMinSize(wx.wxSize(100, 35))
+cancelBtn:SetMinSize(wx.wxSize(100, 35))
+buttonSizer:Add(0, 0, 1, wx.wxEXPAND)  -- Left spacer
+buttonSizer:Add(startBtn, 0, wx.wxRIGHT, 10)
+buttonSizer:Add(cancelBtn, 0, wx.wxLEFT, 10)
+buttonSizer:Add(0, 0, 1, wx.wxEXPAND)  -- Right spacer
+mainSizer:Add(buttonSizer, 0, wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, 15)
+
+-- Apply sizer
+panel:SetSizer(mainSizer)
+dlg:Fit()
+dlg:Centre()
+
+-- Initialize UI
+UpdatePlaneMode()
+UpdateTraverseDisplay()
+if selectedButton then
+    UpdateButtonColors()
+end
+
+-- ==================== SHOW DIALOG ====================
+local isProcessing = false
+local dialogResult = dlg:ShowModal()
+
+if dialogResult == wx.wxID_OK then
+    -- Prevent double-processing
+    if isProcessing then
+        dlg:Destroy()
+        return
+    end
+    isProcessing = true
+    
+    -- Get values
+    local planeMode = planeRadio:GetSelection() + 1
+    local probeDirection = selectedButton
+    local traverseSign = (selectedTraverse == 1) and 1 or 2  -- Convert to storage format
+    local distance = tonumber(distanceInput:GetValue())
+    local actionMode = 1
+    
+    if planeMode == 1 then
+        actionMode = actionRadio:GetSelection() + 1
+    end
+    
+    -- Validate probe direction selection
+    if not probeDirection or probeDirection < 1 or probeDirection > 4 then
+        wx.wxMessageBox("Please select a probe direction (+X, -X, +Y, or -Y)",
+                      "No Probe Direction Selected", wx.wxOK + wx.wxICON_ERROR)
+        isProcessing = false  -- Reset flag on error
+        dlg:Destroy()
+        return
+    end
+    
+    -- Validate traverse direction selection properly
+    if planeMode == 1 then
+        if not selectedTraverse or (selectedTraverse ~= 1 and selectedTraverse ~= -1) then
+            wx.wxMessageBox("Please select a traverse direction for the vertical edge probe",
+                          "No Traverse Direction Selected", wx.wxOK + wx.wxICON_ERROR)
+            isProcessing = false  -- Reset flag on error
+            dlg:Destroy()
+            return
+        end
+    end
+    
+    -- Validate distance to prevent zero
+    if not distance then
+        wx.wxMessageBox("Please enter a valid distance value", "Input Error", wx.wxOK + wx.wxICON_ERROR)
+        isProcessing = false  -- Reset flag on error
+        dlg:Destroy()
+        return
+    elseif distance < MIN_DISTANCE_ALLOWED then
+        wx.wxMessageBox(string.format("Distance must be at least %.3f\"", MIN_DISTANCE_ALLOWED), 
+                       "Input Error", wx.wxOK + wx.wxICON_ERROR)
+        isProcessing = false  -- Reset flag on error
+        dlg:Destroy()
+        return
+    elseif distance < MIN_TRAVERSE_DISTANCE then
+        local msg = string.format("Distance %.4f is below minimum of %.2f\". Continue anyway?", 
+            distance, MIN_TRAVERSE_DISTANCE)
+        if wx.wxMessageBox(msg, "Small Distance Warning", wx.wxYES_NO + wx.wxICON_WARNING) ~= wx.wxYES then
+            isProcessing = false  -- Reset flag on error
+            dlg:Destroy()
+            return
+        end
+    end
+    
+    dlg:Destroy()
+    
+    -- ==================== ROBUST CLEANUP FUNCTION ====================
+    -- FIX #8 & #12: More comprehensive cleanup with soft limit restoration
+    local originalMaxTravel = nil  -- Store original value at dialog scope
+    
+    local function ProbeCleanup(success, errorMsg)
+        -- Wrap entire cleanup in protected call to ensure it completes
+        local cleanupOk, cleanupErr = pcall(function()
+            -- Clear sentinel mode
+            mc.mcCntlSetPoundVar(inst, 388, 0)
+            
+            -- Clear runtime state variables
+            mc.mcCntlSetPoundVar(inst, 395, -1e308)
+            mc.mcCntlSetPoundVar(inst, 396, -1e308)
+            mc.mcCntlSetPoundVar(inst, 397, -1e308)
+            
+            -- FIX #12: Restore original max travel if it was modified
+            if originalMaxTravel then
+                mc.mcCntlSetPoundVar(inst, 305, originalMaxTravel)
+                originalMaxTravel = nil
+            end
+            
+            -- Clear any other temporary pound variables used during probing
+            mc.mcCntlSetPoundVar(inst, 389, -1e308)
+            mc.mcCntlSetPoundVar(inst, 390, -1e308)
+            mc.mcCntlSetPoundVar(inst, 391, -1e308)
+            mc.mcCntlSetPoundVar(inst, 392, -1e308)
+            mc.mcCntlSetPoundVar(inst, 394, -1e308)
+            
+            -- FIX #6: DO NOT MOVE if probe is triggered or if there was any failure
+            if mc.mcSignalGetState(inst, PROBE_SIGNAL) == 1 then
+                mc.mcCntlSetLastError(inst, "ERROR: Probe still triggered - NO MOVEMENTS - manual intervention required")
+                -- NO MOVEMENTS AT ALL
+            elseif not success then
+                mc.mcCntlSetLastError(inst, "ERROR: Probe sequence failed - NO RETURN MOVEMENT for safety")
+                -- NO MOVEMENTS AT ALL
+            end
+            
+            -- Log status
+            if not success and errorMsg then
+                mc.mcCntlSetLastError(inst, "Probe failed: " .. tostring(errorMsg))
+            end
+            
+            -- Critical delay for interpreter stability
+            wx.wxMilliSleep(PROBE_SETTLE_MS)
+            
+            -- Reset isProcessing flag
+            isProcessing = false
+        end)
+        
+        -- If cleanup itself failed, at minimum reset the critical flag
+        if not cleanupOk then
+            mc.mcCntlSetLastError(inst, "WARNING: Cleanup error: " .. tostring(cleanupErr))
+            isProcessing = false
+        end
+    end
+    
+    -- ==================== ROTATION PREVIEW FUNCTION ====================
+    local function ShowRotationPreview(probe1X, probe1Y, probe2X, probe2Y, angle, nearestAxis)
+        -- Re-acquire parent window
+        local parent = wx.NULL
+        local app = wx.wxGetApp()
+        if app then
+            local ok, top = pcall(function() return app:GetTopWindow() end)
+            if ok and top then 
+                parent = top
+            end
+        end
+        
+        -- Calculate default rotation center
+        local centerX = (probe1X + probe2X) / 2
+        local centerY = (probe1Y + probe2Y) / 2
+        
+        -- Create rotation preview dialog
+        local dlgW, dlgH = 540, 720
+        local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
+        local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
+        local posX = math.floor((sw - dlgW) / 2)
+        local posY = math.floor((sh - dlgH) / 2)
+        
+        local previewDlg = wx.wxDialog(parent, wx.wxID_ANY,
+            "Rotation Preview",
+            wx.wxPoint(posX, posY), wx.wxSize(dlgW, dlgH),
+            wx.wxDEFAULT_DIALOG_STYLE)
+        
+        local panel2 = wx.wxPanel(previewDlg, wx.wxID_ANY)
+        local sizer2 = wx.wxBoxSizer(wx.wxVERTICAL)
+        
+        -- Angle display
+        local angleMsg = wx.wxStaticText(panel2, wx.wxID_ANY,
+            string.format("Measured angle: %.4f° from %s axis", angle, nearestAxis))
+        angleMsg:SetFont(wx.wxFont(10, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_BOLD))
+        sizer2:Add(angleMsg, 0, wx.wxALL + wx.wxALIGN_CENTER, 10)
+        
+        -- Visual representation panel
+        local visualPanel = wx.wxPanel(panel2, wx.wxID_ANY, 
+            wx.wxDefaultPosition, wx.wxSize(480, 400))
+        visualPanel:SetBackgroundColour(wx.wxColour(245, 245, 245))
+        visualPanel:SetToolTip("Red line: Measured edge\nGray lines: Machine axes")
+        
+        -- RESTORED: Enhanced Paint handler with angle amplification for small angles
+        visualPanel:Connect(wx.wxEVT_PAINT, function(event)
+            local dc = wx.wxPaintDC(visualPanel)
+            local width, height = visualPanel:GetSize():GetWidth(), visualPanel:GetSize():GetHeight()
+            local centerVX = width / 2
+            local centerVY = height / 2
+            
+            -- Draw grid
+            dc:SetPen(wx.wxPen(wx.wxColour(220, 220, 220), 1, wx.wxSOLID))
+            for i = 0, width, 20 do
+                dc:DrawLine(i, 0, i, height)
+            end
+            for i = 0, height, 20 do
+                dc:DrawLine(0, i, width, i)
+            end
+            
+            -- Draw axes
+            dc:SetPen(wx.wxPen(wx.wxColour(150, 150, 150), 2, wx.wxSOLID))
+            dc:DrawLine(10, centerVY, width - 10, centerVY)  -- X axis
+            dc:DrawLine(centerVX, 10, centerVX, height - 10)  -- Y axis
+            
+            -- Draw axis labels
+            dc:SetFont(wx.wxFont(7, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
+            dc:SetTextForeground(wx.wxColour(150, 150, 150))
+            dc:DrawText("+X", width - 25, centerVY - 15)
+            dc:DrawText("-X", 5, centerVY - 15)
+            dc:DrawText("+Y", centerVX + 5, 5)
+            dc:DrawText("-Y", centerVX + 5, height - 12)
+            
+            -- Calculate the actual measured edge angle
+            local actualAngleRad = math.atan2(probe2Y - probe1Y, probe2X - probe1X)
+            local actualAngleDeg = angle  -- Use the angle passed to the function
+            
+            -- Determine if we need to amplify for visualization
+            local visualAngleRad = actualAngleRad
+            local amplificationFactor = 1
+            local isAmplified = false
+            
+            -- Amplify small angles for better visibility
+            if math.abs(actualAngleDeg) < 5 then
+                -- Progressive amplification: stronger for smaller angles
+                if math.abs(actualAngleDeg) < 0.5 then
+                    amplificationFactor = 20
+                elseif math.abs(actualAngleDeg) < 1 then
+                    amplificationFactor = 10
+                elseif math.abs(actualAngleDeg) < 2 then
+                    amplificationFactor = 5
+                else
+                    amplificationFactor = 3
+                end
+                
+                -- Determine which axis we're nearest to and amplify appropriately
+                if nearestAxis == "X" then
+                    -- Angle from X axis - amplify the Y component
+                    local baseAngle = 0  -- X axis is at 0 radians
+                    visualAngleRad = baseAngle + (actualAngleRad - baseAngle) * amplificationFactor
+                else  -- nearestAxis == "Y"
+                    -- Angle from Y axis - amplify the X component
+                    local baseAngle = math.pi / 2  -- Y axis is at 90 degrees
+                    -- Normalize to closest Y axis (could be ±90)
+                    if actualAngleRad < 0 then
+                        baseAngle = -math.pi / 2
+                    end
+                    visualAngleRad = baseAngle + (actualAngleRad - baseAngle) * amplificationFactor
+                end
+                
+                isAmplified = true
+            end
+            
+            -- Draw measured edge line
+            local lineLen = math.min(width, height) * 0.35
+            local x1 = centerVX - lineLen * math.cos(visualAngleRad)
+            local y1 = centerVY + lineLen * math.sin(visualAngleRad)
+            local x2 = centerVX + lineLen * math.cos(visualAngleRad)
+            local y2 = centerVY - lineLen * math.sin(visualAngleRad)
+            
+            dc:SetPen(wx.wxPen(wx.wxColour(255, 0, 0), 2, wx.wxSOLID))
+            dc:DrawLine(x1, y1, x2, y2)
+            
+            -- Draw angle arc to show the actual angle
+            local arcRadius = 60
+            dc:SetPen(wx.wxPen(wx.wxColour(0, 60, 140), 2, wx.wxSOLID))
+            dc:SetBrush(wx.wxBrush(wx.wxColour(0, 60, 140, 30), wx.wxTRANSPARENT))
+            
+            -- Determine arc parameters based on nearest axis
+            local startAngle, endAngle
+            if nearestAxis == "X" then
+                -- Arc from X-axis to edge
+                startAngle = 0
+                endAngle = actualAngleDeg
+            else  -- Y axis
+                -- For Y-axis, we need to show angle from Y-axis to the actual edge
+                local edgeAngleDeg = math.atan2(probe2Y - probe1Y, probe2X - probe1X) * (180 / math.pi)
+                
+                -- Determine which Y-axis (90° or -90°) is closer to the edge
+                local distTo90 = math.abs(edgeAngleDeg - 90)
+                local distToMinus90 = math.abs(edgeAngleDeg - (-90))
+                
+                if distTo90 <= distToMinus90 then
+                    -- Closer to +Y axis (90°)
+                    startAngle = 90
+                    endAngle = edgeAngleDeg
+                else
+                    -- Closer to -Y axis (-90°)
+                    startAngle = -90
+                    endAngle = edgeAngleDeg
+                end
+                
+                -- Ensure we take the shorter arc
+                if math.abs(endAngle - startAngle) > 180 then
+                    if endAngle > startAngle then
+                        endAngle = endAngle - 360
+                    else
+                        endAngle = endAngle + 360
+                    end
+                end
+            end
+            
+            -- Draw the angle arc
+            if math.abs(actualAngleDeg) > 0.01 then  -- Only draw if angle is measurable
+                local arcSteps = 20
+                local prevX, prevY
+                for i = 0, arcSteps do
+                    local t = i / arcSteps
+                    local arcAngle = startAngle + t * (endAngle - startAngle)
+                    local arcAngleRad = arcAngle * math.pi / 180
+                    local arcX = centerVX + arcRadius * math.cos(arcAngleRad)
+                    local arcY = centerVY - arcRadius * math.sin(arcAngleRad)  -- Negative because Y increases downward
+                    
+                    if i > 0 then
+                        dc:DrawLine(prevX, prevY, arcX, arcY)
+                    end
+                    prevX, prevY = arcX, arcY
+                end
+            end
+            
+            -- Add legend and amplification notice
+            dc:SetFont(wx.wxFont(8, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
+            dc:SetTextForeground(wx.wxColour(255, 0, 0))
+            dc:DrawText("— Measured edge", 10, height - 30)
+            
+            dc:SetTextForeground(wx.wxColour(0, 60, 140))
+            dc:DrawText("— Angle from " .. nearestAxis .. " axis", 10, height - 15)
+            
+            -- Show amplification notice if angle is amplified
+            if isAmplified then
+                dc:SetFont(wx.wxFont(9, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_BOLD))
+                dc:SetTextForeground(wx.wxColour(200, 100, 0))
+                dc:DrawText(string.format("View amplified %dx for visibility", amplificationFactor), 
+                           width - 180, 10)
+                
+                -- Add actual vs visual angle indicator
+                dc:SetFont(wx.wxFont(8, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
+                dc:DrawText(string.format("Actual: %.4f° | Visual: %.2f°", 
+                                         actualAngleDeg, actualAngleDeg * amplificationFactor),
+                           width - 180, 25)
+            end
+            
+            dc:delete()
+        end)
+        
+        sizer2:Add(visualPanel, 0, wx.wxALL + wx.wxALIGN_CENTER, 5)
+        
+        -- Rotation center inputs
+        local centerBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel2, "Rotation Center")
+        
+        -- Coordinate mode toggle
+        local coordModeChoices = {"Work Coordinates", "Machine Coordinates"}
+        local coordModeRadio = wx.wxRadioBox(panel2, wx.wxID_ANY,
+            "Coordinate Mode", wx.wxDefaultPosition, wx.wxDefaultSize,
+            coordModeChoices, 2, wx.wxRA_SPECIFY_COLS)
+        coordModeRadio:SetSelection(0)
+        coordModeRadio:SetToolTip("Work: Position relative to current work offset (G54-G59)\n" ..
+                                 "Machine: Absolute machine position")
+        
+        centerBox:Add(coordModeRadio, 0, wx.wxEXPAND + wx.wxALL, 5)
+        
+        -- X and Y inputs
+        local inputSizer = wx.wxFlexGridSizer(2, 2, 5, 10)
+        
+        local xLabel = wx.wxStaticText(panel2, wx.wxID_ANY, "X:")
+        local xInput = wx.wxTextCtrl(panel2, wx.wxID_ANY, string.format("%.4f", centerX))
+        xInput:SetToolTip("X coordinate of rotation center\nDefault: midpoint of measured edge")
+        inputSizer:Add(xLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxALIGN_RIGHT)
+        inputSizer:Add(xInput, 0, wx.wxEXPAND)
+        
+        local yLabel = wx.wxStaticText(panel2, wx.wxID_ANY, "Y:")
+        local yInput = wx.wxTextCtrl(panel2, wx.wxID_ANY, string.format("%.4f", centerY))
+        yInput:SetToolTip("Y coordinate of rotation center\nDefault: midpoint of measured edge")
+        inputSizer:Add(yLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxALIGN_RIGHT)
+        inputSizer:Add(yInput, 0, wx.wxEXPAND)
+        
+        inputSizer:AddGrowableCol(1)
+        centerBox:Add(inputSizer, 0, wx.wxEXPAND + wx.wxALL, 5)
+        
+        -- Add helper note
+        -- NOTE: Duplicate logic warning - G68 angle calculation repeated in multiple places
+        -- TODO: Future refactor - centralize G68 angle sign logic into single function
+        local g68Angle = (nearestAxis == "Y") and -angle or angle
+        local noteText = wx.wxStaticText(panel2, wx.wxID_ANY, 
+            string.format("Rotation will align the edge with the %s axis\n" ..
+                         "G68 command: X%.4f Y%.4f R%.4f", 
+                         nearestAxis, centerX, centerY, g68Angle))
+        noteText:SetFont(wx.wxFont(8, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
+        noteText:SetForegroundColour(wx.wxColour(100, 100, 100))
+        centerBox:Add(noteText, 0, wx.wxLEFT + wx.wxBOTTOM, 10)
+        
+        -- RESTORED: Update note when coordinates change
+        local function UpdateNote()
+            local x = tonumber(xInput:GetValue()) or centerX
+            local y = tonumber(yInput:GetValue()) or centerY
+            -- NOTE: Duplicate logic - G68 angle sign flip repeated here
+            local g68Angle = (nearestAxis == "Y") and -angle or angle
+            noteText:SetLabel(string.format("Rotation will align the edge with the %s axis\n" ..
+                                           "G68 command: X%.4f Y%.4f R%.4f", 
+                                           nearestAxis, x, y, g68Angle))
+            panel2:Layout()
+        end
+        
+        xInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateNote)
+        yInput:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_UPDATED, UpdateNote)
+        
+        -- RESTORED: Handle coordinate mode toggle with error handling
+        coordModeRadio:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_RADIOBOX_SELECTED, function(event)
+            local mode = coordModeRadio:GetSelection()
+            local currentX = tonumber(xInput:GetValue())
+            local currentY = tonumber(yInput:GetValue())
+            
+            if not currentX or not currentY then
+                -- Invalid input - show warning
+                wx.wxMessageBox("Please enter valid numeric coordinates before switching modes.",
+                              "Invalid Input", wx.wxOK + wx.wxICON_WARNING)
+                return
+            end
+            
+            -- Wrap coordinate conversion in pcall for error handling
+            local ok, result = pcall(function()
+                local machPosX = mc.mcAxisGetMachinePos(inst, mc.X_AXIS)
+                local workPosX = mc.mcAxisGetPos(inst, mc.X_AXIS)
+                local machPosY = mc.mcAxisGetMachinePos(inst, mc.Y_AXIS)
+                local workPosY = mc.mcAxisGetPos(inst, mc.Y_AXIS)
+                
+                if mode == 1 then
+                    -- Convert work to machine
+                    return {
+                        x = currentX + (machPosX - workPosX),
+                        y = currentY + (machPosY - workPosY)
+                    }
+                else
+                    -- Convert machine to work
+                    return {
+                        x = currentX - (machPosX - workPosX),
+                        y = currentY - (machPosY - workPosY)
+                    }
+                end
+            end)
+            
+            if ok then
+                xInput:SetValue(string.format("%.4f", result.x))
+                yInput:SetValue(string.format("%.4f", result.y))
+            else
+                wx.wxMessageBox("Failed to get machine position. Please check CNC connection.",
+                              "Position Error", wx.wxOK + wx.wxICON_ERROR)
+                -- Reset radio button to previous mode
+                coordModeRadio:SetSelection(mode == 0 and 1 or 0)
+            end
+            
+            UpdateNote()
+        end)
+        
+        sizer2:Add(centerBox, 0, wx.wxALL + wx.wxEXPAND, 5)
+        
+        -- Buttons
+        local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+        local applyBtn = wx.wxButton(panel2, wx.wxID_OK, "Apply Rotation")
+        local cancelBtn = wx.wxButton(panel2, wx.wxID_CANCEL, "Cancel")
+        
+        applyBtn:SetMinSize(wx.wxSize(110, 35))
+        cancelBtn:SetMinSize(wx.wxSize(90, 35))
+        applyBtn:SetToolTip("Apply G68 rotation to align edge with axis")
+        cancelBtn:SetToolTip("Close without applying rotation")
+        
+        btnSizer:Add(applyBtn, 0, wx.wxRIGHT, 10)
+        btnSizer:Add(cancelBtn, 0, wx.wxLEFT, 0)
+        
+        sizer2:Add(btnSizer, 0, wx.wxALIGN_CENTER + wx.wxALL, 15)
+        
+        panel2:SetSizer(sizer2)
+        previewDlg:Centre()
+        
+        if previewDlg:ShowModal() == wx.wxID_OK then
+            -- Get rotation center
+            local rotCenterX = tonumber(xInput:GetValue())
+            local rotCenterY = tonumber(yInput:GetValue())
+            local coordMode = coordModeRadio:GetSelection()
+            
+            if not rotCenterX or not rotCenterY then
+                wx.wxMessageBox("Invalid rotation center coordinates", "Input Error", 
+                              wx.wxOK + wx.wxICON_ERROR)
+                previewDlg:Destroy()
+                return false
+            end
+            
+            -- FIX #5: Proper coordinate conversion error handling
+            if coordMode == 1 then
+                local ok, result = pcall(function()
+                    local machPosX = mc.mcAxisGetMachinePos(inst, mc.X_AXIS)
+                    local workPosX = mc.mcAxisGetPos(inst, mc.X_AXIS)
+                    local machPosY = mc.mcAxisGetMachinePos(inst, mc.Y_AXIS)
+                    local workPosY = mc.mcAxisGetPos(inst, mc.Y_AXIS)
+                    
+                    return {
+                        x = rotCenterX - (machPosX - workPosX),
+                        y = rotCenterY - (machPosY - workPosY)
+                    }
+                end)
+                
+                if ok then
+                    rotCenterX = result.x
+                    rotCenterY = result.y
+                else
+                    wx.wxMessageBox(
+                        "Failed to convert coordinates to work coordinate system.\n\n" ..
+                        "Cannot apply rotation without proper coordinate conversion.\n" ..
+                        "Please verify machine connection and try again.",
+                        "Coordinate Conversion Error", 
+                        wx.wxOK + wx.wxICON_ERROR)
+                    previewDlg:Destroy()
+                    return false  -- Abort rotation
+                end
+            end
+            
+            -- Apply G68 rotation
+            -- NOTE: Duplicate logic - G68 angle sign flip repeated here (third instance)
+            local g68Angle = (nearestAxis == "Y") and -angle or angle
+            local g68Cmd = string.format("G68 X%.4f Y%.4f R%.4f", 
+                                       rotCenterX, rotCenterY, g68Angle)
+            
+            mc.mcCntlGcodeExecuteWait(inst, g68Cmd)
+            mc.mcCntlSetLastError(inst, string.format("Applied rotation: %.4f° around X%.4f Y%.4f", 
+                                                     g68Angle, rotCenterX, rotCenterY))
+            
+            wx.wxMessageBox(string.format("Rotation applied successfully!\n\n" ..
+                                         "Angle: %.4f°\n" ..
+                                         "Center: X%.4f Y%.4f\n" ..
+                                         "Command: %s\n\n" ..
+                                         "Use G69 to cancel rotation",
+                                         g68Angle, rotCenterX, rotCenterY, g68Cmd),
+                          "Rotation Applied", wx.wxOK + wx.wxICON_INFORMATION)
+            
+            previewDlg:Destroy()
+        else
+            previewDlg:Destroy()
+            mc.mcCntlSetLastError(inst, string.format("Edge angle: %.4f° from %s axis (rotation cancelled)", 
+                                                     angle, nearestAxis))
+        end
+    end
+    
+    -- ==================== PROBE EXECUTION ====================
+    local function ExecuteFindAngleProbe()
+        -- Transaction tracking for atomic operations
+        local probeTransaction = {
+            probe1X = nil,
+            probe1Y = nil,
+            probe2X = nil,
+            probe2Y = nil,
+            angle = nil,
+            complete = false
+        }
+        
+        -- Check if probe is triggered at start
+        if not CheckProbeState() then
+            return false
+        end
+        
+        -- Get probe parameters with validation
+        local probeDiameter = mc.mcCntlGetPoundVar(inst, 300) or 0.125
+        local xOffset = mc.mcCntlGetPoundVar(inst, 301) or 0
+        local yOffset = mc.mcCntlGetPoundVar(inst, 302) or 0
+        local fastFeed = mc.mcCntlGetPoundVar(inst, 303) or 30
+        local slowFeed = mc.mcCntlGetPoundVar(inst, 304) or 5
+        local maxTravel = mc.mcCntlGetPoundVar(inst, 305) or 1.0
+        
+        -- Validate parameters
+        local function ValidateNumber(value, default, name)
+            if type(value) ~= "number" or value < -1e300 then
+                mc.mcCntlSetLastError(inst, string.format("WARNING: %s invalid, using %.2f", name, default))
+                return default
+            end
+            return value
+        end
+        
+        probeDiameter = ValidateNumber(probeDiameter, 0.125, "Probe diameter")
+        fastFeed = ValidateNumber(fastFeed, 30, "Fast feed")
+        slowFeed = ValidateNumber(slowFeed, 5, "Slow feed")
+        maxTravel = ValidateNumber(maxTravel, 1.0, "Max travel")
+        
+        -- Check for critical uninitialized values
+        if fastFeed <= 0 or slowFeed <= 0 or maxTravel <= 0 then
+            wx.wxMessageBox(
+                "Probe parameters not properly initialized.\n\n" ..
+                "Please set pound variables:\n" ..
+                "#303 = Fast probe feedrate\n" ..
+                "#304 = Slow probe feedrate\n" ..
+                "#305 = Maximum probe travel distance",
+                "Configuration Error", wx.wxOK + wx.wxICON_ERROR)
+            return false
+        end
+        
+        -- Get starting position
+        local startX = mc.mcAxisGetPos(inst, mc.X_AXIS)
+        local startY = mc.mcAxisGetPos(inst, mc.Y_AXIS)
+        local startZ = mc.mcAxisGetPos(inst, mc.Z_AXIS)
+        
+        -- Store runtime state
+        mc.mcCntlSetPoundVar(inst, 395, startZ)
+        
+        if planeMode == 1 then  -- Vertical
+            -- Map probe direction to M311 command
+            local m311Map = {[1] = "S1", [2] = "S2", [3] = "S3", [4] = "S4"}
+            local probeCmd = m311Map[probeDirection]
+            
+            -- Check soft limits for first probe
+            local probeAxis = (probeDirection <= 2) and mc.X_AXIS or mc.Y_AXIS
+            local probeDir = (probeDirection == 1 or probeDirection == 3) and 1 or -1
+            local currentMachPos = mc.mcAxisGetMachinePos(inst, probeAxis)
+            local maxSafeTravel = GetMaxSafeTravel(probeAxis, probeDir, currentMachPos)
+            
+            if maxSafeTravel < maxTravel then
+                mc.mcCntlSetLastError(inst, string.format(
+                    "Probe travel reduced from %.3f to %.3f due to soft limits",
+                    maxTravel, maxSafeTravel))
+                -- Store original before modifying
+                originalMaxTravel = maxTravel
+                -- Temporarily override max travel for this probe
+                mc.mcCntlSetPoundVar(inst, 305, maxSafeTravel)
+            end
+            
+            mc.mcCntlSetLastError(inst, "Performing first edge probe...")
+            
+            -- FIRST PROBE WITH SENTINEL MODE
+            if not CheckProbeState() then return false end
+            
+            -- Enable sentinel mode
+            mc.mcCntlSetPoundVar(inst, 388, 1)
+            mc.mcCntlSetPoundVar(inst, 389, SENTINEL_VALUE)
+            mc.mcCntlSetPoundVar(inst, 390, SENTINEL_VALUE)
+            mc.mcCntlSetPoundVar(inst, 391, SENTINEL_VALUE)
+            mc.mcCntlSetPoundVar(inst, 392, SENTINEL_VALUE)
+            
+            local rc = mc.mcCntlGcodeExecuteWait(inst, probeCmd .. " M311")
+            
+            -- Clear sentinel mode
+            mc.mcCntlSetPoundVar(inst, 388, 0)
+            wx.wxMilliSleep(PROBE_SETTLE_MS)
+            
+            -- Check for failure
+            local edge1Machine = mc.mcCntlGetPoundVar(inst, 389)
+            local edge1 = mc.mcCntlGetPoundVar(inst, 391)
+            
+            if edge1Machine == SENTINEL_VALUE then
+                wx.wxMessageBox(
+                    "First probe did not detect an edge.\n\n" ..
+                    "The probe traveled the full distance without triggering.\n" ..
+                    "Please check:\n" ..
+                    "• Probe is close enough to the edge\n" ..
+                    "• Probe travel distance is sufficient\n" ..
+                    "• Edge exists where expected",
+                    "Probe Miss", wx.wxOK + wx.wxICON_ERROR)
+                return false
+            end
+            
+            -- Store first probe position
+            local probe1X, probe1Y
+            if probeDirection <= 2 then  -- X probing
+                probe1X = edge1
+                probe1Y = startY
+            else  -- Y probing
+                probe1X = startX
+                probe1Y = edge1
+            end
+            
+            probeTransaction.probe1X = probe1X
+            probeTransaction.probe1Y = probe1Y
+            
+            -- Store in runtime state
+            mc.mcCntlSetPoundVar(inst, 396, probe1X)
+            mc.mcCntlSetPoundVar(inst, 397, probe1Y)
+            
+            -- Log first probe
+            LogProbeEvent(probeCmd .. " M311", probe1X, probe1Y, startZ)
+            
+            DebugLog(string.format("Probe 1: X=%.4f, Y=%.4f", probe1X, probe1Y))
+            
+            -- Return to start
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G0 X%.4f Y%.4f", startX, startY))
+            
+            -- Calculate traverse movement
+            local traverseX, traverseY = 0, 0
+            local traverseMultiplier = selectedTraverse  -- Already -1 or 1
+            
+            if probeDirection <= 2 then
+                traverseY = distance * traverseMultiplier
+            else
+                traverseX = distance * traverseMultiplier
+            end
+            
+            -- Calculate target position
+            local targetX = startX + traverseX
+            local targetY = startY + traverseY
+            
+            -- FIX #13: Check traverse against soft limits and fail gracefully
+            local traverseAxis = (probeDirection <= 2) and mc.Y_AXIS or mc.X_AXIS
+            local traverseDir = (probeDirection <= 2) and selectedTraverse or selectedTraverse
+            local currentTraverseMachPos = mc.mcAxisGetMachinePos(inst, traverseAxis)
+            local maxSafeTraverse = GetMaxSafeTravel(traverseAxis, traverseDir, currentTraverseMachPos)
+            
+            if distance > maxSafeTraverse then
+                wx.wxMessageBox(
+                    string.format("Traverse distance %.4f exceeds soft limit.\n\n" ..
+                                 "Maximum safe traverse: %.4f\"\n" ..
+                                 "Please reduce traverse distance or adjust machine position.",
+                                 distance, maxSafeTraverse),
+                    "Soft Limit Warning", wx.wxOK + wx.wxICON_ERROR)
+                return false
+            end
+            
+            -- TRAVERSE WITH COLLISION DETECTION
+            mc.mcCntlSetLastError(inst, "Traversing with collision detection...")
+            local traverseCmd = string.format("G31.1 X%.4f Y%.4f F150", targetX, targetY)
+            mc.mcCntlGcodeExecuteWait(inst, traverseCmd)
+            
+            -- Check if probe triggered during traverse
+            local currentX = mc.mcAxisGetPos(inst, mc.X_AXIS)
+            local currentY = mc.mcAxisGetPos(inst, mc.Y_AXIS)
+            
+            if math.abs(currentX - targetX) > POSITION_TOLERANCE or 
+               math.abs(currentY - targetY) > POSITION_TOLERANCE then
+                wx.wxMessageBox(
+                    "Collision detected during traverse!\n\n" ..
+                    "Probe hit unexpected obstacle while moving to second position.\n" ..
+                    "Traverse stopped at: X" .. string.format("%.4f", currentX) .. 
+                    " Y" .. string.format("%.4f", currentY) .. "\n\n" ..
+                    "NO RETURN MOVEMENT - Manual intervention required.",
+                    "Traverse Collision", wx.wxOK + wx.wxICON_ERROR)
+                
+                -- FIX #6: NO RETURN MOVEMENT on failure
+                return false
+            end
+            
+            -- SECOND PROBE WITH SENTINEL MODE
+            mc.mcCntlSetLastError(inst, "Performing second edge probe...")
+            
+            if not CheckProbeState() then return false end
+            
+            -- Enable sentinel mode
+            mc.mcCntlSetPoundVar(inst, 388, 1)
+            mc.mcCntlSetPoundVar(inst, 389, SENTINEL_VALUE)
+            mc.mcCntlSetPoundVar(inst, 390, SENTINEL_VALUE)
+            mc.mcCntlSetPoundVar(inst, 391, SENTINEL_VALUE)
+            mc.mcCntlSetPoundVar(inst, 392, SENTINEL_VALUE)
+            
+            rc = mc.mcCntlGcodeExecuteWait(inst, probeCmd .. " M311")
+            
+            -- Clear sentinel mode
+            mc.mcCntlSetPoundVar(inst, 388, 0)
+            wx.wxMilliSleep(PROBE_SETTLE_MS)
+            
+            -- Check for failure
+            local edge2Machine = mc.mcCntlGetPoundVar(inst, 389)
+            local edge2 = mc.mcCntlGetPoundVar(inst, 391)
+            
+            if edge2Machine == SENTINEL_VALUE then
+                wx.wxMessageBox(
+                    "Second probe did not detect an edge.\n\n" ..
+                    "The probe traveled the full distance without triggering.\n" ..
+                    "Please check:\n" ..
+                    "• Edge continues to second probe position\n" ..
+                    "• Traverse distance is appropriate",
+                    "Probe Miss", wx.wxOK + wx.wxICON_ERROR)
+                return false
+            end
+            
+            -- Store second probe position
+            local probe2X, probe2Y
+            if probeDirection <= 2 then  -- X probing
+                probe2X = edge2
+                probe2Y = startY + (distance * traverseMultiplier)
+            else  -- Y probing
+                probe2X = startX + (distance * traverseMultiplier)
+                probe2Y = edge2
+            end
+            
+            probeTransaction.probe2X = probe2X
+            probeTransaction.probe2Y = probe2Y
+            
+            -- Log second probe
+            LogProbeEvent(probeCmd .. " M311", probe2X, probe2Y, startZ)
+            
+            DebugLog(string.format("Probe 2: X=%.4f, Y=%.4f", probe2X, probe2Y))
+            
+            -- VALIDATE BOTH PROBES BEFORE CALCULATION
+            if not probeTransaction.probe1X or not probeTransaction.probe1Y or 
+               not probeTransaction.probe2X or not probeTransaction.probe2Y then
+                wx.wxMessageBox(
+                    "Cannot calculate angle - probe sequence incomplete.\n\n" ..
+                    "Missing probe data. No angle calculated.\n" ..
+                    "Please retry the probe operation.",
+                    "Incomplete Probe Data", wx.wxOK + wx.wxICON_ERROR)
+                return false
+            end
+            
+            -- Check for zero-width measurement
+            local deltaX = probe2X - probe1X
+            local deltaY = probe2Y - probe1Y
+            
+            if math.abs(deltaX) < WIDTH_TOLERANCE and math.abs(deltaY) < WIDTH_TOLERANCE then
+                wx.wxMessageBox(
+                    "Invalid measurement - both probes hit the same point.\n\n" ..
+                    "Measured difference: X=" .. string.format("%.6f", deltaX) .. 
+                    " Y=" .. string.format("%.6f", deltaY) .. "\n\n" ..
+                    "Possible causes:\n" ..
+                    "• Traverse distance too small\n" ..
+                    "• Edge is perfectly aligned (0°)\n" ..
+                    "• Probe not functioning correctly",
+                    "Invalid Measurement", wx.wxOK + wx.wxICON_ERROR)
+                return false
+            end
+            
+            -- Calculate angle
+            local angle = 0
+            local nearestAxis = ""
+            
+            DebugLog(string.format("Delta: X=%.4f, Y=%.4f", deltaX, deltaY))
+            
+            if probeDirection <= 2 then  -- X-direction probing
+                angle = math.atan2(deltaX, deltaY) * (180 / math.pi)
+                nearestAxis = "Y"
+                
+                if angle > 90 then 
+                    angle = angle - 180
+                elseif angle < -90 then 
+                    angle = angle + 180
+                end
+            else  -- Y-direction probing
+                angle = math.atan2(deltaY, deltaX) * (180 / math.pi)
+                nearestAxis = "X"
+                
+                if angle > 90 then 
+                    angle = angle - 180
+                elseif angle < -90 then 
+                    angle = angle + 180
+                end
+            end
+            
+            -- Validate maximum angle (should be ±45° from nearest axis)
+            if math.abs(angle) > MAX_ANGLE_FROM_AXIS then
+                wx.wxMessageBox(
+                    string.format("Measured angle (%.2f°) exceeds maximum expected angle (±%.1f°).\n\n" ..
+                                 "This usually indicates:\n" ..
+                                 "• Wrong axis selected for measurement\n" ..
+                                 "• Edge is closer to perpendicular axis\n" ..
+                                 "• Measurement error\n\n" ..
+                                 "Please verify probe setup and retry.",
+                                 math.abs(angle), MAX_ANGLE_FROM_AXIS),
+                    "Angle Out of Range", wx.wxOK + wx.wxICON_WARNING)
+                -- Continue anyway but warn user
+            end
+            
+            probeTransaction.angle = angle
+            probeTransaction.complete = true
+            
+            -- Return to start
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G0 X%.4f Y%.4f", startX, startY))
+            
+            -- Display result
+            mc.mcCntlSetLastError(inst, string.format("Edge angle: %.4f° from %s axis", 
+                                                     angle, nearestAxis))
+            
+            if actionMode == 1 then
+                wx.wxMessageBox(string.format("Measured angle: %.4f° from %s axis",
+                                             angle, nearestAxis),
+                               "Angle Measurement", wx.wxOK + wx.wxICON_INFORMATION)
+            else
+                -- Only show preview if all data valid
+                if probeTransaction.complete and angle then
+                    ShowRotationPreview(probe1X, probe1Y, probe2X, probe2Y, angle, nearestAxis)
+                else
+                    wx.wxMessageBox(
+                        "Cannot show rotation preview.\n\n" ..
+                        "Probe sequence did not complete successfully.",
+                        "Preview Unavailable", wx.wxOK + wx.wxICON_WARNING)
+                end
+            end
+            
+        else  -- Horizontal plane
+            -- Initialize transaction for horizontal mode
+            probeTransaction.probe1X = startX
+            probeTransaction.probe1Y = startY
+            
+            -- First Z probe with sentinel mode
+            mc.mcCntlSetLastError(inst, "Performing first surface probe...")
+            
+            if not CheckProbeState() then return false end
+            
+            -- Enable sentinel mode
+            mc.mcCntlSetPoundVar(inst, 388, 1)
+            mc.mcCntlSetPoundVar(inst, 389, SENTINEL_VALUE)
+            mc.mcCntlSetPoundVar(inst, 390, SENTINEL_VALUE)
+            mc.mcCntlSetPoundVar(inst, 391, SENTINEL_VALUE)
+            mc.mcCntlSetPoundVar(inst, 392, SENTINEL_VALUE)
+            mc.mcCntlSetPoundVar(inst, 394, SENTINEL_VALUE)  -- Clear #394 for Z probe
+            
+            local rc = mc.mcCntlGcodeExecuteWait(inst, "S5 M311")
+            
+            -- Clear sentinel mode
+            mc.mcCntlSetPoundVar(inst, 388, 0)
+            wx.wxMilliSleep(PROBE_SETTLE_MS)
+            
+            -- Check for failure
+            local z1Machine = mc.mcCntlGetPoundVar(inst, 389)
+            local z1 = mc.mcCntlGetPoundVar(inst, 391)
+            
+            if z1Machine == SENTINEL_VALUE then
+                wx.wxMessageBox(
+                    "First surface probe did not detect a surface.\n\n" ..
+                    "The probe traveled the full distance without triggering.\n" ..
+                    "Please check probe distance from surface.",
+                    "Probe Miss", wx.wxOK + wx.wxICON_ERROR)
+                return false
+            end
+            
+            -- Store first Z in transaction
+            probeTransaction.probe1Z = z1
+            
+            -- Store runtime state for horizontal mode
+            mc.mcCntlSetPoundVar(inst, 396, startX)
+            mc.mcCntlSetPoundVar(inst, 397, startY)
+            
+            -- Log first Z probe
+            LogProbeEvent("S5 M311", startX, startY, z1)
+            
+            -- Return to start Z
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G0 Z%.4f", startZ))
+            
+            -- Move in selected direction
+            local moveX = 0
+            local moveY = 0
+            
+            if probeDirection == 1 then
+                moveX = distance
+            elseif probeDirection == 2 then
+                moveX = -distance
+            elseif probeDirection == 3 then
+                moveY = distance
+            else
+                moveY = -distance
+            end
+            
+            local targetX = startX + moveX
+            local targetY = startY + moveY
+            
+            mc.mcCntlSetLastError(inst, "Moving to second measurement position...")
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G0 X%.4f Y%.4f", targetX, targetY))
+            
+            -- Update transaction
+            probeTransaction.probe2X = targetX
+            probeTransaction.probe2Y = targetY
+            
+            -- Second Z probe with sentinel mode
+            mc.mcCntlSetLastError(inst, "Performing second surface probe...")
+            
+            if not CheckProbeState() then return false end
+            
+            -- Enable sentinel mode
+            mc.mcCntlSetPoundVar(inst, 388, 1)
+            mc.mcCntlSetPoundVar(inst, 389, SENTINEL_VALUE)
+            mc.mcCntlSetPoundVar(inst, 390, SENTINEL_VALUE)
+            mc.mcCntlSetPoundVar(inst, 391, SENTINEL_VALUE)
+            mc.mcCntlSetPoundVar(inst, 392, SENTINEL_VALUE)
+            mc.mcCntlSetPoundVar(inst, 394, SENTINEL_VALUE)
+            
+            rc = mc.mcCntlGcodeExecuteWait(inst, "S5 M311")
+            
+            -- Clear sentinel mode
+            mc.mcCntlSetPoundVar(inst, 388, 0)
+            wx.wxMilliSleep(PROBE_SETTLE_MS)
+            
+            -- Check for failure
+            local z2Machine = mc.mcCntlGetPoundVar(inst, 389)
+            local z2 = mc.mcCntlGetPoundVar(inst, 391)
+            
+            if z2Machine == SENTINEL_VALUE then
+                wx.wxMessageBox(
+                    "Second surface probe did not detect a surface.\n\n" ..
+                    "The probe traveled the full distance without triggering.\n" ..
+                    "Please check probe distance from surface.",
+                    "Probe Miss", wx.wxOK + wx.wxICON_ERROR)
+                return false
+            end
+            
+            -- Store second Z in transaction
+            probeTransaction.probe2Z = z2
+            probeTransaction.complete = true
+            
+            -- Log second Z probe
+            LogProbeEvent("S5 M311", targetX, targetY, z2)
+            
+            -- Return to start Z
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G0 Z%.4f", startZ))
+            
+            -- Calculate tilt
+            local heightDiff = z2 - z1
+            local tiltAngleRad = math.atan(heightDiff / distance)
+            local tiltAngleDeg = tiltAngleRad * 180 / math.pi
+            
+            -- Store angle in transaction
+            probeTransaction.angle = tiltAngleDeg
+            
+            -- Determine tilt direction
+            local directionName = ""
+            if probeDirection == 1 then directionName = "+X"
+            elseif probeDirection == 2 then directionName = "-X"
+            elseif probeDirection == 3 then directionName = "+Y"
+            else directionName = "-Y"
+            end
+            
+            local tiltDescription = ""
+            if math.abs(heightDiff) < WIDTH_TOLERANCE then
+                tiltDescription = "Surface is level"
+            elseif heightDiff > 0 then
+                tiltDescription = string.format("Surface rises %.4f° toward %s", 
+                    math.abs(tiltAngleDeg), directionName)
+            else
+                tiltDescription = string.format("Surface falls %.4f° toward %s", 
+                    math.abs(tiltAngleDeg), directionName)
+            end
+            
+            -- Return to original starting position
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G0 X%.4f Y%.4f", startX, startY))
+            
+            -- Display result
+            mc.mcCntlSetLastError(inst, tiltDescription)
+            wx.wxMessageBox(string.format("%s\n\n" ..
+                "Height difference: %.4f\"\n" ..
+                "Over distance: %.4f\"\n\n" ..
+                "Probe 1 position: X%.4f Y%.4f Z%.4f\n" ..
+                "Probe 2 position: X%.4f Y%.4f Z%.4f\n" ..
+                "Delta: X%.4f Y%.4f Z%.4f",
+                tiltDescription, heightDiff, distance,
+                startX, startY, z1,
+                targetX, targetY, z2,
+                moveX, moveY, heightDiff),
+                "Surface Tilt Measurement", wx.wxOK + wx.wxICON_INFORMATION)
+        end
+        
+        return true
+    end
+    
+    -- Execute with guaranteed cleanup
+    local success, result = xpcall(
+        ExecuteFindAngleProbe,
+        function(err)
+            ProbeCleanup(false, err)
+            return debug.traceback(err)
+        end
+    )
+    
+    -- Always cleanup
+    ProbeCleanup(success, result)
+    
+    -- Only save settings after successful probe
+    if success and result ~= false then
+        -- Save settings only after successful completion
+        ProfileSetInt("PlaneMode", planeMode)
+        ProfileSetInt("ProbeDirection", probeDirection)
+        ProfileSetInt("TraverseSign", traverseSign)
+        ProfileSetFloat("Distance", distance)
+        
+        if planeMode == 1 then
+            ProfileSetInt("ActionMode", actionMode)
+        end
+        
+        mc.mcCntlSetLastError(inst, "Probe completed successfully - settings saved")
+    else
+        if not success then
+            mc.mcCntlSetLastError(inst, "Probe sequence failed - settings not saved")
+            wx.wxMessageBox("Probe sequence failed:\n" .. tostring(result), 
+                           "Probe Error", wx.wxOK + wx.wxICON_ERROR)
+        elseif result == false then
+            mc.mcCntlSetLastError(inst, "Probe cancelled - settings not saved")
+        end
+    end
+    
+else
+    dlg:Destroy()
+end

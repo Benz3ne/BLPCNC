@@ -1,0 +1,915 @@
+-- X/Y Probe v2.4 - Button Left-Down Script for Mach4
+
+-- Required Pound Variables:
+-- #301 = X offset from spindle center to probe tip
+-- #302 = Y offset from spindle center to probe tip  
+-- #303 = Fast feedrate for probing
+-- #304 = Slow feedrate for final probe
+-- #305 = Maximum probe travel distance
+-- #388 = Probe mode state (0=normal, 1=sentinel mode) [M311 v1.4]
+-- #389 = Machine coordinate of final probe contact [M311 v1.4]
+-- #391 = Edge position (adjusted for probe radius) [M311 v1.4]
+
+-- Required Macro:
+-- m311.mcs v1.4.0+ must exist in your profile's Macros folder
+
+local inst = mc.mcGetInstance()
+if not inst then 
+    wx.wxMessageBox("Failed to get Mach4 instance.\n\nPlease restart Mach4 and try again.", 
+                   "Initialization Error", wx.wxOK + wx.wxICON_ERROR)
+    return 
+end
+
+-- Constants
+local SENTINEL_VALUE = -999999.0  -- Impossible position for failure detection
+local PROBE_SIGNAL = mc.ISIG_PROBE1  -- Match M311's signal
+
+-- ============================================
+-- HELPER FUNCTIONS
+-- ============================================
+
+-- Check for active G68 rotation
+local function CheckForRotation()
+    -- Check if G68 is active by looking at modal group
+    local rotation = mc.mcCntlGetPoundVar(inst, 4016)  -- Modal rotation
+    if type(rotation) == "number" and rotation == 68 then  -- Check for G68 specifically, not G69
+        local result = wx.wxMessageBox(
+            "WARNING: Coordinate rotation (G68) is active.\n\n" ..
+            "The probe will use machine coordinates and ignore rotation.\n" ..
+            "This is intentional for safety.\n\n" ..
+            "Continue probing?",
+            "Rotation Active", 
+            wx.wxYES_NO + wx.wxICON_WARNING)
+        return result == wx.wxYES
+    end
+    return true
+end
+
+-- Check soft limits for axis movement
+local function CheckSoftLimits(axis, targetMachPos)
+    local softMin, rc1 = mc.mcAxisGetSoftlimitMin(inst, axis)
+    local softMax, rc2 = mc.mcAxisGetSoftlimitMax(inst, axis)
+    local softEnabled = mc.mcSoftLimitGetState(inst, axis)
+    
+    if softEnabled == 1 and rc1 == mc.MERROR_NOERROR and rc2 == mc.MERROR_NOERROR then
+        if targetMachPos < softMin or targetMachPos > softMax then
+            return false, softMin, softMax
+        end
+    end
+    return true, nil, nil
+end
+
+-- Check if probe movement will exceed soft limits (for graceful failure)
+local function ValidateProbeTravel(axis, direction, maxTravel)
+    local currentMachPos = mc.mcAxisGetMachinePos(inst, axis)
+    local targetMachPos = currentMachPos + (maxTravel * direction)
+    
+    local softMin, rc1 = mc.mcAxisGetSoftlimitMin(inst, axis)
+    local softMax, rc2 = mc.mcAxisGetSoftlimitMax(inst, axis)
+    local softEnabled = mc.mcSoftLimitGetState(inst, axis)
+    
+    if softEnabled == 1 and rc1 == mc.MERROR_NOERROR and rc2 == mc.MERROR_NOERROR then
+        if direction > 0 and targetMachPos > softMax then
+            local available = softMax - currentMachPos
+            return false, available
+        elseif direction < 0 and targetMachPos < softMin then
+            local available = currentMachPos - softMin
+            return false, available
+        end
+    end
+    return true, maxTravel
+end
+
+-- ============================================
+-- TOOL AND PROBE DEPLOYMENT CHECK
+-- ============================================
+-- Check if T90 (probe) is active
+local currentTool = mc.mcToolGetCurrent(inst)
+-- Check if probe is physically deployed (output 7)
+local probeDownHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7)
+local probeDeployed = mc.mcSignalGetState(probeDownHandle)
+
+-- Check both conditions - T90 is current AND probe is deployed
+if currentTool ~= 90 or probeDeployed ~= 1 then
+    -- Determine parent window
+    local parent = wx.NULL
+    local app = wx.wxGetApp()
+    if app then
+        local ok, top = pcall(function() return app:GetTopWindow() end)
+        if ok and top then parent = top end
+    end
+    
+    -- Show error dialog
+    local dlgW, dlgH = 340, 200
+    local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
+    local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
+    local posX = math.floor((sw - dlgW) / 2)
+    local posY = math.floor((sh - dlgH) / 2)
+    
+    local errorDlg = wx.wxDialog(parent, wx.wxID_ANY,
+        "Probe Not Active",
+        wx.wxPoint(posX, posY), wx.wxSize(dlgW, dlgH),
+        wx.wxDEFAULT_DIALOG_STYLE)
+    
+    local panel = wx.wxPanel(errorDlg, wx.wxID_ANY)
+    local sizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    -- Error message
+    local msg = wx.wxStaticText(panel, wx.wxID_ANY,
+        "Please activate T90 (probe) and deploy it before using X/Y probe.\n\n" ..
+        "Click 'Change Tool to T90' to activate the probe,\n" ..
+        "or 'Cancel' to exit.")
+    msg:SetFont(wx.wxFont(10, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
+    sizer:Add(msg, 1, wx.wxALL + wx.wxALIGN_CENTER, 20)
+    
+    -- Button sizer
+    local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    
+    -- Change Tool button
+    local changeBtn = wx.wxButton(panel, wx.wxID_ANY, "Change Tool to T90")
+    changeBtn:SetMinSize(wx.wxSize(130, 28))
+    btnSizer:Add(changeBtn, 0, wx.wxRIGHT, 10)
+    
+    -- Cancel button
+    local cancelBtn = wx.wxButton(panel, wx.wxID_CANCEL, "Cancel")
+    cancelBtn:SetMinSize(wx.wxSize(90, 28))
+    btnSizer:Add(cancelBtn, 0, wx.wxLEFT, 0)
+    
+    sizer:Add(btnSizer, 0, wx.wxALIGN_CENTER + wx.wxBOTTOM, 15)
+    
+    -- Handle Change Tool button
+    changeBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function(event)
+        errorDlg:EndModal(wx.wxID_YES)  -- Use YES as indicator to change tool
+    end)
+    
+    panel:SetSizer(sizer)
+    errorDlg:Centre()
+    
+    local result = errorDlg:ShowModal()
+    errorDlg:Destroy()
+    
+    if result == wx.wxID_YES then
+        -- Execute tool change and exit - user will need to click probe again
+        mc.mcCntlGcodeExecuteWait(inst, "T90 M6")
+        mc.mcCntlSetLastError(inst, "T90 activated - click X/Y Probe again to continue")
+        return
+    else
+        return  -- User cancelled
+    end
+end
+
+-- Check for G68 rotation warning
+if not CheckForRotation() then
+    return  -- User cancelled due to rotation
+end
+
+-- ============================================
+-- HELPER FUNCTIONS
+-- ============================================
+
+-- Helper functions for profile storage
+local function ProfileGetInt(section, key, default)
+    local strValue = mc.mcProfileGetString(inst, section, key, tostring(default))
+    return tonumber(strValue) or default
+end
+
+local function ProfileSetInt(section, key, value)
+    return mc.mcProfileWriteString(inst, section, key, tostring(value))
+end
+
+-- Execute probe with sentinel mode for reliable failure detection (M311 v1.4 compatible)
+local function ExecuteProbeWithSentinel(direction)
+    -- Enable sentinel mode (M311 v1.4 pattern)
+    mc.mcCntlSetPoundVar(inst, 388, 1)  -- Set sentinel mode flag
+    mc.mcCntlSetPoundVar(inst, 389, SENTINEL_VALUE)
+    mc.mcCntlSetPoundVar(inst, 390, SENTINEL_VALUE)
+    mc.mcCntlSetPoundVar(inst, 391, SENTINEL_VALUE)
+    mc.mcCntlSetPoundVar(inst, 392, SENTINEL_VALUE)
+    
+    -- Execute probe (following Outside Center pattern exactly)
+    local probeCmd = string.format("S%d M311", direction)
+    local rc = mc.mcCntlGcodeExecuteWait(inst, probeCmd)
+    
+    -- Clear sentinel mode flag
+    mc.mcCntlSetPoundVar(inst, 388, 0)
+    
+    -- Check return code
+    if rc ~= mc.MERROR_NOERROR then
+        error(string.format("M311 execution failed with code: %d", rc))
+    end
+    
+    -- Check for probe failure using #389 (machine coordinate) per M311 v1.4
+    local edgeMachine = mc.mcCntlGetPoundVar(inst, 389)  -- Machine coordinate
+    local edgeWork = mc.mcCntlGetPoundVar(inst, 391)     -- Work coordinate (edge position)
+    
+    if edgeMachine == SENTINEL_VALUE then
+        return false, nil, nil  -- Probe failed
+    end
+    
+    return true, edgeWork, edgeMachine  -- Success with both coordinates
+end
+
+-- ============================================
+-- UI SETUP
+-- ============================================
+
+-- Load saved settings
+local lastDirection = ProfileGetInt("ProbeXY", "Direction", 1)  -- 1=+X, 2=-X, 3=+Y, 4=-Y
+local lastAction = ProfileGetInt("ProbeXY", "ActionMode", 1)
+
+-- Determine parent window
+local parent = wx.NULL
+local app = wx.wxGetApp()
+if app then
+    local ok, top = pcall(function() return app:GetTopWindow() end)
+    if ok and top then parent = top end
+end
+
+-- Dialog dimensions
+local dlgW, dlgH = 320, 320
+local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
+local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
+local posX = math.floor((sw - dlgW) / 2)
+local posY = math.floor((sh - dlgH) / 2)
+
+-- Create main dialog
+local dlg = wx.wxDialog(parent, wx.wxID_ANY,
+    "X/Y Probe Setup",
+    wx.wxPoint(posX, posY), wx.wxSize(dlgW, dlgH),
+    wx.wxDEFAULT_DIALOG_STYLE)
+
+-- Main panel
+local panel = wx.wxPanel(dlg, wx.wxID_ANY)
+local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+
+-- Declare UI elements
+local instructText, datumText
+local actionRadio
+
+-- Create controls
+instructText = wx.wxStaticText(panel, wx.wxID_ANY,
+    "Position the probe near the edge to measure:\n" ..
+    "• Probe will move in the selected direction\n" ..
+    "• Ensure adequate clearance for probe travel")
+instructText:SetFont(wx.wxFont(9, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
+
+datumText = wx.wxStaticText(panel, wx.wxID_ANY, "")
+datumText:SetFont(wx.wxFont(9, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
+
+-- Create individual radio buttons for plus-shape layout
+directionButtons = {}
+selectedDirection = lastDirection
+
+local actionChoices = {"Set Datum", "Print Coords", "Set/Center"}
+actionRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
+    "Action", wx.wxDefaultPosition, wx.wxDefaultSize,
+    actionChoices, 3, wx.wxRA_SPECIFY_COLS)
+actionRadio:SetSelection(lastAction - 1)
+
+-- Function to update datum description
+local function UpdateDatumDescription()
+    local action = actionRadio:GetSelection() + 1
+    local dirSel = selectedDirection
+    
+    local dirStr = ({"+X", "-X", "+Y", "-Y"})[dirSel]
+    local axisStr = (dirSel <= 2) and "X" or "Y"
+    
+    local description = ""
+    if action == 1 then  -- Set Datum
+        description = "Datum will be set to:\n• " .. axisStr .. "0 at probed edge\n• Other axes unchanged"
+    elseif action == 2 then  -- Print Coords
+        description = "Will print machine coordinates of:\n• Probed edge (" .. dirStr .. " direction)"
+    else  -- Set/Center
+        description = "Two-step center finding:\n• First probe: " .. dirStr .. " edge\n• Second probe: opposite edge"
+    end
+    datumText:SetLabel(description)
+    panel:Layout()
+end
+
+-- Build the UI layout
+-- Instructions (plain text, no box)
+mainSizer:Add(instructText, 0, wx.wxALL, 10)
+
+-- Direction selection with plus-shape layout
+local dirBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Probe Direction")
+
+-- Create a panel for the direction buttons
+local dirPanel = wx.wxPanel(panel, wx.wxID_ANY)
+local dirGrid = wx.wxGridSizer(3, 3, 5, 5)
+
+-- Create individual radio buttons in plus shape
+-- Top row: empty, +Y, empty
+dirGrid:Add(0, 0, 0, wx.wxEXPAND)  -- Empty top-left
+
+local btnPlusY = wx.wxRadioButton(dirPanel, wx.wxID_ANY, "+Y", 
+                                  wx.wxDefaultPosition, wx.wxSize(40, 25))
+btnPlusY:SetValue(selectedDirection == 3)
+dirGrid:Add(btnPlusY, 0, wx.wxALIGN_CENTER)
+directionButtons[3] = btnPlusY
+
+dirGrid:Add(0, 0, 0, wx.wxEXPAND)  -- Empty top-right
+
+-- Middle row: -X, center space, +X
+local btnMinusX = wx.wxRadioButton(dirPanel, wx.wxID_ANY, "-X",
+                                   wx.wxDefaultPosition, wx.wxSize(40, 25))
+btnMinusX:SetValue(selectedDirection == 2)
+dirGrid:Add(btnMinusX, 0, wx.wxALIGN_CENTER)
+directionButtons[2] = btnMinusX
+
+dirGrid:Add(0, 0, 0, wx.wxEXPAND)  -- Empty center
+
+local btnPlusX = wx.wxRadioButton(dirPanel, wx.wxID_ANY, "+X",
+                                  wx.wxDefaultPosition, wx.wxSize(40, 25))
+btnPlusX:SetValue(selectedDirection == 1)
+dirGrid:Add(btnPlusX, 0, wx.wxALIGN_CENTER)
+directionButtons[1] = btnPlusX
+
+-- Bottom row: empty, -Y, empty
+dirGrid:Add(0, 0, 0, wx.wxEXPAND)  -- Empty bottom-left
+
+local btnMinusY = wx.wxRadioButton(dirPanel, wx.wxID_ANY, "-Y",
+                                   wx.wxDefaultPosition, wx.wxSize(40, 25))
+btnMinusY:SetValue(selectedDirection == 4)
+dirGrid:Add(btnMinusY, 0, wx.wxALIGN_CENTER)
+directionButtons[4] = btnMinusY
+
+dirGrid:Add(0, 0, 0, wx.wxEXPAND)  -- Empty bottom-right
+
+dirPanel:SetSizer(dirGrid)
+dirGrid:Fit(dirPanel)
+
+-- Add the direction panel to the static box
+dirBox:Add(dirPanel, 0, wx.wxALIGN_CENTER + wx.wxALL, 10)
+mainSizer:Add(dirBox, 0, wx.wxALL + wx.wxEXPAND, 10)
+
+-- Options section
+local optionsBox = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Options")
+
+-- Add Action radio box
+optionsBox:Add(actionRadio, 0, wx.wxEXPAND + wx.wxALL, 5)
+
+mainSizer:Add(optionsBox, 0, wx.wxALL + wx.wxEXPAND, 10)
+
+-- Connect radio button events
+for i = 1, 4 do
+    directionButtons[i]:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_RADIOBUTTON_SELECTED, function(event)
+        selectedDirection = i
+        UpdateDatumDescription()
+    end)
+end
+
+-- Update datum description when controls change
+actionRadio:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_RADIOBOX_SELECTED, function(event)
+    UpdateDatumDescription()
+end)
+
+-- Initial update of datum description
+UpdateDatumDescription()
+
+-- Add datum text with fixed height reservation
+local datumSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+datumSizer:Add(datumText, 0, wx.wxALIGN_CENTER)
+datumSizer:SetMinSize(wx.wxSize(-1, 60))  -- Reserve fixed height for datum text
+mainSizer:Add(datumSizer, 0, wx.wxALL + wx.wxEXPAND, 10)
+
+-- Spacer
+mainSizer:AddStretchSpacer()
+
+-- Buttons
+local buttonSizer = wx.wxStdDialogButtonSizer()
+local okBtn = wx.wxButton(panel, wx.wxID_OK, "OK")
+local cancelBtn = wx.wxButton(panel, wx.wxID_CANCEL, "Cancel")
+
+okBtn:SetMinSize(wx.wxSize(90, 28))
+cancelBtn:SetMinSize(wx.wxSize(90, 28))
+
+buttonSizer:AddButton(okBtn)
+buttonSizer:AddButton(cancelBtn)
+buttonSizer:Realize()
+
+mainSizer:Add(buttonSizer, 0, wx.wxALL + wx.wxALIGN_CENTER, 8)
+
+-- Apply layout
+panel:SetSizer(mainSizer)
+mainSizer:Fit(panel)
+dlg:Fit()
+dlg:Centre()
+
+-- ============================================
+-- SHOW DIALOG AND PROCESS
+-- ============================================
+if dlg:ShowModal() == wx.wxID_OK then
+    -- Get values
+    local dirSel = selectedDirection  -- Now from the individual radio buttons
+    local actionSel = actionRadio:GetSelection() + 1
+    
+    -- Save settings
+    ProfileSetInt("ProbeXY", "Direction", dirSel)
+    ProfileSetInt("ProbeXY", "ActionMode", actionSel)
+    
+    dlg:Destroy()
+    
+    -- ============================================
+    -- EXECUTE PROBE SEQUENCE
+    -- ============================================
+    local function ExecuteXYProbe()
+        -- Save configuration pound variables for potential rollback
+        local savedPoundVars = {
+            [301] = mc.mcCntlGetPoundVar(inst, 301),  -- X offset
+            [302] = mc.mcCntlGetPoundVar(inst, 302),  -- Y offset
+            [303] = mc.mcCntlGetPoundVar(inst, 303),  -- Fast feed
+            [304] = mc.mcCntlGetPoundVar(inst, 304),  -- Slow feed
+            [305] = mc.mcCntlGetPoundVar(inst, 305),  -- Max travel
+            -- DO NOT save 388-392 (probe state/results)
+        }
+        
+        -- Initialize probe progress tracking
+        local probeProgress = {
+            attempted = {},
+            completed = {},
+            failed = nil
+        }
+        
+        -- Initialize probe log
+        local profileName = mc.mcProfileGetName(inst)
+        local probeLogPath = mc.mcCntlGetMachDir(inst) .. "\\Profiles\\" .. profileName .. "\\ProbeLog.csv"
+        local logFile = io.open(probeLogPath, "a")
+        if logFile then
+            -- Write header if file is new/empty
+            local fileSize = logFile:seek("end")
+            if fileSize == 0 then
+                logFile:write("Timestamp,Method,X,Y,Z\n")
+            end
+            logFile:close()
+        end
+        
+        -- Helper function to log probe events
+        local function LogProbeEvent(method, x, y, z)
+            local ok, err = pcall(function()
+                local logFile = io.open(probeLogPath, "a")
+                if logFile then
+                    local timestamp = os.date("%Y-%m-%d %H:%M:%S")
+                    local logEntry = string.format("%s,%s,%.4f,%.4f,%.4f\n",
+                        timestamp, method, x, y, z)
+                    logFile:write(logEntry)
+                    logFile:close()
+                end
+            end)
+            -- Silent fail on logging errors
+        end
+        
+        -- ============================================
+        -- COMPREHENSIVE CLEANUP FUNCTION
+        -- ============================================
+        local function ProbeCleanup(success, errorMsg)
+            -- Step 1: Check probe state but DO NOT MOVE
+            if mc.mcSignalGetState(inst, PROBE_SIGNAL) == 1 then
+                mc.mcCntlSetLastError(inst, "WARNING: Probe is triggered - manual intervention required")
+            end
+            
+            -- Step 2: Always clear sentinel mode flag
+            mc.mcCntlSetPoundVar(inst, 388, 0)
+            
+            -- Step 3: Clear runtime variables
+            mc.mcCntlSetPoundVar(inst, 389, -1e308)
+            mc.mcCntlSetPoundVar(inst, 390, -1e308)
+            mc.mcCntlSetPoundVar(inst, 391, -1e308)
+            mc.mcCntlSetPoundVar(inst, 392, -1e308)
+            
+            -- Step 4: Restore configuration variables if probe failed
+            if not success then
+                for var, value in pairs(savedPoundVars) do
+                    if type(value) == "number" and value > -1e300 then
+                        mc.mcCntlSetPoundVar(inst, var, value)
+                    end
+                end
+                
+                -- Report failure with error details
+                if errorMsg then
+                    mc.mcCntlSetLastError(inst, "XY probe failed: " .. errorMsg)
+                else
+                    mc.mcCntlSetLastError(inst, "XY probe failed - see previous error")
+                end
+            end
+            
+            -- Step 5: Give interpreter time to settle
+            wx.wxMilliSleep(100)
+        end
+        
+        -- Get probe parameters from pound variables
+        local xProbeOffset = mc.mcCntlGetPoundVar(inst, 301)
+        local yProbeOffset = mc.mcCntlGetPoundVar(inst, 302)
+        local fastFeed = mc.mcCntlGetPoundVar(inst, 303)
+        local slowFeed = mc.mcCntlGetPoundVar(inst, 304)
+        local maxTravel = mc.mcCntlGetPoundVar(inst, 305)
+        
+        -- Validate and set defaults
+        if type(xProbeOffset) ~= "number" then xProbeOffset = 0 end
+        if type(yProbeOffset) ~= "number" then yProbeOffset = 0 end
+        if type(fastFeed) ~= "number" or fastFeed <= 0 then fastFeed = 30 end
+        if type(slowFeed) ~= "number" or slowFeed <= 0 then slowFeed = 5 end
+        if type(maxTravel) ~= "number" or maxTravel <= 0 then maxTravel = 1.0 end
+        
+        -- Check for uninitialized pound variables
+        if xProbeOffset < -1e300 or yProbeOffset < -1e300 or fastFeed < -1e300 or 
+           slowFeed < -1e300 or maxTravel < -1e300 then
+            mc.mcCntlSetLastError(inst, "ERROR: Probe parameters not initialized. Set #301-305")
+            wx.wxMessageBox("Probe parameters not initialized!\n\nPlease set pound variables:\n" ..
+                          "#301 = X offset\n#302 = Y offset\n#303 = Fast feed\n" ..
+                          "#304 = Slow feed\n#305 = Max travel", 
+                          "Configuration Error", wx.wxOK + wx.wxICON_ERROR)
+            ProbeCleanup(false, "Probe parameters not initialized")
+            return false
+        end
+        
+        -- Map direction selection to M311 S values
+        local directionMap = {
+            [1] = {S = 1, name = "+X", axis = "X", mcAxis = mc.X_AXIS, dir = 1},  -- +X
+            [2] = {S = 2, name = "-X", axis = "X", mcAxis = mc.X_AXIS, dir = -1},  -- -X
+            [3] = {S = 3, name = "+Y", axis = "Y", mcAxis = mc.Y_AXIS, dir = 1},  -- +Y
+            [4] = {S = 4, name = "-Y", axis = "Y", mcAxis = mc.Y_AXIS, dir = -1}   -- -Y
+        }
+        
+        local probeDir = directionMap[dirSel]
+        
+        -- Check soft limits for probe travel (graceful failure)
+        local isValid, availableTravel = ValidateProbeTravel(probeDir.mcAxis, probeDir.dir, maxTravel)
+        if not isValid then
+            local msg = string.format(
+                "SOFT LIMIT WARNING\n\n" ..
+                "Cannot probe %s by %.3f\" due to soft limits.\n" ..
+                "Available travel: %.3f\"\n\n" ..
+                "Possible solutions:\n" ..
+                "• Move probe closer to the edge\n" ..
+                "• Reduce the maximum probe travel (#305)\n" ..
+                "• Adjust soft limits if safe to do so",
+                probeDir.name, maxTravel, availableTravel)
+            wx.wxMessageBox(msg, "Soft Limit Warning", wx.wxOK + wx.wxICON_WARNING)
+            ProbeCleanup(false, "Soft limit exceeded")
+            return false
+        end
+        
+        -- Check if probe is already triggered (match M311 pattern)
+        if mc.mcSignalGetState(inst, PROBE_SIGNAL) == 1 then
+            -- Clear probe latch
+            mc.mcCntlGcodeExecuteWait(inst, "G31.2")
+            wx.wxMilliSleep(50)  -- Let hardware settle
+            
+            -- Check if still triggered
+            if mc.mcSignalGetState(inst, PROBE_SIGNAL) == 1 then
+                wx.wxMessageBox("Probe is stuck triggered!\n\nCheck probe connection and retry.", 
+                               "Probe Error", wx.wxOK + wx.wxICON_ERROR)
+                ProbeCleanup(false, "Probe stuck triggered")
+                return false
+            end
+        end
+        
+        -- Set absolute distance mode and feed per minute mode (mimic Outside Center)
+        mc.mcCntlGcodeExecuteWait(inst, "G90 G94")
+        
+        -- Capture starting state in BOTH coordinate systems
+        local startState = {
+            -- Machine positions for ALL movements (G53 commands)
+            machX = mc.mcAxisGetMachinePos(inst, 0),
+            machY = mc.mcAxisGetMachinePos(inst, 1),
+            machZ = mc.mcAxisGetMachinePos(inst, 2),
+            
+            -- Work positions for display and logging ONLY
+            workX = mc.mcAxisGetPos(inst, mc.X_AXIS),
+            workY = mc.mcAxisGetPos(inst, mc.Y_AXIS),
+            workZ = mc.mcAxisGetPos(inst, mc.Z_AXIS)
+        }
+        
+        -- Track this probe attempt
+        table.insert(probeProgress.attempted, probeDir.name)
+        
+        -- Show initial status
+        mc.mcCntlSetLastError(inst, string.format("Probing %s direction...", probeDir.name))
+        
+        -- Execute probe with sentinel mode (M311 v1.4 compatible)
+        local success, edgeWork, edgeMachine = ExecuteProbeWithSentinel(probeDir.S)
+        
+        if not success then
+            probeProgress.failed = probeDir.name
+            mc.mcCntlSetLastError(inst, string.format("ERROR: %s probe failed - no contact", probeDir.name))
+            
+            local msg = string.format(
+                "%s PROBE FAILURE\n\n" ..
+                "The probe did not make contact within %.3f inches.\n\n" ..
+                "Possible causes:\n" ..
+                "• Probe is not close enough to the edge\n" ..
+                "• Edge is beyond probe travel distance\n" ..
+                "• Probe may be damaged or disconnected\n\n" ..
+                "Check probe position and retry.",
+                probeDir.name, maxTravel)
+            
+            wx.wxMessageBox(msg, "Probe Failure", wx.wxOK + wx.wxICON_ERROR)
+            ProbeCleanup(false, "Probe contact not detected")
+            return false
+        end
+        
+        -- Record successful probe
+        table.insert(probeProgress.completed, probeDir.name)
+        
+        -- M311 v1.4 returns machine position in #389, edge position in #391
+        -- We already have both from ExecuteProbeWithSentinel
+        local edgeMachinePos = edgeMachine  -- From #389
+        local edgeWorkPos = edgeWork        -- From #391
+        
+        -- Log the probe event using work coordinates for readability
+        local logX = mc.mcAxisGetPos(inst, mc.X_AXIS)
+        local logY = mc.mcAxisGetPos(inst, mc.Y_AXIS)
+        local logZ = mc.mcAxisGetPos(inst, mc.Z_AXIS)
+        
+        -- For the probed axis, use the edge position
+        if probeDir.axis == "X" then
+            logX = edgeWorkPos
+        else
+            logY = edgeWorkPos
+        end
+        
+        LogProbeEvent(string.format("S%d M311", probeDir.S), logX, logY, logZ)
+        
+        -- Common function for setting work offset
+        local function SetWorkOffset(axisLetter, machinePos)
+            -- Get current work offset
+            local modalOffset = mc.mcCntlGetPoundVar(inst, 4014)
+            local currentOffset = 54  -- Default G54
+            if type(modalOffset) == "number" and modalOffset >= 54 and modalOffset <= 59 then
+                currentOffset = math.floor(modalOffset + 0.5)
+            end
+            
+            -- Work offset variable mapping
+            local workOffsetVars = {
+                [54] = {x = 5221, y = 5222, z = 5223},  -- G54
+                [55] = {x = 5241, y = 5242, z = 5243},  -- G55
+                [56] = {x = 5261, y = 5262, z = 5263},  -- G56
+                [57] = {x = 5281, y = 5282, z = 5283},  -- G57
+                [58] = {x = 5301, y = 5302, z = 5303},  -- G58
+                [59] = {x = 5321, y = 5322, z = 5323}   -- G59
+            }
+            
+            local offsets = workOffsetVars[currentOffset]
+            if not offsets then
+                mc.mcCntlSetLastError(inst, "ERROR: Invalid work offset")
+                return false
+            end
+            
+            -- Use the MACHINE position for datum setting
+            if axisLetter == "X" then
+                mc.mcCntlSetPoundVar(inst, offsets.x, machinePos)
+                -- Keep Y and Z unchanged
+                local currentYOffset = mc.mcCntlGetPoundVar(inst, offsets.y)
+                local currentZOffset = mc.mcCntlGetPoundVar(inst, offsets.z)
+                mc.mcCntlSetPoundVar(inst, offsets.y, currentYOffset)
+                mc.mcCntlSetPoundVar(inst, offsets.z, currentZOffset)
+            else
+                mc.mcCntlSetPoundVar(inst, offsets.y, machinePos)
+                -- Keep X and Z unchanged
+                local currentXOffset = mc.mcCntlGetPoundVar(inst, offsets.x)
+                local currentZOffset = mc.mcCntlGetPoundVar(inst, offsets.z)
+                mc.mcCntlSetPoundVar(inst, offsets.x, currentXOffset)
+                mc.mcCntlSetPoundVar(inst, offsets.z, currentZOffset)
+            end
+            
+            -- CRITICAL FIX: Use G10 L20 for machine coordinates (was L2)
+            local offsetP = currentOffset - 53  -- G54=P1, G55=P2, etc.
+            local g10Command = string.format("G10 L20 P%d %s%.4f", offsetP, axisLetter, machinePos)
+            mc.mcCntlGcodeExecuteWait(inst, g10Command)
+            
+            -- Now activate the work offset
+            local gcode = string.format("G%d", currentOffset)
+            mc.mcCntlGcodeExecuteWait(inst, gcode)
+            
+            return true, gcode
+        end
+        
+        -- Process based on action mode
+        if actionSel == 1 then  -- Set Datum
+            local success, gcode = SetWorkOffset(probeDir.axis, edgeMachinePos)
+            if success then
+                mc.mcCntlSetLastError(inst, string.format("%s edge set as %s %s0", 
+                                                         probeDir.name, gcode, probeDir.axis))
+                cleanup(true)
+                return true
+            else
+                ProbeCleanup(false, nil)
+                return false
+            end
+            
+        elseif actionSel == 2 then  -- Print Coords
+            -- Print machine position of the edge
+            mc.mcCntlSetLastError(inst, string.format("%s edge (machine): %s%.4f", 
+                                                     probeDir.name, probeDir.axis, edgeMachinePos))
+            cleanup(true)
+            return true
+                                                     
+        else  -- Set/Center (actionSel == 3)
+            -- Store first edge in both coordinate systems
+            local firstEdgeMach = edgeMachinePos
+            local firstEdgeWork = edgeWorkPos
+            
+            -- Show message about first edge (use work coordinate for display)
+            mc.mcCntlSetLastError(inst, string.format("First edge at %s%.4f - Move to opposite edge for center finding", 
+                                                     probeDir.axis, firstEdgeWork))
+            
+            -- Show dialog for second probe
+            local parent = wx.NULL
+            local app = wx.wxGetApp()
+            if app then
+                local ok, top = pcall(function() return app:GetTopWindow() end)
+                if ok and top then parent = top end
+            end
+            
+            -- Create second probe dialog
+            local dlgW, dlgH = 360, 240
+            local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
+            local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
+            local posX = math.floor((sw - dlgW) / 2)
+            local posY = math.floor((sh - dlgH) / 2)
+            
+            local secondDlg = wx.wxDialog(parent, wx.wxID_ANY,
+                "Probe Second Edge for Center",
+                wx.wxPoint(posX, posY), wx.wxSize(dlgW, dlgH),
+                wx.wxDEFAULT_DIALOG_STYLE)
+            
+            local panel2 = wx.wxPanel(secondDlg, wx.wxID_ANY)
+            local sizer2 = wx.wxBoxSizer(wx.wxVERTICAL)
+            
+            -- Message with work coordinates for user understanding
+            local oppositeDirection = ({[1]="-X", [2]="+X", [3]="-Y", [4]="+Y"})[dirSel]
+            local msg = wx.wxStaticText(panel2, wx.wxID_ANY,
+                string.format("First edge probed successfully at %s%.4f\n\n" ..
+                            "Now position probe at the opposite edge.\n" ..
+                            "The probe will automatically move %s.\n\n" ..
+                            "Click 'Probe Second Edge' when ready,\n" ..
+                            "or 'Cancel' to abort center finding.",
+                            probeDir.axis, firstEdgeWork, oppositeDirection))
+            msg:SetFont(wx.wxFont(10, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
+            sizer2:Add(msg, 1, wx.wxALL + wx.wxALIGN_CENTER, 20)
+            
+            -- Buttons
+            local btnSizer2 = wx.wxBoxSizer(wx.wxHORIZONTAL)
+            local okBtn2 = wx.wxButton(panel2, wx.wxID_OK, "Probe Second Edge")
+            local cancelBtn2 = wx.wxButton(panel2, wx.wxID_CANCEL, "Cancel Center Finding")
+            
+            okBtn2:SetMinSize(wx.wxSize(130, 28))
+            cancelBtn2:SetMinSize(wx.wxSize(130, 28))
+            
+            btnSizer2:Add(okBtn2, 0, wx.wxRIGHT, 10)
+            btnSizer2:Add(cancelBtn2, 0, wx.wxLEFT, 0)
+            
+            sizer2:Add(btnSizer2, 0, wx.wxALIGN_CENTER + wx.wxBOTTOM, 15)
+            
+            panel2:SetSizer(sizer2)
+            secondDlg:Centre()
+            
+            if secondDlg:ShowModal() == wx.wxID_OK then
+                secondDlg:Destroy()
+                
+                -- Determine opposite direction for second probe
+                local oppositeDir = {
+                    [1] = 2,  -- +X -> -X
+                    [2] = 1,  -- -X -> +X
+                    [3] = 4,  -- +Y -> -Y
+                    [4] = 3   -- -Y -> +Y
+                }
+                
+                local secondProbeDir = directionMap[oppositeDir[dirSel]]
+                
+                -- Track second probe attempt
+                table.insert(probeProgress.attempted, secondProbeDir.name)
+                
+                -- Execute second probe
+                mc.mcCntlSetLastError(inst, string.format("Probing %s direction (second edge)...", secondProbeDir.name))
+                
+                local success2, edge2Work, edge2Machine = ExecuteProbeWithSentinel(secondProbeDir.S)
+                
+                if not success2 then
+                    probeProgress.failed = secondProbeDir.name
+                    
+                    local completedStr = #probeProgress.completed > 0 and 
+                                         table.concat(probeProgress.completed, ", ") or "None"
+                    
+                    local msg = string.format(
+                        "Second probe failed!\n\n" ..
+                        "Successfully completed: %s\n" ..
+                        "Failed: %s\n\n" ..
+                        "First edge was at %s%.4f\n" ..
+                        "No center datum has been set.",
+                        completedStr,
+                        secondProbeDir.name,
+                        probeDir.axis, firstEdgeWork)
+                    
+                    wx.wxMessageBox(msg, "Probe Failure", wx.wxOK + wx.wxICON_ERROR)
+                    ProbeCleanup(false, nil)
+                    return false
+                end
+                
+                -- Record successful second probe
+                table.insert(probeProgress.completed, secondProbeDir.name)
+                
+                -- Get second edge positions from M311 v1.4
+                local secondEdgeMach = edge2Machine  -- From #389
+                local secondEdgeWork = edge2Work     -- From #391
+                
+                -- Log second probe
+                local logX2 = mc.mcAxisGetPos(inst, mc.X_AXIS)
+                local logY2 = mc.mcAxisGetPos(inst, mc.Y_AXIS)
+                local logZ2 = mc.mcAxisGetPos(inst, mc.Z_AXIS)
+                
+                if secondProbeDir.axis == "X" then
+                    logX2 = secondEdgeWork
+                else
+                    logY2 = secondEdgeWork
+                end
+                
+                LogProbeEvent(string.format("S%d M311", secondProbeDir.S), logX2, logY2, logZ2)
+                
+                -- Calculate center and width (with validation)
+                local centerMach = nil
+                local width = nil
+                
+                -- Validate both edges are valid numbers
+                if type(firstEdgeMach) == "number" and type(secondEdgeMach) == "number" then
+                    centerMach = (firstEdgeMach + secondEdgeMach) / 2.0
+                    width = math.abs(secondEdgeWork - firstEdgeWork)
+                else
+                    wx.wxMessageBox("Invalid edge measurements!\n\nProbe data corrupted.", 
+                                   "Calculation Error", wx.wxOK + wx.wxICON_ERROR)
+                    ProbeCleanup(false, nil)
+                    return false
+                end
+                
+                -- Validate width
+                if width <= 0.0001 then
+                    local msg = string.format(
+                        "INVALID MEASUREMENT\n\n" ..
+                        "Both probes contacted at nearly the same point.\n" ..
+                        "Measured width: %.6f\"\n\n" ..
+                        "Possible causes:\n" ..
+                        "• Probe not positioned correctly\n" ..
+                        "• Part missing or misaligned\n" ..
+                        "• Wrong edge selected",
+                        width)
+                    
+                    wx.wxMessageBox(msg, "Measurement Error", wx.wxOK + wx.wxICON_ERROR)
+                    ProbeCleanup(false, nil)
+                    return false
+                end
+                
+                -- Set center as datum using common function
+                local success, gcode = SetWorkOffset(probeDir.axis, centerMach)
+                if success then
+                    -- DO NOT MOVE! Stay at current position to avoid crashes
+                    -- Center is set as datum but probe stays where it is
+                    
+                    -- Provide detailed feedback
+                    mc.mcCntlSetLastError(inst, string.format("%s center set as %s %s0 | Width: %.4f | Edges: %.4f to %.4f", 
+                                                             probeDir.axis, gcode, probeDir.axis, width, 
+                                                             math.min(firstEdgeWork, secondEdgeWork),
+                                                             math.max(firstEdgeWork, secondEdgeWork)))
+                    cleanup(true)
+                    return true
+                else
+                    ProbeCleanup(false, nil)
+                    return false
+                end
+            else
+                secondDlg:Destroy()
+                -- User cancelled after first probe - treat as failure not success
+                mc.mcCntlSetLastError(inst, string.format("Center finding cancelled - First edge was at %s%.4f", 
+                                                         probeDir.axis, firstEdgeWork))
+                ProbeCleanup(false, nil)  -- Changed to false - cancellation is not success
+                return false    -- Changed to false
+            end
+        end
+    end
+    
+    -- Execute with comprehensive error handling
+    local success, result = xpcall(ExecuteXYProbe, debug.traceback)
+    
+    if not success then
+        mc.mcCntlSetLastError(inst, "ERROR: " .. tostring(result))
+        wx.wxMessageBox("Probe sequence failed:\n" .. tostring(result), 
+                       "Probe Error", wx.wxOK + wx.wxICON_ERROR)
+    elseif result == false then
+        -- Probe failed with proper error message already shown
+        local lastError = mc.mcCntlGetLastError(inst)
+        if lastError and not lastError:find("cancelled") then
+            -- Only show generic error if no specific error was shown
+            if not lastError:find("ERROR") then
+                wx.wxMessageBox("Probe sequence failed!\n\nCheck status bar for details.", 
+                               "Probe Error", wx.wxOK + wx.wxICON_ERROR)
+            end
+        end
+    else
+        -- Success
+        local lastError = mc.mcCntlGetLastError(inst)
+        if not lastError or not lastError:find("cancelled") then
+            mc.mcCntlSetLastError(inst, "X/Y probe completed successfully")
+        end
+    end
+else
+    dlg:Destroy()
+end

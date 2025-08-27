@@ -1,0 +1,114 @@
+--[[ Set Tool Button Script - Working v6.0
+Dependencies: mc, wx
+
+INSTALLATION INSTRUCTIONS:
+This goes in btnSetTool "Left Up Script" event
+1. Open Screen Editor (Operator → Edit Screen)
+2. Find btnSetTool
+3. Double-click → Left Up Script
+4. Replace entire contents with this code
+]]--
+
+local inst = mc.mcGetInstance()
+
+-- Check machine state
+local controlState = mc.mcCntlGetState(inst)
+if controlState ~= mc.MC_STATE_IDLE then
+    wx.wxMessageBox("Machine must be idle to set tool!", "Error", wx.wxOK + wx.wxICON_ERROR)
+    return
+end
+
+-- Get selected tool
+local selectedIndex = _G.selectedToolIndex
+if not selectedIndex then
+    wx.wxMessageBox("No tool selected!\n\nSelect a tool from the dropdown first.", "Error", wx.wxOK + wx.wxICON_ERROR)
+    return
+end
+
+if not _G.toolNumbers then
+    wx.wxMessageBox("Tool list not initialized!", "Error", wx.wxOK + wx.wxICON_ERROR)
+    return
+end
+
+local toolNum = _G.toolNumbers[selectedIndex + 1]
+if not toolNum then
+    wx.wxMessageBox("Invalid tool selection!", "Error", wx.wxOK + wx.wxICON_ERROR)
+    return
+end
+
+-- Get current tool for comparison
+local currentTool = mc.mcToolGetCurrent(inst)
+
+-- Get descriptions
+local newDesc = toolNum == 0 and "No Tool" or (mc.mcToolGetDesc(inst, toolNum) or "Unnamed")
+local currDesc = currentTool == 0 and "No Tool" or (mc.mcToolGetDesc(inst, currentTool) or "Unnamed")
+
+-- Confirm with user
+local msg = string.format("Change active tool from:\nT%d - %s\n\nTo:\nT%d - %s\n\nWITHOUT physical tool change?", 
+    currentTool, currDesc, toolNum, newDesc)
+    
+local result = wx.wxMessageBox(msg, "Confirm Tool Change", wx.wxYES_NO + wx.wxICON_QUESTION)
+
+if result == wx.wxYES then
+    -- Get tool height
+    local toolHeight = 0
+    if toolNum > 0 then
+        toolHeight = mc.mcToolGetData(inst, mc.MTOOL_MILL_HEIGHT, toolNum) or 0
+        
+        if toolHeight == 0 then
+            local warnResult = wx.wxMessageBox(
+                string.format("WARNING: Tool T%d has no height value!\n\nHeight offset will not work properly.\n\nContinue anyway?", toolNum),
+                "No Tool Height", 
+                wx.wxYES_NO + wx.wxICON_WARNING)
+            
+            if warnResult ~= wx.wxYES then
+                return
+            end
+        end
+    end
+    
+    -- Cancel current offset
+    mc.mcCntlGcodeExecuteWait(inst, "G49")
+    wx.wxMilliSleep(100)
+    
+    -- Set the tool
+    local rc = mc.mcToolSetCurrent(inst, toolNum)
+    
+    if rc == mc.MERROR_NOERROR then
+        wx.wxMilliSleep(100)
+        
+        if toolNum > 0 then
+            -- Apply height offset
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G43 H%d", toolNum))
+            wx.wxMilliSleep(200)
+            
+            -- Verify
+            local finalH = mc.mcCntlGetPoundVar(inst, 4120)
+            local status = string.format("Tool set to T%d - %s", toolNum, newDesc)
+            
+            if finalH == toolNum then
+                status = status .. " (H offset active)"
+            else
+                status = status .. string.format(" (WARNING: H%.0f active, expected H%d)", finalH, toolNum)
+            end
+            
+         --   mc.mcCntlSetLastError(inst, status)
+        else
+            -- T0
+       --     mc.mcCntlSetLastError(inst, "Tool set to T0 - No Tool (offset cancelled)")
+        end
+        
+        -- Clear selection
+        _G.selectedToolIndex = nil
+        
+        -- Force PLC update
+        _G.lastTool = -999
+        
+        -- Update display
+        if UpdateToolPreview then
+            UpdateToolPreview()
+        end
+    else
+        mc.mcCntlSetLastError(inst, "ERROR: Failed to set tool")
+    end
+end

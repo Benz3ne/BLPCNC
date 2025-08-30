@@ -263,11 +263,13 @@ function ToolLib.requestDeploy(inst, toolNum)
         return false, string.format("Virtual tool T%d not configured", toolNum)
     end
     
+    --[[ MARKED FOR DELETION - Related to isSafeForModalChange
     -- Check if safe to make modal changes
     local safe, err = isSafeForModalChange(inst)
     if not safe then
         return false, err
     end
+    --]]
     
     -- Check if already active
     local current = getPV(inst, PV.VIRTUAL_TOOL, 0)
@@ -378,11 +380,13 @@ function ToolLib.requestRetract(inst)
         return true, "No virtual tool active"
     end
     
+    --[[ MARKED FOR DELETION - Related to isSafeForModalChange
     -- Check if safe to make modal changes
     local safe, err = isSafeForModalChange(inst)
     if not safe then
         return false, err
     end
+    --]]
     
     -- Get stored deltas
     local xDelta = getPV(inst, PV.X_DELTA, 0)

@@ -1056,6 +1056,170 @@ function ProbeLib.Cleanup.Standard(inst, wasSuccess, msg)
     ProbeLib.Movement.DisableSentinel(inst)
 end
 
+-- Create a cleanup handler with saved state
+-- Use this at the start of probe operations to ensure proper cleanup
+-- Parameters:
+--   inst: Mach4 instance
+--   saveState: If true, capture current position state
+-- Returns:
+--   Cleanup handler object with cleanup() method
+function ProbeLib.Cleanup.CreateHandler(inst, saveState)
+    local handler = {
+        inst = inst,
+        startTime = os.clock(),
+        savedState = nil,
+        savedVars = {},
+        cleanupActions = {}
+    }
+    
+    -- Save current state if requested
+    if saveState then
+        handler.savedState = ProbeLib.Core.CaptureState(inst)
+    end
+    
+    -- Save critical pound variables
+    local varsToSave = {
+        ProbeLib.CONSTANTS.VAR_SENTINEL_FLAG,
+        ProbeLib.CONSTANTS.VAR_G68_MODE,
+        ProbeLib.CONSTANTS.VAR_G68_X,
+        ProbeLib.CONSTANTS.VAR_G68_Y,
+        ProbeLib.CONSTANTS.VAR_G68_R
+    }
+    
+    for _, var in ipairs(varsToSave) do
+        handler.savedVars[var] = mc.mcCntlGetPoundVar(inst, var)
+    end
+    
+    -- Main cleanup function
+    function handler:cleanup(success, errorMsg)
+        local inst = self.inst
+        
+        -- Always disable sentinel mode
+        ProbeLib.Movement.DisableSentinelMode(inst)
+        
+        -- Check if probe is still triggered
+        local probeTriggered = mc.mcSignalGetState(
+            mc.mcSignalGetHandle(inst, mc.ISIG_PROBE1)) == 1
+            
+        if probeTriggered then
+            mc.mcCntlSetLastError(inst, "WARNING: Probe still triggered after operation")
+            
+            -- Attempt to clear
+            mc.mcCntlGcodeExecuteWait(inst, "G31.2")
+            wx.wxMilliSleep(100)
+        end
+        
+        -- Clear runtime variables
+        local runtimeVars = {
+            ProbeLib.CONSTANTS.VAR_RUNTIME_1,
+            ProbeLib.CONSTANTS.VAR_RUNTIME_2,
+            ProbeLib.CONSTANTS.VAR_RUNTIME_3
+        }
+        
+        for _, var in ipairs(runtimeVars) do
+            mc.mcCntlSetPoundVar(inst, var, -1e308)
+        end
+        
+        -- Execute any registered cleanup actions
+        for _, action in ipairs(self.cleanupActions) do
+            pcall(action)
+        end
+        
+        -- Log operation result
+        local duration = os.clock() - self.startTime
+        if success then
+            mc.mcCntlSetLastError(inst, 
+                string.format("Probe operation completed successfully (%.2fs)", duration))
+        else
+            mc.mcCntlSetLastError(inst, 
+                string.format("Probe operation failed: %s (%.2fs)", 
+                             errorMsg or "Unknown error", duration))
+        end
+    end
+    
+    -- Add a cleanup action to be executed during cleanup
+    function handler:addAction(func)
+        table.insert(self.cleanupActions, func)
+    end
+    
+    -- Return to start position
+    function handler:returnToStart(safeZ)
+        if not self.savedState then
+            return
+        end
+        
+        ProbeLib.Movement.ReturnToPosition(self.inst, self.savedState, safeZ)
+    end
+    
+    -- Restore saved variables
+    function handler:restoreVars()
+        for var, value in pairs(self.savedVars) do
+            mc.mcCntlSetPoundVar(self.inst, var, value)
+        end
+    end
+    
+    return handler
+end
+
+-- Standard cleanup for probe operations (enhanced version)
+-- Call this in finally blocks or error handlers
+-- Parameters:
+--   inst: Mach4 instance
+--   options: Cleanup options table
+--     - clearSentinel: Clear sentinel mode (default true)
+--     - clearRuntime: Clear runtime vars (default true)
+--     - checkProbe: Check if probe is stuck (default true)
+--     - restoreVars: Table of vars to restore
+function ProbeLib.Cleanup.StandardCleanup(inst, options)
+    options = options or {}
+    if options.clearSentinel == nil then options.clearSentinel = true end
+    if options.clearRuntime == nil then options.clearRuntime = true end
+    if options.checkProbe == nil then options.checkProbe = true end
+    
+    -- Clear sentinel mode
+    if options.clearSentinel then
+        ProbeLib.Movement.DisableSentinelMode(inst)
+    end
+    
+    -- Check probe state
+    if options.checkProbe then
+        local probeTriggered = mc.mcSignalGetState(
+            mc.mcSignalGetHandle(inst, mc.ISIG_PROBE1)) == 1
+            
+        if probeTriggered then
+            mc.mcCntlSetLastError(inst, "WARNING: Probe triggered after operation")
+            mc.mcCntlGcodeExecuteWait(inst, "G31.2")
+            wx.wxMilliSleep(100)
+        end
+    end
+    
+    -- Clear runtime variables
+    if options.clearRuntime then
+        local runtimeVars = {
+            ProbeLib.CONSTANTS.VAR_RUNTIME_1,
+            ProbeLib.CONSTANTS.VAR_RUNTIME_2,
+            ProbeLib.CONSTANTS.VAR_RUNTIME_3,
+            ProbeLib.CONSTANTS.VAR_RESULT_X_PLUS,
+            ProbeLib.CONSTANTS.VAR_RESULT_X_MINUS,
+            ProbeLib.CONSTANTS.VAR_RESULT_Y_PLUS,
+            ProbeLib.CONSTANTS.VAR_RESULT_Y_MINUS,
+            ProbeLib.CONSTANTS.VAR_RESULT_Z_PLUS,
+            ProbeLib.CONSTANTS.VAR_RESULT_Z_MINUS
+        }
+        
+        for _, var in ipairs(runtimeVars) do
+            mc.mcCntlSetPoundVar(inst, var, -1e308)
+        end
+    end
+    
+    -- Restore variables if provided
+    if options.restoreVars then
+        for var, value in pairs(options.restoreVars) do
+            mc.mcCntlSetPoundVar(inst, var, value)
+        end
+    end
+end
+
 -- ============================================
 -- G68 MODULE - Probe-specific rotation handling
 -- ============================================

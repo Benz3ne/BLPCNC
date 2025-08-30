@@ -784,5 +784,226 @@ function UILib.Controls.CreateProbeInput(parent, label, value, tooltip, unit, wi
     return lbl, txt, unitLbl
 end
 
+-- ============================================
+-- ENHANCED UI HELPERS - Probe Script Utilities
+-- ============================================
+
+-- Get safe parent window for dialogs
+-- Returns:
+--   Valid parent window or wx.NULL
+function UILib.GetSafeParentWindow()
+    local app = wx.wxGetApp()
+    if app then
+        local ok, top = pcall(function() return app:GetTopWindow() end)
+        if ok and top then
+            return top
+        end
+    end
+    return wx.NULL
+end
+
+-- Get centered position for dialog
+-- Parameters:
+--   width: Dialog width
+--   height: Dialog height
+-- Returns:
+--   wx.wxPoint with centered position
+function UILib.GetCenteredPosition(width, height)
+    local screenWidth = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
+    local screenHeight = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
+    
+    local posX = math.floor((screenWidth - width) / 2)
+    local posY = math.floor((screenHeight - height) / 2)
+    
+    return wx.wxPoint(posX, posY)
+end
+
+-- Create standard dialog with consistent styling
+-- Parameters:
+--   title: Dialog title
+--   width: Dialog width
+--   height: Dialog height
+--   parent: Parent window (optional)
+-- Returns:
+--   dialog: Created dialog
+--   panel: Main panel for adding controls
+function UILib.CreateStandardDialog(title, width, height, parent)
+    parent = parent or UILib.GetSafeParentWindow()
+    
+    local dlg = wx.wxDialog(parent, wx.wxID_ANY, title,
+                           UILib.GetCenteredPosition(width, height),
+                           wx.wxSize(width, height),
+                           wx.wxDEFAULT_DIALOG_STYLE + wx.wxSTAY_ON_TOP)
+    
+    local panel = wx.wxPanel(dlg, wx.wxID_ANY)
+    
+    return dlg, panel
+end
+
+-- Create standard OK/Cancel buttons
+-- Parameters:
+--   panel: Parent panel
+--   okText: Text for OK button (default "OK")
+--   cancelText: Text for Cancel button (default "Cancel")
+--   okId: ID for OK button (default wx.wxID_OK)
+-- Returns:
+--   buttonSizer: Sizer containing buttons
+--   okBtn: OK button reference
+--   cancelBtn: Cancel button reference
+function UILib.CreateDialogButtons(panel, okText, cancelText, okId)
+    okText = okText or "OK"
+    cancelText = cancelText or "Cancel"
+    okId = okId or wx.wxID_OK
+    
+    local buttonSizer = wx.wxStdDialogButtonSizer()
+    
+    local okBtn = wx.wxButton(panel, okId, okText)
+    local cancelBtn = wx.wxButton(panel, wx.wxID_CANCEL, cancelText)
+    
+    okBtn:SetMinSize(wx.wxSize(90, 30))
+    cancelBtn:SetMinSize(wx.wxSize(90, 30))
+    
+    buttonSizer:AddButton(okBtn)
+    buttonSizer:AddButton(cancelBtn)
+    buttonSizer:Realize()
+    
+    return buttonSizer, okBtn, cancelBtn
+end
+
+-- Create direction selection grid (cross pattern)
+-- Parameters:
+--   panel: Parent panel
+--   selectedDirection: Initially selected direction ("+X", "-X", "+Y", "-Y")
+--   callback: Function to call when selection changes
+-- Returns:
+--   grid: Grid sizer
+--   buttons: Table of buttons indexed by direction
+function UILib.CreateDirectionGrid(panel, selectedDirection, callback)
+    local grid = wx.wxGridSizer(3, 3, 5, 5)
+    local buttons = {}
+    
+    -- Button layout (cross pattern)
+    local layout = {
+        {nil, "+Y", nil},
+        {"-X", nil, "+X"},
+        {nil, "-Y", nil}
+    }
+    
+    -- Create buttons
+    for row = 1, 3 do
+        for col = 1, 3 do
+            local label = layout[row][col]
+            if label then
+                local btn = wx.wxToggleButton(panel, wx.wxNewId(), label)
+                btn:SetMinSize(wx.wxSize(50, 30))
+                
+                -- Set initial state
+                if label == selectedDirection then
+                    btn:SetValue(true)
+                end
+                
+                -- Store button reference
+                buttons[label] = btn
+                
+                -- Connect callback
+                if callback then
+                    btn:Connect(wx.wxEVT_COMMAND_TOGGLEBUTTON_CLICKED, function(event)
+                        -- Unselect all other buttons
+                        for dir, button in pairs(buttons) do
+                            if button ~= btn then
+                                button:SetValue(false)
+                            end
+                        end
+                        callback(label, btn:GetValue())
+                    end)
+                end
+                
+                grid:Add(btn, 0, wx.wxEXPAND)
+            else
+                -- Empty space
+                grid:Add(wx.wxStaticText(panel, wx.wxID_ANY, ""), 0, wx.wxEXPAND)
+            end
+        end
+    end
+    
+    return grid, buttons
+end
+
+-- Create labeled input field
+-- Parameters:
+--   panel: Parent panel
+--   label: Label text
+--   value: Initial value
+--   width: Field width (default 80)
+--   validator: Optional validator function
+-- Returns:
+--   sizer: Horizontal sizer containing label and input
+--   textCtrl: Text control reference
+function UILib.CreateLabeledInput(panel, label, value, width, validator)
+    width = width or 80
+    
+    local sizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    
+    local labelCtrl = wx.wxStaticText(panel, wx.wxID_ANY, label)
+    sizer:Add(labelCtrl, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+    
+    local textCtrl = wx.wxTextCtrl(panel, wx.wxID_ANY, tostring(value),
+                                   wx.wxDefaultPosition, wx.wxSize(width, -1))
+    
+    if validator then
+        textCtrl:Connect(wx.wxEVT_KILL_FOCUS, function(event)
+            local valid, newValue = validator(textCtrl:GetValue())
+            if valid then
+                textCtrl:SetValue(tostring(newValue))
+            else
+                textCtrl:SetBackgroundColour(wx.wxColour(255, 200, 200))
+                wx.wxMessageBox("Invalid value", "Input Error", wx.wxOK + wx.wxICON_WARNING)
+                textCtrl:SetFocus()
+            end
+            event:Skip()
+        end)
+    end
+    
+    sizer:Add(textCtrl, 0, wx.wxALIGN_CENTER_VERTICAL)
+    
+    return sizer, textCtrl
+end
+
+-- Create radio button group
+-- Parameters:
+--   panel: Parent panel
+--   title: Group title
+--   options: Array of option strings
+--   selected: Initially selected index (1-based)
+--   callback: Function to call on selection change
+-- Returns:
+--   sizer: Static box sizer containing radio buttons
+--   radioButtons: Array of radio button references
+function UILib.CreateRadioGroup(panel, title, options, selected, callback)
+    local sizer = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, title)
+    local radioButtons = {}
+    
+    for i, option in ipairs(options) do
+        local style = i == 1 and wx.wxRB_GROUP or 0
+        local radio = wx.wxRadioButton(panel, wx.wxNewId(), option, 
+                                       wx.wxDefaultPosition, wx.wxDefaultSize, style)
+        
+        if i == selected then
+            radio:SetValue(true)
+        end
+        
+        if callback then
+            radio:Connect(wx.wxEVT_COMMAND_RADIOBUTTON_SELECTED, function(event)
+                callback(i, option)
+            end)
+        end
+        
+        radioButtons[i] = radio
+        sizer:Add(radio, 0, wx.wxALL, 5)
+    end
+    
+    return sizer, radioButtons
+end
+
 -- Return the library
 return UILib

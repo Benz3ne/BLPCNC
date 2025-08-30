@@ -1052,6 +1052,12 @@ end
 -- Spindle-based control with manual override
 -- ============================================
 
+--[[
+============================================
+***** MARKED FOR DELETION *****
+Empty stub functions that do nothing - DustLib handles everything now
+27 lines of neutralized code - DO NOT USE
+============================================
 -- Legacy dust boot functions - NEUTRALIZED
 -- These functions are kept for compatibility but do nothing
 -- All dust/boot control is now handled by dustLib.lua
@@ -1080,6 +1086,7 @@ _G.SetManualMode = SetManualMode
 _G.SetAutoMode = SetAutoMode
 
 -- Legacy initialization removed - dustLib handles everything
+]]--
 
 
 

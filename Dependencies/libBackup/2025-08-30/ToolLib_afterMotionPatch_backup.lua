@@ -95,13 +95,18 @@ end
 
 -- Check if machine is in safe state for modal changes
 local function isSafeForModalChange(inst)
-    -- Block during program execution
-    if mc.mcCntlIsInCycle(inst) == 1 then
+    -- Check if in cycle (program running)
+    local inCycle = mc.mcCntlIsInCycle(inst)
+    if inCycle == 1 then
         return false, "Cannot change modes during program execution"
     end
 
-    -- Root-cause fix: rely only on available APIs
-    -- Check per-axis motion using mcAxisIsMoving
+    -- Check planner/trajectory motion first
+    if mc.mcMotionIsMoving(inst) == 1 then
+        return false, "Axes in motion"
+    end
+
+    -- Per-axis moving checks (more granular)
     for axis = 0, 5 do
         if mc.mcAxisIsEnabled(inst, axis) == 1 then
             if mc.mcAxisIsMoving(inst, axis) == 1 then
@@ -755,4 +760,3 @@ ToolLib.G68 = {
 }
 
 return ToolLib
-

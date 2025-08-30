@@ -95,10 +95,112 @@ end
 
 -- Check if machine is in safe state for modal changes
 local function isSafeForModalChange(inst)
-    -- Only block during program execution; allow changes while axes move
+    -- Block during program execution
     if mc.mcCntlIsInCycle(inst) == 1 then
         return false, "Cannot change modes during program execution"
     end
+
+    -- Feature-detect available motion APIs; fall back to position sampling
+    local hasAxisIsMoving = (type(mc.mcAxisIsMoving) == "function")
+    local hasMotionIsMoving = (type(mc.mcMotionIsMoving) == "function")
+
+    if hasAxisIsMoving then
+        -- Per-axis moving checks
+        for axis = 0, 5 do
+            if mc.mcAxisIsEnabled(inst, axis) == 1 then
+                if mc.mcAxisIsMoving(inst, axis) == 1 then
+                    local axisName = ({"X","Y","Z","A","B","C"})[axis + 1]
+                    return false, string.format("Axis %s is moving", axisName)
+                end
+            end
+        end
+        return true
+    elseif hasMotionIsMoving then
+        -- Planner-level moving check
+        if mc.mcMotionIsMoving(inst) == 1 then
+            return false, "Axes in motion"
+        end
+        return true
+    else
+        -- Fallback: sample machine positions twice and compare
+        local pos1 = {}
+        for axis = 0, 5 do
+            if mc.mcAxisIsEnabled(inst, axis) == 1 then
+                pos1[axis] = mc.mcAxisGetMachinePos(inst, axis) or 0
+            end
+        end
+        -- 50ms delay using wx if available, else os.clock loop
+        if wx and wx.wxMilliSleep then
+            wx.wxMilliSleep(50)
+        else
+            local t0 = os.clock()
+            while (os.clock() - t0) < 0.05 do end
+        end
+        for axis = 0, 5 do
+            if pos1[axis] ~= nil then
+                local p2 = mc.mcAxisGetMachinePos(inst, axis) or 0
+                if math.abs(p2 - pos1[axis]) > 0.0001 then
+                    local axisName = ({"X","Y","Z","A","B","C"})[axis + 1]
+                    return false, string.format("Axis %s is moving", axisName)
+                end
+            end
+        end
+        return true
+    end
+end
+
+-- Get virtual tool configuration
+local function getVirtualToolConfig(inst, toolNum)
+    if toolNum == 90 then
+        return {
+            name = "Probe",
+            xOffset = getPV(inst, PV.PROBE_X_OFFSET, 0),
+            yOffset = getPV(inst, PV.PROBE_Y_OFFSET, 0),
+            output = OUTPUT.PROBE
+        }
+    elseif toolNum == 91 then
+        return {
+            name = "Laser",
+            xOffset = getPV(inst, PV.LASER_X_OFFSET, 0),
+            yOffset = getPV(inst, PV.LASER_Y_OFFSET, 0),
+            output = OUTPUT.LASER
+        }
+    else
+        -- Tools 92-99 not configured
+        return nil
+    end
+end
+
+-- ============================================
+-- INITIALIZATION
+-- ============================================
+function ToolLib.init(inst)
+    if S.init then return true end
+    
+    -- Get handles
+    S.handles = {
+        probe = getHandle(inst, OUTPUT.PROBE),
+        laser = getHandle(inst, OUTPUT.LASER),
+        clamp = getHandle(inst, OUTPUT.CLAMP),
+        toolPresent = getHandle(inst, INPUT.TOOL_PRESENT),
+        clampButton = getHandle(inst, INPUT.CLAMP_BUTTON),
+    }
+    
+    -- Initialize state from hardware
+    if S.handles.probe then
+        S.lastOutputs.probe = mc.mcSignalGetState(S.handles.probe)
+    end
+    if S.handles.laser then
+        S.lastOutputs.laser = mc.mcSignalGetState(S.handles.laser)
+    end
+    if S.handles.clamp then
+        S.lastOutputs.clamp = mc.mcSignalGetState(S.handles.clamp)
+    end
+    
+    S.lastVirtual = getPV(inst, PV.VIRTUAL_TOOL, 0)
+    S.init = true
+    
+    pushLog("ToolLib initialized")
     return true
 end
 
@@ -688,6 +790,5 @@ ToolLib.G68 = {
 }
 
 return ToolLib
-
 
 

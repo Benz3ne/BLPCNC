@@ -1275,6 +1275,243 @@ function ProbeLib.G68.ClearState(inst)
 end
 
 -- ============================================
+-- TOOL MODULE - Tool validation and management
+-- ============================================
+ProbeLib.Tool = {}
+
+-- Check if probe tool (T90) is active
+-- Parameters:
+--   inst: Mach4 instance
+-- Returns:
+--   true if T90 is active and deployed, false otherwise
+function ProbeLib.Tool.IsProbeActive(inst)
+    local currentTool = mc.mcToolGetCurrent(inst)
+    local probeDownHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7)
+    local probeDeployed = mc.mcSignalGetState(probeDownHandle)
+    
+    return currentTool == 90 and probeDeployed == 1
+end
+
+-- Validate probe tool is active (no dialog)
+-- Parameters:
+--   inst: Mach4 instance
+-- Returns:
+--   true if probe is active, false otherwise
+function ProbeLib.Tool.ValidateProbeActive(inst)
+    if ProbeLib.Tool.IsProbeActive(inst) then
+        return true
+    end
+    
+    mc.mcCntlSetLastError(inst, "ERROR: T90 (probe) not active")
+    return false
+end
+
+-- Require probe tool with standardized dialog
+-- This replaces all the different tool check dialogs
+-- Parameters:
+--   inst: Mach4 instance
+--   scriptName: Name of the calling script (e.g., "inside center probe")
+--   allowChange: If true, offer to change tool (default true)
+-- Returns:
+--   true if probe is active or user changed tool, false if cancelled
+function ProbeLib.Tool.RequireProbe(inst, scriptName, allowChange)
+    if allowChange == nil then allowChange = true end
+    
+    -- Check if already active
+    if ProbeLib.Tool.IsProbeActive(inst) then
+        return true
+    end
+    
+    -- Build message
+    local currentTool = mc.mcToolGetCurrent(inst)
+    local probeDownHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7)
+    local probeDeployed = mc.mcSignalGetState(probeDownHandle)
+    
+    local status = string.format("Current tool: T%d\nProbe deployed: %s",
+                                 currentTool,
+                                 probeDeployed == 1 and "Yes" or "No")
+    
+    local message = string.format(
+        "Probe tool (T90) is not active.\n\n%s\n\n" ..
+        "The %s requires the probe to be active.\n",
+        status, scriptName or "probe operation")
+    
+    if allowChange then
+        message = message .. "\nWould you like to change to T90 now?"
+        
+        -- Show dialog
+        local result = wx.wxMessageBox(message, "Probe Not Active",
+                                       wx.wxYES_NO + wx.wxICON_QUESTION)
+        
+        if result == wx.wxYES then
+            -- Change tool
+            mc.mcCntlSetLastError(inst, "Changing to T90...")
+            mc.mcCntlGcodeExecuteWait(inst, "T90 M6")
+            
+            -- Verify change
+            if ProbeLib.Tool.IsProbeActive(inst) then
+                mc.mcCntlSetLastError(inst, "T90 activated successfully")
+                return true
+            else
+                wx.wxMessageBox("Tool change to T90 failed.\nPlease activate manually.",
+                              "Tool Change Failed", wx.wxOK + wx.wxICON_ERROR)
+                return false
+            end
+        end
+        
+        return false
+    else
+        message = message .. "\nPlease activate T90 before continuing."
+        wx.wxMessageBox(message, "Probe Not Active", wx.wxOK + wx.wxICON_WARNING)
+        return false
+    end
+end
+
+-- ============================================
+-- WORK OFFSET MODULE - Work offset management
+-- ============================================
+ProbeLib.WorkOffset = {}
+
+-- Get pound variable addresses for work offset
+-- Parameters:
+--   offsetNumber: 54-59 for G54-G59
+-- Returns:
+--   Table with x, y, z variable numbers, or nil if invalid
+function ProbeLib.WorkOffset.GetVariables(offsetNumber)
+    local workOffsetVars = {
+        [54] = {x = 5221, y = 5222, z = 5223},  -- G54
+        [55] = {x = 5241, y = 5242, z = 5243},  -- G55
+        [56] = {x = 5261, y = 5262, z = 5263},  -- G56
+        [57] = {x = 5281, y = 5282, z = 5283},  -- G57
+        [58] = {x = 5301, y = 5302, z = 5303},  -- G58
+        [59] = {x = 5321, y = 5322, z = 5323}   -- G59
+    }
+    
+    return workOffsetVars[offsetNumber]
+end
+
+-- Get current active work offset
+-- Parameters:
+--   inst: Mach4 instance
+-- Returns:
+--   offsetNumber: 54-59
+--   variables: Table with x, y, z variable numbers
+function ProbeLib.WorkOffset.GetCurrent(inst)
+    local modalOffset = mc.mcCntlGetPoundVar(inst, ProbeLib.CONSTANTS.VAR_WORK_OFFSET_MODE)
+    
+    -- Validate and clamp to valid range
+    if type(modalOffset) ~= "number" or modalOffset < 54 or modalOffset > 59 then
+        modalOffset = 54  -- Default to G54
+    else
+        modalOffset = math.floor(modalOffset + 0.5)  -- Round to nearest integer
+    end
+    
+    local vars = ProbeLib.WorkOffset.GetVariables(modalOffset)
+    return modalOffset, vars
+end
+
+-- Set work offset datum for specific axes
+-- Parameters:
+--   inst: Mach4 instance
+--   coords: Table with x, y, z work coordinates to set (nil to skip axis)
+--   offsetNumber: 54-59 for G54-G59 (nil for current)
+-- Returns:
+--   true on success, false on error
+function ProbeLib.WorkOffset.SetDatum(inst, coords, offsetNumber)
+    -- Get offset to use
+    if not offsetNumber then
+        offsetNumber = ProbeLib.WorkOffset.GetCurrent(inst)
+    end
+    
+    local vars = ProbeLib.WorkOffset.GetVariables(offsetNumber)
+    if not vars then
+        mc.mcCntlSetLastError(inst, string.format("Invalid work offset: G%d", offsetNumber))
+        return false
+    end
+    
+    -- Get current position state for offset calculation
+    local state = ProbeLib.Core.CaptureState(inst)
+    
+    -- Set each axis if provided
+    local axesSet = {}
+    
+    if coords.x ~= nil then
+        local machX = coords.x + (state.machine.x - state.work.x)
+        mc.mcCntlSetPoundVar(inst, vars.x, machX)
+        table.insert(axesSet, "X")
+    end
+    
+    if coords.y ~= nil then
+        local machY = coords.y + (state.machine.y - state.work.y)
+        mc.mcCntlSetPoundVar(inst, vars.y, machY)
+        table.insert(axesSet, "Y")
+    end
+    
+    if coords.z ~= nil then
+        local machZ = coords.z + (state.machine.z - state.work.z)
+        mc.mcCntlSetPoundVar(inst, vars.z, machZ)
+        table.insert(axesSet, "Z")
+    end
+    
+    -- Activate the work offset
+    mc.mcCntlGcodeExecuteWait(inst, string.format("G%d", offsetNumber))
+    
+    -- Log what was set
+    if #axesSet > 0 then
+        mc.mcCntlSetLastError(inst, 
+            string.format("G%d datum set: %s", offsetNumber, table.concat(axesSet, ", ")))
+    end
+    
+    return true
+end
+
+-- Apply work offset or print coordinates based on mode
+-- Unified function for all probe scripts
+-- Parameters:
+--   inst: Mach4 instance
+--   actionMode: 1=Set Datum, 2=Print Coordinates
+--   coords: Table with x, y, z coordinates
+--   offsetNumber: Optional work offset (54-59)
+--   title: Optional title for print dialog
+function ProbeLib.WorkOffset.ApplyOrPrint(inst, actionMode, coords, offsetNumber, title)
+    if actionMode == 1 then
+        -- Set Datum mode
+        return ProbeLib.WorkOffset.SetDatum(inst, coords, offsetNumber)
+    else
+        -- Print Coordinates mode
+        local parts = {}
+        
+        if coords.x ~= nil then
+            table.insert(parts, string.format("X: %.4f", coords.x))
+        end
+        if coords.y ~= nil then
+            table.insert(parts, string.format("Y: %.4f", coords.y))
+        end
+        if coords.z ~= nil then
+            table.insert(parts, string.format("Z: %.4f", coords.z))
+        end
+        
+        if coords.width then
+            table.insert(parts, string.format("Width: %.4f", coords.width))
+        end
+        if coords.height then
+            table.insert(parts, string.format("Height: %.4f", coords.height))
+        end
+        if coords.diameter then
+            table.insert(parts, string.format("Diameter: %.4f", coords.diameter))
+        end
+        if coords.angle then
+            table.insert(parts, string.format("Angle: %.3f°", coords.angle))
+        end
+        
+        local message = table.concat(parts, "\n")
+        local dlgTitle = title or "Probe Result"
+        
+        wx.wxMessageBox(message, dlgTitle, wx.wxOK + wx.wxICON_INFORMATION)
+    end
+end
+
+-- ============================================
 -- Return the library
 -- ============================================
 return ProbeLib

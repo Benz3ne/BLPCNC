@@ -1,4 +1,4 @@
-﻿-- ToolLib.lua v1.0
+-- ToolLib.lua v1.0
 -- Single owner of tool-related outputs and state
 -- Manages physical tools, virtual tools, and tool change operations
 
@@ -95,27 +95,28 @@ end
 
 -- Check if machine is in safe state for modal changes
 local function isSafeForModalChange(inst)
-    -- Check if in cycle (program running)
+    -- Check if in cycle
     local inCycle = mc.mcCntlIsInCycle(inst)
     if inCycle == 1 then
+        mc.mcCntlSetLastError(inst, "DEBUG: In cycle check failed - mcCntlIsInCycle=1")
         return false, "Cannot change modes during program execution"
     end
-
-    -- Check planner/trajectory motion first
-    if mc.mcMotionIsMoving(inst) == 1 then
-        return false, "Axes in motion"
-    end
-
-    -- Per-axis moving checks (more granular)
+    
+    -- State check removed - it's useless since M6 always runs as state 200 (macro)
+    -- The important checks are: not in cycle and axes not moving
+    
+    -- Check for axis motion
     for axis = 0, 5 do
         if mc.mcAxisIsEnabled(inst, axis) == 1 then
-            if mc.mcAxisIsMoving(inst, axis) == 1 then
+            local vel = mc.mcAxisGetVel(inst, axis)
+            if math.abs(vel) > 0.001 then
                 local axisName = ({"X","Y","Z","A","B","C"})[axis + 1]
-                return false, string.format("Axis %s is moving", axisName)
+                mc.mcCntlSetLastError(inst, string.format("DEBUG: Axis %s in motion - vel=%.4f", axisName, vel))
+                return false, string.format("Axes in motion (%s vel=%.4f)", axisName, vel)
             end
         end
     end
-
+    
     return true
 end
 

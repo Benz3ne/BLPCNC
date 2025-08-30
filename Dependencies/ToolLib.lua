@@ -301,21 +301,50 @@ function ToolLib.requestDeploy(inst, toolNum)
         setPV(inst, PV.G68_STORED_R, currentR)
         setPV(inst, PV.G68_NEEDS_RESTORE, 1)
         
-        -- Cancel G68 temporarily
+        -- Cancel G68 temporarily (we'll reapply after offset modification)
         mc.mcCntlGcodeExecuteWait(inst, "G69")
         
-        -- Apply G52 offset
-        mc.mcCntlGcodeExecuteWait(inst, string.format("G52 X%.4f Y%.4f", -xOffset, -yOffset))
+        pushLog(string.format("G68 stored for later restoration: X%.4f Y%.4f R%.4f", 
+            currentX, currentY, currentR))
+    end
+    
+    -- POUND VARIABLE METHOD: Modify work offsets directly
+    -- This makes the virtual tool appear at the spindle position
+    -- by subtracting the tool's offset from all work coordinates
+    for i = 0, 5 do
+        local baseVar = 5221 + (i * 20)  -- G54=#5221, G55=#5241, G56=#5261, G57=#5281, G58=#5301, G59=#5321
+        local currentX = getPV(inst, baseVar, 0)
+        local currentY = getPV(inst, baseVar + 1, 0)
         
-        -- Reapply G68 with adjusted center
+        -- Sanity check - only modify if coordinates look reasonable
+        if currentX and currentY and currentX > -1e300 and currentY > -1e300 then
+            if math.abs(currentX) < 1000 and math.abs(currentY) < 1000 then
+                -- Apply offset: subtract from work coordinates
+                -- This shifts the zero point so the virtual tool appears at spindle position
+                setPV(inst, baseVar, currentX - xOffset)
+                setPV(inst, baseVar + 1, currentY - yOffset)
+                
+                pushLog(string.format("G%d offsets modified: X%.4f->%.4f Y%.4f->%.4f", 
+                    54 + i, currentX, currentX - xOffset, currentY, currentY - yOffset))
+            else
+                pushLog(string.format("WARNING: G%d coordinates out of range, skipping", 54 + i))
+            end
+        end
+    end
+    
+    -- Reapply G68 with adjusted center if it was active
+    if g68Active then
+        local storedX = getPV(inst, PV.G68_STORED_X, 0)
+        local storedY = getPV(inst, PV.G68_STORED_Y, 0)
+        local storedR = getPV(inst, PV.G68_STORED_R, 0)
+        
+        -- The G68 center must be adjusted by the same offset we applied to work coordinates
+        -- This maintains the rotation center relative to the workpiece
         mc.mcCntlGcodeExecuteWait(inst, string.format("G68 X%.4f Y%.4f R%.4f", 
-            currentX - xOffset, currentY - yOffset, currentR))
+            storedX - xOffset, storedY - yOffset, storedR))
         
-        pushLog(string.format("G68 adjusted for virtual tool: X%.4f Y%.4f", 
-            currentX - xOffset, currentY - yOffset))
-    else
-        -- No rotation active, just apply G52
-        mc.mcCntlGcodeExecuteWait(inst, string.format("G52 X%.4f Y%.4f", -xOffset, -yOffset))
+        pushLog(string.format("G68 reapplied with adjusted center: X%.4f Y%.4f", 
+            storedX - xOffset, storedY - yOffset))
     end
     
     -- Store state
@@ -328,7 +357,7 @@ function ToolLib.requestDeploy(inst, toolNum)
     mc.mcCntlGcodeExecuteWait(inst, "G49")
     mc.mcCntlGcodeExecuteWait(inst, string.format("G43 H%d", toolNum))
     
-    pushLog(string.format("Deployed virtual T%d (%s) with G52 offset", toolNum, config.name))
+    pushLog(string.format("Deployed virtual T%d (%s) with work offset modification", toolNum, config.name))
     return true
 end
 

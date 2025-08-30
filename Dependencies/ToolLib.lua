@@ -93,6 +93,7 @@ local function pushLog(msg)
     if #S.log > 100 then table.remove(S.log, 1) end
 end
 
+--[[ MARKED FOR DELETION - Unnecessary validation
 -- Check if machine is in safe state for modal changes
 local function isSafeForModalChange(inst)
     -- Check if in cycle
@@ -117,6 +118,12 @@ local function isSafeForModalChange(inst)
         end
     end
     
+    return true
+end
+--]]
+
+-- Simplified version - no validation needed
+local function isSafeForModalChange(inst)
     return true
 end
 

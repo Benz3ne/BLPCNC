@@ -598,6 +598,93 @@ function ToolLib.emergencyStop(inst)
 end
 
 -- ============================================
+-- DIRECT HARDWARE CONTROL
+-- ============================================
+-- Toggle virtual tool hardware output directly
+-- This provides immediate control without waiting for PLC update cycle
+-- Parameters:
+--   inst: Mach4 instance  
+--   toolNum: Virtual tool number (90-99)
+--   state: true=on, false=off, nil=toggle current state
+-- Returns:
+--   success: true if operation succeeded
+--   newState: true if output is now on, false if off
+--   errorMsg: Error message if failed
+function ToolLib.setHardware(inst, toolNum, state)
+    -- Initialize if needed
+    if not S.init then ToolLib.init(inst) end
+    
+    -- Map virtual tool numbers to output constants
+    local outputMap = {
+        [90] = OUTPUT.PROBE,    -- Probe uses OUTPUT7
+        [91] = OUTPUT.LASER,    -- Laser uses OUTPUT1
+        -- Add more mappings as needed for other virtual tools
+    }
+    
+    local output = outputMap[toolNum]
+    if not output then 
+        return false, nil, string.format("Tool T%d is not a virtual tool", toolNum)
+    end
+    
+    -- Get the appropriate handle
+    local handle
+    local cacheKey
+    
+    if output == OUTPUT.PROBE then
+        handle = S.handles.probe or getHandle(inst, OUTPUT.PROBE)
+        cacheKey = "probe"
+    elseif output == OUTPUT.LASER then
+        handle = S.handles.laser or getHandle(inst, OUTPUT.LASER)
+        cacheKey = "laser"
+    end
+    
+    if not handle or handle <= 0 then
+        return false, nil, string.format("No handle for T%d output signal", toolNum)
+    end
+    
+    -- Get current state
+    local currentState = mc.mcSignalGetState(handle) == 1
+    
+    -- Determine target state
+    local targetState
+    if state == nil then
+        -- Toggle mode
+        targetState = not currentState
+    else
+        -- Explicit on/off
+        targetState = state
+    end
+    
+    -- Set the hardware state
+    mc.mcSignalSetState(handle, targetState and 1 or 0)
+    
+    -- Update cached state to prevent PLC from fighting us
+    if cacheKey then
+        S.lastOutputs[cacheKey] = targetState and 1 or 0
+    end
+    
+    -- Log the change
+    pushLog(string.format("T%d hardware %s (direct control)", 
+                         toolNum, targetState and "ON" or "OFF"))
+    
+    -- Add settling time for mechanical movement if state changed
+    if targetState ~= currentState then
+        if toolNum == 90 then
+            -- Probe needs time to physically deploy/retract
+            wx.wxMilliSleep(500)
+        elseif toolNum == 91 then
+            -- Laser might need warmup time
+            wx.wxMilliSleep(100)
+        end
+    end
+    
+    -- Verify state changed
+    local newState = mc.mcSignalGetState(handle) == 1
+    
+    return true, newState
+end
+
+-- ============================================
 -- G68 ROTATION STATE MANAGEMENT (STUB)
 -- ============================================
 -- TODO: Move this to SystemLib.lua when implementing full G68 support

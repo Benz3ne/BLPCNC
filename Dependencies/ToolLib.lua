@@ -381,26 +381,62 @@ function ToolLib.requestRetract(inst)
     local xDelta = getPV(inst, PV.X_DELTA, 0)
     local yDelta = getPV(inst, PV.Y_DELTA, 0)
     
-    -- Clear G52 offset
-    mc.mcCntlGcodeExecuteWait(inst, "G52 X0 Y0")
+    -- Validate deltas before using (corruption check)
+    if xDelta < -1e300 or yDelta < -1e300 then
+        pushLog("WARNING: Virtual tool deltas corrupted, skipping offset restoration")
+        -- Still clear state and turn off hardware
+        setPV(inst, PV.VIRTUAL_TOOL, 0)
+        setPV(inst, PV.X_DELTA, 0)
+        setPV(inst, PV.Y_DELTA, 0)
+        mc.mcToolSetCurrent(inst, 0)
+        mc.mcCntlGcodeExecuteWait(inst, "G49")
+        return true, "Cleared corrupted virtual tool state"
+    end
     
-    -- Handle G68 restoration if it was active
-    if getPV(inst, PV.G68_NEEDS_RESTORE, 0) == 1 then
+    -- Check if G68 needs restoration
+    local g68NeedsRestore = getPV(inst, PV.G68_NEEDS_RESTORE, 0) == 1
+    if g68NeedsRestore then
+        -- Cancel current G68 before restoring offsets
+        mc.mcCntlGcodeExecuteWait(inst, "G69")
+        pushLog("G68 temporarily cancelled for offset restoration")
+    end
+    
+    -- POUND VARIABLE METHOD: Restore original work offsets
+    -- Add the deltas back to return work coordinates to their original values
+    for i = 0, 5 do
+        local baseVar = 5221 + (i * 20)  -- G54=#5221, G55=#5241, G56=#5261, G57=#5281, G58=#5301, G59=#5321
+        local currentX = getPV(inst, baseVar, 0)
+        local currentY = getPV(inst, baseVar + 1, 0)
+        
+        -- Sanity check - only restore if coordinates look reasonable
+        if currentX and currentY and currentX > -1e300 and currentY > -1e300 then
+            if math.abs(currentX) < 1000 and math.abs(currentY) < 1000 then
+                -- Restore offset: add back to work coordinates
+                setPV(inst, baseVar, currentX + xDelta)
+                setPV(inst, baseVar + 1, currentY + yDelta)
+                
+                pushLog(string.format("G%d offsets restored: X%.4f->%.4f Y%.4f->%.4f", 
+                    54 + i, currentX, currentX + xDelta, currentY, currentY + yDelta))
+            else
+                pushLog(string.format("WARNING: G%d coordinates out of range, skipping restoration", 54 + i))
+            end
+        end
+    end
+    
+    -- Restore G68 if it was active
+    if g68NeedsRestore then
         local storedX = getPV(inst, PV.G68_STORED_X, 0)
         local storedY = getPV(inst, PV.G68_STORED_Y, 0)
         local storedR = getPV(inst, PV.G68_STORED_R, 0)
         
-        -- Cancel current G68
-        mc.mcCntlGcodeExecuteWait(inst, "G69")
-        
-        -- Restore original G68
+        -- Restore original G68 with original center
         mc.mcCntlGcodeExecuteWait(inst, string.format("G68 X%.4f Y%.4f R%.4f", 
             storedX, storedY, storedR))
         
         -- Clear restoration flag
         setPV(inst, PV.G68_NEEDS_RESTORE, 0)
         
-        pushLog(string.format("G68 restored: X%.4f Y%.4f R%.4f", storedX, storedY, storedR))
+        pushLog(string.format("G68 restored to original: X%.4f Y%.4f R%.4f", storedX, storedY, storedR))
     end
     
     -- Clear state
@@ -412,7 +448,7 @@ function ToolLib.requestRetract(inst)
     mc.mcToolSetCurrent(inst, 0)
     mc.mcCntlGcodeExecuteWait(inst, "G49")
     
-    pushLog(string.format("Retracted virtual T%d, G52 cleared", current))
+    pushLog(string.format("Retracted virtual T%d, work offsets restored", current))
     return true
 end
 

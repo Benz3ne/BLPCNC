@@ -731,6 +731,96 @@ function ProbeLib.Safety.EnsureProbeNotTripped(inst)
     return true
 end
 
+-- Validate probe is ready (not stuck/triggered) - Enhanced version
+-- Parameters:
+--   inst: Mach4 instance
+--   attemptClear: If true, attempt G31.2 to clear stuck probe
+--   showError: If true, show error dialog (default true)
+-- Returns:
+--   true if probe is ready, false if stuck
+function ProbeLib.Safety.ValidateProbeReady(inst, attemptClear, showError)
+    if showError == nil then showError = true end
+    
+    local probeSignal = mc.mcSignalGetHandle(inst, mc.ISIG_PROBE1)
+    local probeState = mc.mcSignalGetState(probeSignal)
+    
+    if probeState == 1 then
+        -- Probe is triggered
+        if attemptClear then
+            -- Try to clear with G31.2
+            mc.mcCntlSetLastError(inst, "Probe triggered - attempting to clear...")
+            mc.mcCntlGcodeExecuteWait(inst, "G31.2")
+            wx.wxMilliSleep(100)
+            
+            -- Check again
+            probeState = mc.mcSignalGetState(probeSignal)
+        end
+        
+        if probeState == 1 then
+            -- Still triggered
+            if showError then
+                local msg = "Probe is stuck in triggered state!\n\n" ..
+                           "Possible causes:\n" ..
+                           "• Probe tip is in contact with material\n" ..
+                           "• Probe wiring issue\n" ..
+                           "• Probe needs calibration\n\n" ..
+                           "Please check probe and try again."
+                wx.wxMessageBox(msg, "Probe Stuck", wx.wxOK + wx.wxICON_ERROR)
+            end
+            return false
+        else
+            mc.mcCntlSetLastError(inst, "Probe cleared successfully")
+        end
+    end
+    
+    return true
+end
+
+-- Comprehensive probe safety check
+-- Combines all safety validations in one call
+-- Parameters:
+--   inst: Mach4 instance
+--   options: Table with optional settings
+--     - checkTool: Verify T90 is active (default true)
+--     - checkStuck: Check if probe is stuck (default true)
+--     - checkRotation: Check for G68 rotation (default true)
+--     - attemptClear: Try to clear stuck probe (default true)
+-- Returns:
+--   true if all checks pass, false otherwise
+function ProbeLib.Safety.PerformAllChecks(inst, options)
+    options = options or {}
+    if options.checkTool == nil then options.checkTool = true end
+    if options.checkStuck == nil then options.checkStuck = true end
+    if options.checkRotation == nil then options.checkRotation = true end
+    if options.attemptClear == nil then options.attemptClear = true end
+    
+    -- Check tool (requires ProbeLib.Tool module to be implemented)
+    if options.checkTool then
+        -- Check if T90 is active
+        local currentTool = mc.mcToolGetCurrent(inst)
+        if currentTool ~= 90 then
+            mc.mcCntlSetLastError(inst, "ERROR: Probe tool (T90) not active")
+            return false
+        end
+    end
+    
+    -- Check probe state
+    if options.checkStuck then
+        if not ProbeLib.Safety.ValidateProbeReady(inst, options.attemptClear) then
+            return false
+        end
+    end
+    
+    -- Check rotation
+    if options.checkRotation then
+        if not ProbeLib.Safety.CheckRotation(inst) then
+            return false
+        end
+    end
+    
+    return true
+end
+
 -- ============================================
 -- CALCULATIONS MODULE - Common math utilities
 -- ============================================

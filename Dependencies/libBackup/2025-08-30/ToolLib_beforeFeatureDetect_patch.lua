@@ -100,53 +100,18 @@ local function isSafeForModalChange(inst)
         return false, "Cannot change modes during program execution"
     end
 
-    -- Feature-detect available motion APIs; fall back to position sampling
-    local hasAxisIsMoving = (type(mc.mcAxisIsMoving) == "function")
-    local hasMotionIsMoving = (type(mc.mcMotionIsMoving) == "function")
-
-    if hasAxisIsMoving then
-        -- Per-axis moving checks
-        for axis = 0, 5 do
-            if mc.mcAxisIsEnabled(inst, axis) == 1 then
-                if mc.mcAxisIsMoving(inst, axis) == 1 then
-                    local axisName = ({"X","Y","Z","A","B","C"})[axis + 1]
-                    return false, string.format("Axis %s is moving", axisName)
-                end
+    -- Root-cause fix: rely only on available APIs
+    -- Check per-axis motion using mcAxisIsMoving
+    for axis = 0, 5 do
+        if mc.mcAxisIsEnabled(inst, axis) == 1 then
+            if mc.mcAxisIsMoving(inst, axis) == 1 then
+                local axisName = ({"X","Y","Z","A","B","C"})[axis + 1]
+                return false, string.format("Axis %s is moving", axisName)
             end
         end
-        return true
-    elseif hasMotionIsMoving then
-        -- Planner-level moving check
-        if mc.mcMotionIsMoving(inst) == 1 then
-            return false, "Axes in motion"
-        end
-        return true
-    else
-        -- Fallback: sample machine positions twice and compare
-        local pos1 = {}
-        for axis = 0, 5 do
-            if mc.mcAxisIsEnabled(inst, axis) == 1 then
-                pos1[axis] = mc.mcAxisGetMachinePos(inst, axis) or 0
-            end
-        end
-        -- 50ms delay using wx if available, else os.clock loop
-        if wx and wx.wxMilliSleep then
-            wx.wxMilliSleep(50)
-        else
-            local t0 = os.clock()
-            while (os.clock() - t0) < 0.05 do end
-        end
-        for axis = 0, 5 do
-            if pos1[axis] ~= nil then
-                local p2 = mc.mcAxisGetMachinePos(inst, axis) or 0
-                if math.abs(p2 - pos1[axis]) > 0.0001 then
-                    local axisName = ({"X","Y","Z","A","B","C"})[axis + 1]
-                    return false, string.format("Axis %s is moving", axisName)
-                end
-            end
-        end
-        return true
     end
+
+    return true
 end
 
 -- Get virtual tool configuration
@@ -790,5 +755,4 @@ ToolLib.G68 = {
 }
 
 return ToolLib
-
 

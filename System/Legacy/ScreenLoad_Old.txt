@@ -8,51 +8,6 @@ machWasEnabled = 0
 inst = mc.mcGetInstance()
 Tframe = nil --TouchFrame handle
 
--- Add Lua search paths for better portability
--- First add standard Modules folder (preferred for portability)
-local sep = package.config:sub(1,1)  -- Get path separator
-local machDir = mc.mcCntlGetMachDir(inst)
-local modules = machDir .. sep .. "Modules" .. sep .. "?.lua"
-if not package.path:find(modules, 1, true) then
-    package.path = modules .. ";" .. package.path
-end
-
--- Then add profile-specific Dependencies folder
-package.path = package.path .. ";C:/Mach4Hobby/Profiles/BLP/Scripts/Dependencies/?.lua"
-
--- SafeCall wrapper for protected execution with error reporting
-local function SafeCall(fn, ...)
-    return xpcall(function(...) return fn(...) end, function(err)
-        mc.mcCntlSetLastError(inst, "Lua error: " .. tostring(err))
-        return nil, err
-    end, ...)
-end
-_G.SafeCall = SafeCall  -- Make globally available
-
--- Sentinel value for invalid/uninitialized pound variables
-local SENTINEL_VALUE = -999999
-_G.SENTINEL_VALUE = SENTINEL_VALUE
-
--- Safe pound variable getter with sentinel handling
-local function getPV(n, default)
-    local v = mc.mcCntlGetPoundVar(inst, n)
-    if v == nil or v <= -1e307 then 
-        return default or SENTINEL_VALUE 
-    end
-    return v
-end
-_G.getPV = getPV  -- Make globally available
-
--- Safe numeric conversion helper
-local function num(v, default)
-    v = tonumber(v)
-    if v == nil or v ~= v then -- NaN check (v~=v)
-        return default or 0
-    end
-    return v
-end
-_G.num = num  -- Make globally available
-
 --mobdebug = require('mobdebug')
 --mobdebug.onexit = mobdebug.done
 --mobdebug.start() -- This line is to start the debug Process Comment out for no debuging
@@ -397,7 +352,17 @@ end
 -------------------------------------------------------
 --  Seconds to time Added 5-9-16
 -------------------------------------------------------
--- SecondsToTime function removed - using SystemLib.Display.SecondsToTime instead
+--Converts decimal seconds to an HH:MM:SS.xx format
+function SecondsToTime(seconds)
+	if seconds == 0 then
+		return "00:00:00.00"
+	else
+		local hours = string.format("%02.f", math.floor(seconds/3600))
+		local mins = string.format("%02.f", math.floor((seconds/60) - (hours*60)))
+		local secs = string.format("%04.2f",(seconds - (hours*3600) - (mins*60)))
+		return hours .. ":" .. mins .. ":" .. secs
+	end
+end
 ---------------------------------------------------------------
 -- Set Button Jog Mode to Cont.
 ---------------------------------------------------------------
@@ -460,103 +425,29 @@ function DecToFrac(axis)
 	scr.SetProperty((labDen), 'Label', "/" .. tostring(denom))
 end
 ---------------------------------------------------------------
---Timer panel example (disabled)
+--Timer panel example
 ---------------------------------------------------------------
---TimerPanel = wx.wxPanel (wx.NULL, wx.wxID_ANY, wx.wxDefaultPosition, wx.wxSize( 0,0 ) )
---timer = wx.wxTimer(TimerPanel)
---TimerPanel:Connect(wx.wxEVT_TIMER,
---function (event)
---    wx.wxMessageBox("Hello")
---    timer:Stop()
---end)
-
----------------------------------------------------------------
--- Tool Selection Dialog Timer (Non-blocking PLC support)
----------------------------------------------------------------
-local ToolPromptPanel = wx.wxPanel(wx.NULL, wx.wxID_ANY, wx.wxDefaultPosition, wx.wxSize(0,0))
-local toolPromptTimer = wx.wxTimer(ToolPromptPanel)
-
-ToolPromptPanel:Connect(wx.wxEVT_TIMER, function(event)
-    -- Check if PLC requested tool selection
-    if _G.needToolPrompt then
-        _G.needToolPrompt = false  -- Clear flag immediately to prevent re-entry
-        
-        -- Show tool selection dialog (moved from PLC)
-        ShowToolSelectionDialog(_G.toolPromptIsStartup)
-    end
-    
-    -- Check if PLC requested air pressure dialog
-    if _G.needLowAirDialog then
-        _G.needLowAirDialog = false  -- Clear flag immediately
-        
-        SafeCall(function()
-            local icon = wx.wxICON_WARNING
-            if _G.lowAirDialogType == "error" then
-                icon = wx.wxICON_ERROR
-            elseif _G.lowAirDialogType == "info" then
-                icon = wx.wxICON_INFORMATION
-            end
-            
-            wx.wxMessageBox(
-                _G.lowAirDialogMessage or "System Alert",
-                "Air Pressure Alert",
-                wx.wxOK + icon
-            )
-        end)
-    end
+TimerPanel = wx.wxPanel (wx.NULL, wx.wxID_ANY, wx.wxDefaultPosition, wx.wxSize( 0,0 ) )
+timer = wx.wxTimer(TimerPanel)
+TimerPanel:Connect(wx.wxEVT_TIMER,
+function (event)
+    wx.wxMessageBox("Hello")
+    timer:Stop()
 end)
-
--- Start checking every 100ms
-toolPromptTimer:Start(100)
 ---------------------------------------------------------------
--- Safe module loading with fallbacks
+-- Load modules
 ---------------------------------------------------------------
--- Helper function for safe module loading with operator-visible degraded mode
-local function safeRequire(name)
-    local ok, modOrErr = pcall(require, name)
-    if not ok then
-        mc.mcCntlSetLastError(inst, string.format("[Degraded Mode] Missing lib '%s': %s", name, tostring(modOrErr)))
-        return nil
-    end
-    return modOrErr
-end
-
--- Master module
+--Master module
 package.loaded.mcRegister = nil
-mm = safeRequire("mcRegister")
+mm = require "mcRegister"
 
--- ErrorCheck module Added 11-4-16
+--ErrorCheck module Added 11-4-16
 package.loaded.mcErrorCheck = nil
-mcErrorCheck = safeRequire("mcErrorCheck")
+mcErrorCheck = require "mcErrorCheck"
 
--- SystemLib module for shared utilities
-package.loaded.SystemLib = nil
-SystemLib = safeRequire("SystemLib")
-_G.SystemLib = SystemLib  -- Make globally available
-
--- Trace module
+--Trace module
 package.loaded.mcTrace = nil
-mcTrace = safeRequire("mcTrace")
-
--- Load unified Dust/Airflow library
-package.loaded.dustLib = nil
-dustLib = safeRequire("DustLib")
-_G.DustLib = dustLib  -- Make globally available
-
--- Load unified Tool library
-package.loaded.ToolLib = nil
-ToolLib = safeRequire("ToolLib")
-_G.ToolLib = ToolLib  -- Make globally available
-
--- Load UILib for dialog management
-package.loaded.UILib = nil
-UILib = safeRequire("UILib")
-_G.UILib = UILib  -- Make globally available
-
--- Load ProbeLib for probing utilities
-package.loaded.ProbeLib = nil
-ProbeLib = safeRequire("ProbeLib")
-_G.ProbeLib = ProbeLib  -- Make globally available
+mcTrace = require "mcTrace"
 
 ---------------------------------------------------------------
 -- Get fixtue offset pound variables function Updated 5-16-16
@@ -690,174 +581,6 @@ end
 -- Call on load
 PopulateTools()
 
----------------------------------------------------------------
--- Tool Selection Dialog (Non-blocking version moved from PLC)
----------------------------------------------------------------
-function ShowToolSelectionDialog(isStartup)
-    local inst = mc.mcGetInstance()
-    
-    -- Filter physical tools only
-    local filteredChoices = {}
-    local filteredNumbers = {}
-    
-    for i, toolNum in ipairs(_G.toolNumbers) do
-        if toolNum > 0 and toolNum < 90 then
-            table.insert(filteredChoices, _G.toolChoices[i])
-            table.insert(filteredNumbers, toolNum)
-        end
-    end
-    
-    if #filteredChoices == 0 then
-        mc.mcCntlSetLastError(inst, "ERROR: No physical tools configured")
-        mc.mcToolSetCurrent(inst, 1)
-        mc.mcCntlGcodeExecuteWait(inst, "G49")
-        wx.wxMilliSleep(100)
-        mc.mcCntlGcodeExecuteWait(inst, "G43 H1")
-        return
-    end
-    
-    local message = isStartup and 
-        "Tool detected in spindle at startup.\nSelect the actual tool:" or
-        "Tool inserted manually.\nSelect the tool number:"
-    
-    -- Create dialog
-    local dlg = wx.wxSingleChoiceDialog(wx.NULL, message, 
-        isStartup and "Tool Mismatch Detected" or "Tool Confirmation", 
-        filteredChoices)
-    
-    -- Signal monitoring timer (preserves all existing functionality)
-    local timerPanel = wx.wxPanel(dlg, wx.wxID_ANY)
-    local timer = wx.wxTimer(timerPanel)
-    local spindleCancelled = false
-    
-    -- Get signal handles
-    local input8Handle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT8)
-    local out2Handle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT2)
-    local toolPresentHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)
-    
-    -- Track states for monitoring
-    local lastInput8 = 0
-    if input8Handle and input8Handle > 0 then
-        lastInput8 = mc.mcSignalGetState(input8Handle)
-    end
-    
-    local lastToolPresent = 1  -- Assume tool present when dialog opened
-    if toolPresentHandle and toolPresentHandle > 0 then
-        lastToolPresent = mc.mcSignalGetState(toolPresentHandle)
-    end
-    
-    local buttonPressStart = 0
-    local buttonHoldRequired = 0.5
-    local buttonHeld = false
-    
-    -- Timer monitors signals while dialog is open
-    timerPanel:Connect(wx.wxEVT_TIMER, function(event)
-        -- Check for tool removal
-        if toolPresentHandle and toolPresentHandle > 0 then
-            local currentToolPresent = mc.mcSignalGetState(toolPresentHandle)
-            if currentToolPresent == 0 and lastToolPresent == 1 then
-                spindleCancelled = true
-                dlg:EndModal(wx.wxID_CANCEL)
-                timer:Stop()
-                return
-            end
-            lastToolPresent = currentToolPresent
-        end
-        
-        -- Mirror INPUT8 to OUTPUT2 (protected by M6 check)
-        local m6Running = mc.mcCntlGetPoundVar(inst, 499)
-        if m6Running ~= 1 then
-            if input8Handle and input8Handle > 0 and out2Handle and out2Handle > 0 then
-                local currentInput8 = mc.mcSignalGetState(input8Handle)
-                mc.mcSignalSetState(out2Handle, currentInput8)
-                
-                -- Button hold detection for cancel
-                if currentInput8 == 1 and lastInput8 == 0 then
-                    buttonPressStart = os.clock()
-                    buttonHeld = false
-                elseif currentInput8 == 1 and lastInput8 == 1 then
-                    if not buttonHeld and (os.clock() - buttonPressStart) >= buttonHoldRequired then
-                        buttonHeld = true
-                        spindleCancelled = true
-                        dlg:EndModal(wx.wxID_CANCEL)
-                        timer:Stop()
-                    end
-                elseif currentInput8 == 0 and lastInput8 == 1 then
-                    mc.mcSignalSetState(out2Handle, 0)
-                    buttonPressStart = 0
-                    buttonHeld = false
-                end
-                lastInput8 = currentInput8
-            end
-        end
-    end)
-    
-    timer:Start(50)  -- Check signals every 50ms
-    
-    -- Show dialog (blocking only ScreenLoad context, not PLC)
-    local result = dlg:ShowModal()
-    timer:Stop()
-    
-    -- Process result
-    if spindleCancelled then
-        mc.mcToolSetCurrent(inst, 0)
-        mc.mcCntlGcodeExecuteWait(inst, "G49")
-        
-        if UpdateToolPreview then
-            UpdateToolPreview()
-        end
-        
-        mc.mcCntlSetLastError(inst, "Tool removed - T0 set")
-        
-    elseif result == wx.wxID_OK then
-        local selection = dlg:GetSelection()
-        if selection >= 0 and selection < #filteredNumbers then
-            local selectedTool = filteredNumbers[selection + 1]
-            
-            _G.lastTool = -999  -- Reset sync tracker
-            
-            mc.mcToolSetCurrent(inst, selectedTool)
-            wx.wxMilliSleep(50)
-            mc.mcCntlGcodeExecuteWait(inst, "G49")
-            wx.wxMilliSleep(100)
-            
-            if selectedTool > 0 then
-                mc.mcCntlGcodeExecuteWait(inst, string.format("G43 H%d", selectedTool))
-                wx.wxMilliSleep(100)
-            end
-            
-            _G.hOffsetLastSync = os.clock()
-            
-            if UpdateToolPreview then
-                UpdateToolPreview()
-            end
-            
-            mc.mcCntlSetLastError(inst, string.format("Tool set to T%d", selectedTool))
-        end
-    else
-        -- Cancelled
-        if isStartup then
-            mc.mcToolSetCurrent(inst, 1)
-            mc.mcCntlGcodeExecuteWait(inst, "G49")
-            wx.wxMilliSleep(100)
-            mc.mcCntlGcodeExecuteWait(inst, "G43 H1")
-            
-            _G.hOffsetLastSync = os.clock()
-            
-            wx.wxMessageBox("Tool selection cancelled.\n\nTool has been set to T1 by default.\nPlease verify the correct tool number.", 
-                           "Tool Set to T1", wx.wxOK + wx.wxICON_WARNING)
-        else
-            wx.wxMessageBox("Tool change cancelled. Tool not updated.", "Info", wx.wxOK + wx.wxICON_INFORMATION)
-        end
-        
-        if UpdateToolPreview then
-            UpdateToolPreview()
-        end
-    end
-    
-    dlg:Destroy()
-end
-
 -- Initialize for PLC - force T0 on startup with H offset sync
 local inst = mc.mcGetInstance()
 mc.mcToolSetCurrent(inst, 0)  -- Set to T0
@@ -917,17 +640,6 @@ ValidateVirtualToolConfig()
 -- ============================================
 function RetractVirtualTool()
     local inst = mc.mcGetInstance()
-    if ToolLib then
-        return ToolLib.requestRetract(inst)
-    end
-    return false
-end
-_G.RetractVirtualTool = RetractVirtualTool
-
--- Original function replaced with ToolLib wrapper
--- ToolLib now handles all virtual tool state management
-local function RetractVirtualTool_REPLACED()
-    local inst = mc.mcGetInstance()
     local state = mc.mcCntlGetPoundVar(inst, 406)
     
     -- Only retract if virtual tool active (90-99)
@@ -941,14 +653,34 @@ local function RetractVirtualTool_REPLACED()
     
     -- Check if G68 is currently active (from probe operations)
     local currentRotState = mc.mcCntlGetPoundVar(inst, 4016)
-    -- Use SystemLib to handle G68 state preservation
-    local g68NeedsAdjustment = SystemLib.G68.StoreState(inst, xDelta, yDelta)
+    local g68NeedsAdjustment = false
+    local adjustedX, adjustedY, adjustedR = 0, 0, 0
     
-    if g68NeedsAdjustment then
-        -- Get debug info for logging
-        local g68State = SystemLib.G68.GetState(inst)
-        mc.mcCntlSetLastError(inst, string.format("G68 center will adjust: X%.4f Y%.4f",
-            g68State.storedX, g68State.storedY))
+    if currentRotState == 68 then
+        -- G68 was applied while probe was active
+        -- Get current center (in offset coordinates)
+        local currentG68X = mc.mcCntlGetPoundVar(inst, 1245)
+        local currentG68Y = mc.mcCntlGetPoundVar(inst, 1246)
+        local currentG68R = mc.mcCntlGetPoundVar(inst, 1247)
+        
+        -- Calculate adjusted center for non-offset coordinates
+        adjustedX = currentG68X + xDelta
+        adjustedY = currentG68Y + yDelta
+        adjustedR = currentG68R
+        
+        -- Store adjusted values
+        mc.mcCntlSetPoundVar(inst, 440, adjustedX)
+        mc.mcCntlSetPoundVar(inst, 441, adjustedY)
+        mc.mcCntlSetPoundVar(inst, 442, adjustedR)
+        mc.mcCntlSetPoundVar(inst, 443, 1)  -- Flag: needs adjustment
+        
+        g68NeedsAdjustment = true
+        
+        -- Cancel G68 temporarily
+        mc.mcCntlGcodeExecuteWait(inst, "G69")
+        
+        mc.mcCntlSetLastError(inst, string.format("G68 center will adjust: X%.4f→%.4f Y%.4f→%.4f",
+            currentG68X, adjustedX, currentG68Y, adjustedY))
     end
     
     -- VALIDATE DELTAS BEFORE USING
@@ -968,7 +700,8 @@ local function RetractVirtualTool_REPLACED()
         mc.mcCntlSetPoundVar(inst, 406, 0)
         mc.mcCntlSetPoundVar(inst, 407, 0)
         mc.mcCntlSetPoundVar(inst, 408, 0)
-        SystemLib.G68.ClearState(inst)  -- Clear G68 state and atomic flag
+        mc.mcCntlSetPoundVar(inst, 443, 0)  -- Clear G68 flag
+        mc.mcCntlSetPoundVar(inst, 445, 0)  -- Clear atomic flag
         mc.mcToolSetCurrent(inst, 0)
         mc.mcCntlGcodeExecuteWait(inst, "G49")
         
@@ -1000,8 +733,13 @@ local function RetractVirtualTool_REPLACED()
     
     -- Reapply G68 with adjusted center if it was active
     if g68NeedsAdjustment then
-        SystemLib.G68.RestoreState(inst)
+        mc.mcCntlGcodeExecuteWait(inst, string.format("G68 X%.4f Y%.4f R%.4f",
+            adjustedX, adjustedY, adjustedR))
+        
         mc.mcCntlSetLastError(inst, "G68 rotation adjusted for coordinate system restoration")
+        
+        -- Clear the flag
+        mc.mcCntlSetPoundVar(inst, 443, 0)
     end
     
     -- Turn off hardware based on tool type
@@ -1034,6 +772,8 @@ local function RetractVirtualTool_REPLACED()
     return true  -- Successfully retracted
 end
 
+-- CRITICAL: Make it globally accessible
+_G.RetractVirtualTool = RetractVirtualTool
 
 
 
@@ -1045,26 +785,72 @@ end
 -- Spindle-based control with manual override
 -- ============================================
 
--- Legacy dust boot functions - NEUTRALIZED
--- These functions are kept for compatibility but do nothing
--- All dust/boot control is now handled by dustLib.lua
+-- Initialize dust boot system on startup
 function InitDustBoot()
-    -- No-op: dustLib handles initialization
+    local inst = mc.mcGetInstance()
+    mc.mcCntlSetPoundVar(inst, 402, 1)  -- Default to auto mode
+    mc.mcCntlSetPoundVar(inst, 403, 0)  -- Target UP
+    -- Start with boot UP for safety
+    local h = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+    if h and h > 0 then
+        mc.mcSignalSetState(h, 0)
+    end
 end
 
--- Simple boot control - NEUTRALIZED
+-- Simple boot control - called by PLC
 function UpdateDustBoot()
-    -- No-op: dustLib handles all updates
+    local inst = mc.mcGetInstance()
+    local h = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+    if not h or h <= 0 then return end
+    
+    -- Get states
+    local m6Running = mc.mcCntlGetPoundVar(inst, 499)
+    local virtualTool = mc.mcCntlGetPoundVar(inst, 406)
+    local autoMode = mc.mcCntlGetPoundVar(inst, 402)
+    local override = mc.mcCntlGetPoundVar(inst, 410)
+    local target = mc.mcCntlGetPoundVar(inst, 403)
+    
+    local bootPosition = 0  -- Default UP
+    
+    -- Priority: M6 > Virtual > Auto/Manual
+    if m6Running == 1 then
+        bootPosition = 0  -- M6 forces UP
+    elseif virtualTool >= 90 then
+        bootPosition = 0  -- Virtual tool forces UP
+    else
+        -- Apply auto control if no override
+        if autoMode == 1 and override == 0 then
+            local spindleHandle = mc.mcSignalGetHandle(inst, mc.OSIG_SPINDLEON)
+            local spindleOn = (spindleHandle and mc.mcSignalGetState(spindleHandle) == 1) or false
+            mc.mcCntlSetPoundVar(inst, 403, spindleOn and 1 or 0)
+        end
+        bootPosition = mc.mcCntlGetPoundVar(inst, 403)
+    end
+    
+    -- Apply position
+    mc.mcSignalSetState(h, bootPosition)
 end
 
--- Set manual mode - NEUTRALIZED
+-- Set manual mode
 function SetManualMode(targetState)
-    -- No-op: dustLib handles all mode changes
+    local inst = mc.mcGetInstance()
+    mc.mcCntlSetPoundVar(inst, 402, 0)  -- Manual mode
+    mc.mcCntlSetPoundVar(inst, 403, targetState)  -- Set target
+    UpdateDustBoot()  -- Apply immediately
+    
+    -- Update AUTO button to show manual mode
+    scr.SetProperty("btnDustBootAuto", "Bg Color", "#FF0000")
 end
 
--- Set auto mode - NEUTRALIZED  
+-- Set auto mode
 function SetAutoMode()
-    -- No-op: dustLib handles all mode changes
+    local inst = mc.mcGetInstance()
+    mc.mcCntlSetPoundVar(inst, 402, 1)  -- Auto mode
+    -- Don't change target - let M3/M5 control it
+    UpdateDustBoot()
+    
+    -- Update AUTO button to show auto mode
+    scr.SetProperty("btnDustBootAuto", "Bg Color", "#00FF00")
 end
 
 -- Make functions global
@@ -1072,7 +858,8 @@ _G.UpdateDustBoot = UpdateDustBoot
 _G.SetManualMode = SetManualMode
 _G.SetAutoMode = SetAutoMode
 
--- Legacy initialization removed - dustLib handles everything
+-- Initialize on load
+InitDustBoot()
 
 
 
@@ -1088,11 +875,15 @@ do
     
     -- Function to recover virtual tool state on startup
     local function recoverVirtualToolState()
-        if ToolLib then
-            local recovered, details = ToolLib.recover(inst)
-            if recovered then
-                mc.mcCntlSetLastError(inst, "ToolLib: " .. details)
-            end
+        
+        local state = mc.mcCntlGetPoundVar(inst, 406)
+        
+        -- Only recover if virtual tool was active (90-99)
+        if state >= 90 and state <= 99 then
+            mc.mcCntlSetLastError(inst, "Recovering from virtual tool deployment")
+            
+            -- Use the global retraction function
+            RetractVirtualTool()
         end
     end
     
@@ -1445,13 +1236,6 @@ end
 -- ============================================
 function ShowProbeSettingsDialog()
     local inst = mc.mcGetInstance()
-    
-    -- Ensure UILib is available
-    if not UILib then
-        wx.wxMessageBox("UILib not loaded - cannot show probe settings dialog", 
-                       "Error", wx.wxOK + wx.wxICON_ERROR)
-        return
-    end
     
     -- Probe, laser & tool-change setting pound variables and their defaults
     local PROBE_VARS = {
@@ -2384,10 +2168,12 @@ do
     -- Check current tool and notify user if needed
     local currentTool = mc.mcToolGetCurrent(inst)
     if currentTool >= 90 and currentTool <= 99 then
-        -- Set boot target state for dustLib to handle
-        mc.mcCntlSetPoundVar(inst, 403, 0)  -- Boot target = UP
-        -- DustLib.update() will apply on next PLC cycle
-        mc.mcCntlSetLastError(inst, string.format("Virtual T%d active - boot will raise", currentTool))
+        -- Virtual tool loaded - ensure boot is up
+        local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+        if hBoot and hBoot > 0 then
+            mc.mcSignalSetState(hBoot, 0)  -- Raise boot
+        end
+        mc.mcCntlSetLastError(inst, string.format("Virtual T%d active - dust boot raised", currentTool))
     end
     
     -- Initialize dust boot to auto mode
@@ -2396,23 +2182,6 @@ do
     end
 end
 
--- ============================================
--- VIRTUAL TOOL BUTTON HANDLERS
--- ============================================
-function btnTouchProbe_Clicked()
-    local inst = mc.mcGetInstance()
-    if ToolLib.isActive(inst) then
-        ToolLib.requestRetract(inst)
-    else
-        ToolLib.requestDeploy(inst, 90)
-    end
-end
 
-function btnLaserDown_Clicked()
-    local inst = mc.mcGetInstance()
-    if ToolLib.isDeployed(inst, 91) then
-        ToolLib.requestRetract(inst)
-    else
-        ToolLib.requestDeploy(inst, 91)
-    end
-end
+
+

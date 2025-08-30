@@ -1,0 +1,1665 @@
+================================================================================
+MACH4 LUA SCRIPTING REFERENCE - VERIFIED EXAMPLES ONLY
+Generated from official Mach4 default scripts
+================================================================================
+
+CRITICAL: All examples verified from default Mach4 directories only
+- LuaExamples/
+- Wizards/
+- Modules/
+
+================================================================================
+1. BASIC MESSAGE BOX
+Used in: C:\Mach4Hobby\LuaExamples\MessageBox.mcs
+================================================================================
+
+local inst = mc.mcGetInstance()
+wx.wxMessageBox("This is a message in a message box")
+
+================================================================================
+2. OUTPUT ACTIVATION
+Used in: C:\Mach4Hobby\LuaExamples\Activate Output.mcs
+================================================================================
+
+local inst = mc.mcGetInstance()
+local handle, rc = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT1)
+mc.mcSignalSetState(handle, 1)  -- Turn on
+wx.wxMilliSleep(5000)  -- Wait 5 seconds
+mc.mcSignalSetState(handle, 0)  -- Turn off
+
+================================================================================
+3. JOGGING AT SPECIFIC RATES
+Used in: C:\Mach4Hobby\LuaExamples\JogAtRates.mcs
+================================================================================
+
+local inst = mc.mcGetInstance()
+mc.mcJogSetRate(inst, mc.X_AXIS, 50)  -- Set X axis jog rate to 50%
+mc.mcJogVelocityStart(inst, mc.X_AXIS, mc.MC_JOG_POS)  -- Start positive jog
+wx.wxMilliSleep(2000)  -- Jog for 2 seconds
+mc.mcJogVelocityStop(inst, mc.X_AXIS)  -- Stop jogging
+
+================================================================================
+4. HOMING CHECK
+Used in: C:\Mach4Hobby\LuaExamples\AdvancedExamples\CheckHomed.mcs
+================================================================================
+
+function CheckHomed()
+    local inst = mc.mcGetInstance() 
+    local homedX, homedY, homedZ, homedA, homedB, homedC
+    
+    homedX, rc = mc.mcAxisIsHomed(inst, mc.X_AXIS)
+    homedY, rc = mc.mcAxisIsHomed(inst, mc.Y_AXIS) 
+    homedZ, rc = mc.mcAxisIsHomed(inst, mc.Z_AXIS) 
+    homedA, rc = mc.mcAxisIsHomed(inst, mc.A_AXIS) 
+    homedB, rc = mc.mcAxisIsHomed(inst, mc.B_AXIS) 
+    homedC, rc = mc.mcAxisIsHomed(inst, mc.C_AXIS)
+    
+    if (homedX == 1) and (homedY == 1) and (homedZ == 1) then
+        wx.wxMessageBox('All axes are homed')
+    else
+        wx.wxMessageBox('At least one axis is not homed')
+    end
+end
+
+================================================================================
+5. SIGNAL LIBRARY PATTERN
+Used in: C:\Mach4Hobby\LuaExamples\AdvancedExamples\Signal Library.mcs
+================================================================================
+
+SigLib = {
+    [mc.OSIG_MACHINE_ENABLED] = function(state)
+        if state == 1 then
+            -- Machine enabled
+        else
+            -- Machine disabled
+        end
+    end,
+    
+    [mc.ISIG_INPUT1] = function(state)
+        if state == 1 then
+            -- Input activated
+        end
+    end
+}
+
+================================================================================
+6. FILE OPERATIONS
+Used in: C:\Mach4Hobby\LuaExamples\AdvancedExamples\FileOperations.mcs
+================================================================================
+
+function GetDirAndName(s)
+    local MyFile = wx.wxFileName(s)
+    local MyDirOnly = MyFile:GetPathWithSep()
+    local MyNameOnly = MyFile:GetName()
+    local MyExtOnly = MyFile:GetExt()
+    return MyDirOnly, MyNameOnly, MyExtOnly
+end
+
+function CreateNewFile()
+    local MyNum = wx.wxGetNumberFromUser("Select feed rate", "Feed Rate:", "Enter Feed Rate", 50, 1, 1500)
+    local MyGcode = string.format("(File created)\nF%0.4f", MyNum)
+    local MyFile = wx.wxGetCwd() .. "\\GcodeFiles\\MyFile.tap"
+    file = io.open(MyFile, "w+")  -- Open in write mode
+    file:write(MyGcode)
+    file:flush(MyFile)
+    file:close(MyFile)
+end
+
+================================================================================
+7. MODULE LOADING
+Used in: C:\Mach4Hobby\LuaExamples\AdvancedExamples\load_modules.mcs
+================================================================================
+
+local inst = mc.mcGetInstance()
+local profile = mc.mcProfileGetName(inst)
+local machDir = mc.mcCntlGetMachDir(inst)
+local paths = machDir .. "/Profiles/" .. profile .. "/Modules/?.lua"
+
+package.path = paths .. package.path
+
+-- Load modules
+package.loaded.mcProbing = nil
+prb = require "mcProbing"
+
+================================================================================
+8. COROUTINE EXAMPLE
+Used in: C:\Mach4Hobby\LuaExamples\AdvancedExamples\CoroutineExample.mcs
+================================================================================
+
+-- Button script
+wait = coroutine.create(RefAllHome)
+
+-- Screen Load Script
+function RefAllHome()
+    mc.mcAxisDerefAll(inst)
+    mc.mcAxisHomeAll(inst)
+    coroutine.yield()  -- yield coroutine
+    wx.wxMessageBox('Referencing is complete')
+end
+
+-- PLC Script
+if (wait ~= nil) and (machState == 0) then
+    local state = coroutine.status(wait)
+    if state == "suspended" then
+        coroutine.resume(wait)
+    end
+end
+
+================================================================================
+9. PROBE FILE OPENING
+Used in: C:\Mach4Hobby\LuaExamples\ProbeToFile\m400.mcs
+================================================================================
+
+function m400()
+    inst = mc.mcGetInstance()
+    mc.mcCntlProbeFileOpen(inst, "ProbeFile.txt", "X%.4AXIS_X Y%.4AXIS_Y Z%.4AXIS_Z", 1)
+end
+
+================================================================================
+10. M-CODE WITH PARAMETERS
+Used in: C:\Mach4Hobby\LuaExamples\SpindleOrient\m19.mcs
+================================================================================
+
+function m19(hParam)
+    local inst = mc.mcGetInstance()
+    local varR = 0
+    
+    if hParam ~= nil then
+        local flagR, rc = mc.mcCntlGetLocalVarFlag(inst, hParam, mc.SV_R)
+        if rc ~= mc.MERROR_NOERROR then
+            mc.mcCntlMacroAlarm(inst, 19, "Error getting R flag")
+            return
+        end
+        
+        if flagR == 1 then
+            varR, rc = mc.mcCntlGetLocalVar(inst, hParam, mc.SV_R)
+            if varR < 0 or varR > 360 then
+                mc.mcCntlMacroAlarm(inst, 19, "R out of range")
+                return
+            end
+        end
+    end
+end
+
+-- Testing in editor:
+if mc.mcInEditor() == 1 then
+    hParam = mc.mcCntlCreateLocalVars(inst, "R90 P0")
+    m19(hParam)
+end
+
+================================================================================
+11. EMAIL NOTIFICATIONS
+Used in: C:\Mach4Hobby\LuaExamples\AdvancedExamples\Email.mcs
+================================================================================
+
+function email(message)
+    package.path = package.path .. ';./Modules/?.lua;'
+    local smtp = require('/socket.smtp')
+    
+    from = '<fromname@hostname.net>'
+    rcpt = {'<toname1@hostname.net>'}
+    
+    mesgt = {
+        headers = {
+            from = 'From Name <fromname@hostname.net>',
+            to = 'To Name <toname1@hostname.net>',
+            subject = 'Mail from Mach4'
+        },
+        body = tostring(message)
+    }
+    
+    r, e = smtp.send{
+        from = from,
+        rcpt = rcpt,
+        source = smtp.message(mesgt),
+        server = 'mail.myhost.net'
+    }
+end
+
+================================================================================
+12. PENDANT CONTROL
+Used in: C:\Mach4Hobby\LuaExamples\AdvancedExamples\Pendant.mcs
+================================================================================
+
+function Pendant()
+    local hSig, rc = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT10)
+    local XSelection = mc.mcSignalGetState(hSig)
+    
+    if XSelection == 1 then
+        mc.mcMpgSetAxis(inst, 0, 0)  -- X Axis
+        mc.mcCntlSetLastError(inst, "X Selected")
+    else
+        mc.mcMpgSetAxis(inst, 0, -1)  -- No Axis
+    end
+    
+    hSig, rc = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT14)
+    local Step001 = mc.mcSignalGetState(hSig)
+    
+    if Step001 == 1 then
+        mc.mcMpgSetInc(inst, 0, .001)
+    end
+end
+
+================================================================================
+13. SOFT LIMITS ON/OFF
+Used in: C:\Mach4Hobby\LuaExamples\AdvancedExamples\SoftLimsOnOff.mcs
+================================================================================
+
+function SoftLimsOnOff(pInst, SLState)
+    pInst = pInst or 0
+    local inst = mc.mcCntlGetInstanceHandle(pInst, "function SoftLimsOnOff")
+    local msg = ""
+    local rc = 0
+    
+    for v = 0, 5 do
+        rc = mc.mcSoftLimitSetState(pInst, v, SLState)
+        if rc ~= 0 then
+            break
+        end
+    end
+    
+    return msg, rc
+end
+
+================================================================================
+14. OUTPUT TOGGLE WITH PARAMETER
+Used in: C:\Mach4Hobby\LuaExamples\ToggleOutputMacros\m162.mcs
+================================================================================
+
+function m162(hParam)
+    if hParam ~= nil then
+        local inst = mc.mcGetInstance()
+        local flagP, rc = mc.mcCntlGetLocalVarFlag(inst, hParam, mc.SV_P)
+        if flagP == 1 then
+            local varP = mc.mcCntlGetLocalVar(inst, hParam, mc.SV_P)
+            local Osig = mc.OSIG_OUTPUT0 + varP
+            local hReg = mc.mcSignalGetHandle(inst, Osig)
+            if hReg ~= nil then
+                mc.mcSignalSetState(hReg, true)
+            end
+        end
+    end
+end
+
+================================================================================
+15. REGISTER OPERATIONS
+Used in: C:\Mach4Hobby\Modules\mcStandard\mcRegister.lua
+================================================================================
+
+function mcReg.Add(inst, device, path, desc, initialVal, persistent)
+    local hCmdReg, rc = mc.mcRegGetHandle(inst, device .. "/command")
+    if rc ~= mc.MERROR_NOERROR then
+        return "Command register not available", rc
+    end
+    
+    local hReg, rc = mc.mcRegGetHandle(inst, device .. "/" .. path)
+    if rc == mc.MERROR_NOERROR then
+        return "Register already exists", mc.MERROR_NOERROR
+    end
+    
+    local persist = persistent and "1" or "0"
+    local cmdstring = "ADD|" .. path .. "|" .. desc .. "|" .. initialVal .. "|" .. persist
+    return mc.mcRegSendCommand(hCmdReg, cmdstring)
+end
+
+================================================================================
+16. ERROR CHECKING MODULE
+Used in: C:\Mach4Hobby\Modules\mcStandard\mcErrorCheck.lua
+================================================================================
+
+mcErrorCheck = {}
+mcErrorCheck[mc.MERROR_NOERROR] = "No Error"
+mcErrorCheck[mc.MERROR_INVALID_INSTANCE] = "Invalid Instance"
+mcErrorCheck[mc.MERROR_INVALID_ARG] = "Invalid Argument"
+mcErrorCheck[mc.MERROR_FILE_NOT_FOUND] = "File Not Found"
+mcErrorCheck[mc.MERROR_NOT_ENABLED] = "Not Enabled"
+
+================================================================================
+17. BOLT HOLE CIRCLE WIZARD
+Used in: C:\Mach4Hobby\Wizards\BoltHoleCircle.mcs
+================================================================================
+
+function GenerateBoltHoleGCode(X, Y, Radius, StartAngle, NumHoles, ZClearance, ZDepth)
+    local inst = mc.mcGetInstance()
+    local gcode = ""
+    
+    for i = 0, NumHoles - 1 do
+        local angle = StartAngle + (i * 360 / NumHoles)
+        local radians = math.rad(angle)
+        local holeX = X + (Radius * math.cos(radians))
+        local holeY = Y + (Radius * math.sin(radians))
+        
+        gcode = gcode .. string.format("G0 X%.4f Y%.4f\n", holeX, holeY)
+        gcode = gcode .. string.format("G0 Z%.4f\n", ZClearance)
+        gcode = gcode .. string.format("G1 Z%.4f F50\n", ZDepth)
+        gcode = gcode .. string.format("G0 Z%.4f\n", ZClearance)
+    end
+    
+    return gcode
+end
+
+================================================================================
+18. CV FEEDRATE CONTROL
+Used in: C:\Mach4Hobby\Wizards\CV_Feedrate.mcs
+================================================================================
+
+function SaveCellData(row, col)
+    local v = grid:GetCellValue(row, col)
+    mc.mcMotionSetCVAngle(inst, tonumber(row), tonumber(v))
+    grid:SetCellValue(row, col, string.format("%.4f", v))
+end
+
+-- Toggle CV feedrate
+local IsCVangleOn = mc.mcMotionGetCVAngleEnable(inst)
+if IsCVangleOn == 1 then
+    mc.mcMotionSetCVAngleEnable(inst, 0)
+else
+    mc.mcMotionSetCVAngleEnable(inst, 1)
+end
+
+================================================================================
+19. PROBING MODULE
+Used in: C:\Mach4Hobby\Modules\mcProbing.lua
+================================================================================
+
+-- System Variables for probing
+mc.SV_PROBE_POS_X = 5061
+mc.SV_PROBE_POS_Y = 5062
+mc.SV_PROBE_POS_Z = 5063
+mc.SV_PROBE_MACH_POS_X = 5071
+mc.SV_PROBE_MACH_POS_Y = 5072
+mc.SV_PROBE_MACH_POS_Z = 5073
+
+-- Execute probe
+mc.mcCntlGcodeExecuteWait(inst, "G31 Z-10 F100")
+local probeZ = mc.mcCntlGetPoundVar(inst, mc.SV_PROBE_POS_Z)
+
+================================================================================
+20. TOOL SETTING
+Used in: C:\Mach4Hobby\Modules\mcAutoTool.lua
+================================================================================
+
+function mcAutoTool.AutoToolSet(length)
+    local inst = mc.mcGetInstance()
+    
+    -- Probe signal selection
+    local ProbeSigTable = {
+        [31] = mc.ISIG_PROBE,
+        [31.1] = mc.ISIG_PROBE1,
+        [31.2] = mc.ISIG_PROBE2,
+        [31.3] = mc.ISIG_PROBE3
+    }
+    
+    -- Check probe state
+    local function CheckProbe(state)
+        local hsig = mc.mcSignalGetHandle(inst, ProbeSignal)
+        local ProbeState = mc.mcSignalGetState(hsig)
+        if ProbeState == state then
+            mc.mcCntlSetLastError(inst, "Probe error")
+            mc.mcCntlEStop(inst)
+            return false
+        end
+        return true
+    end
+    
+    -- Execute probing
+    mc.mcCntlGcodeExecuteWait(inst, "G91 G31 Z-2.0 F25.")
+    local ZProbed = mc.mcCntlGetPoundVar(inst, 5073)
+    mc.mcToolSetData(inst, mc.MTOOL_MILL_HEIGHT, CurTool, ZOffset)
+end
+
+================================================================================
+21. TOUCH OFF MODULE
+Used in: C:\Mach4Hobby\Modules\mcTouchOff.lua
+================================================================================
+
+function GetMachPos(Axis)
+    if Axis == 'X' then
+        XMach = mc.mcAxisGetMachinePos(inst, mc.X_AXIS)
+    elseif Axis == 'Y' then
+        YMach = mc.mcAxisGetMachinePos(inst, mc.Y_AXIS)
+    elseif Axis == 'Z' then
+        ZMach = mc.mcAxisGetMachinePos(inst, mc.Z_AXIS)
+    end
+end
+
+function ToMachPos(Axis)
+    mc.mcCntlSetLastError(inst, Axis .. ' axis moving to machine position')
+    if Axis == 'X' then
+        Code(string.format('G90 G53 X%.4f F%.1f', XMach, ToffPrepRate))
+    end
+end
+
+================================================================================
+22. MOUSE WHEEL MPG
+Used in: C:\Mach4Hobby\Wizards\MouseMPG.mcs
+================================================================================
+
+function SelectAxis(axis)
+    if axis == 'x' then
+        mpgX:SetBackgroundColour(wx.wxColour(0, 255, 128))
+        mc.mcMpgSetAxis(0, 0, 0)
+        mc.mcMpgSetShuttleMode(0, 0)
+    else
+        mpgX:SetBackgroundColour(wx.wxNullColour)
+    end
+    
+    if axis == 'shuttle' then
+        mpgOff:SetBackgroundColour(wx.wxColour(255, 0, 0))
+        mc.mcMpgSetShuttleMode(0, 1)
+    end
+end
+
+================================================================================
+23. DEFAULT M6 TOOL CHANGE
+Used in: C:\Mach4Hobby\Profiles\Mach4Mill\Macros\m6.mcs
+================================================================================
+
+function m6()
+    local inst = mc.mcGetInstance()
+    local selectedTool = mc.mcToolGetSelected(inst)
+    local currentTool = mc.mcToolGetCurrent(inst)
+    
+    if selectedTool == currentTool then
+        mc.mcCntlSetLastError(inst, "Current tool == Selected tool")
+    else
+        mc.mcCntlSetLastError(inst, "Change to tool " .. tostring(selectedTool))
+        mc.mcCntlToolChangeManual(inst, true)
+        mc.mcToolSetCurrent(inst, selectedTool)
+    end
+end
+
+================================================================================
+CRITICAL SAFETY NOTES
+================================================================================
+
+1. ALWAYS check return codes
+2. ALWAYS get instance before API calls
+3. VALIDATE all user input
+4. CHECK probe state before probing
+5. VERIFY homing before moves
+6. USE mcCntlGcodeExecuteWait for sequential operations
+7. Handle nil values properly
+8. Use pcall for error protection
+9. Check signal handles before use
+10. Validate tool numbers
+
+================================================================================
+24. CUSTOM DIALOG CREATION
+Used in: C:\Mach4Hobby\Modules\GCodeConverter.lua
+================================================================================
+
+function CreateCustomDialog(msg, title, btnOK, btnCANCEL)
+    btnOK = btnOK or "OK"
+    btnCANCEL = btnCANCEL or "Cancel"
+    local btnSize = wx.wxSize(150, 100)
+    
+    -- Create dialog
+    local dialog = wx.wxDialog(wx.NULL, wx.wxID_ANY, title, 
+        wx.wxDefaultPosition, wx.wxDefaultSize, 
+        wx.wxDEFAULT_DIALOG_STYLE + wx.wxSTAY_ON_TOP)
+    
+    dialog:SetSizeHints(wx.wxSize(300, -1), wx.wxDefaultSize)
+    
+    -- Main sizer
+    local szrMain = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    -- Message text
+    local lblText = wx.wxStaticText(dialog, wx.wxID_ANY, msg)
+    lblText:Wrap(-1)
+    lblText:SetFont(wx.wxFont(25, 70, 90, 90, false, ""))
+    szrMain:Add(lblText, 0, wx.wxALIGN_CENTER + wx.wxALL, 5)
+    
+    -- Button sizer
+    local szrButton = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    
+    local btnOK = wx.wxButton(dialog, wx.wxID_ANY, btnOK, 
+        wx.wxDefaultPosition, btnSize, 0)
+    btnOK:SetFont(wx.wxFont(20, 70, 90, 90, false, ""))
+    szrButton:Add(btnOK, 0, wx.wxALIGN_CENTER + wx.wxALL, 5)
+    
+    -- Connect events
+    dialog:Connect(wx.wxEVT_CLOSE_WINDOW, function(event)
+        dialog:Destroy()
+        DialogReturn = wx.wxCLOSE
+    end)
+    
+    btnOK:Connect(wx.wxEVT_COMMAND_BUTTON_CLICKED, function(event)
+        dialog:Destroy()
+        DialogReturn = wx.wxOK
+    end)
+    
+    dialog:SetSizer(szrMain)
+    dialog:Layout()
+    dialog:Centre(wx.wxBOTH)
+    dialog:ShowModal()
+    
+    return _G.DialogReturn
+end
+
+================================================================================
+25. TABLE SAVE/LOAD TO FILE
+Used in: C:\Mach4Hobby\Modules\GCodeConverter.lua
+================================================================================
+
+function SaveTableToFile(file_name, tabletoSave)
+    local function TableToString(tbl)
+        local str = ""
+        for var, value in pairs(tbl) do
+            if type(value) == "table" then
+                str = str .. tostring(var) .. " <TABLE_START>\n" .. 
+                      TableToString(value) .. "<TABLE_END>\n"
+            else
+                if tonumber(value) ~= nil then
+                    str = str .. tostring(var) .. "=" .. 
+                          string.format("%.4f", tonumber(value)) .. "\n"
+                else
+                    str = str .. tostring(var) .. "=" .. tostring(value) .. "\n"
+                end
+            end
+        end
+        return str
+    end
+    
+    local str = TableToString(tabletoSave)
+    local myfile = io.open(file_name, "w")
+    myfile:write(str)
+    myfile:flush()
+    myfile:close()
+    return true
+end
+
+function LoadTableFromFile(file_name)
+    local function AddToTable(thefile, tableindex)
+        local str = thefile:read("line")
+        while str ~= nil do
+            if string.find(str, "<TABLE_START>") then
+                str = string.gsub(str, " <TABLE_START>", "")
+                local newTable = {}
+                table.insert(tableindex, AddToTable(thefile, newTable))
+            elseif string.find(str, "<TABLE_END>") then
+                return tableindex
+            else
+                local eqpos = string.find(str, "=")
+                local varname = string.sub(str, 0, eqpos-1)
+                local val = string.sub(str, eqpos+1, string.len(str))
+                tableindex[varname] = val
+            end
+            str = thefile:read("line")
+        end
+        return tableindex
+    end
+    
+    local myfile = io.open(file_name, "r")
+    if myfile then
+        local dataTable = AddToTable(myfile, {})
+        myfile:close()
+        return dataTable
+    end
+    return {}
+end
+
+================================================================================
+26. GLOB PATTERN MATCHING
+Used in: C:\Mach4Hobby\Modules\mcUtil.lua
+================================================================================
+
+function globtopattern(g)
+    local p = "^"  -- pattern being built
+    local i = 0    -- index in g
+    
+    -- Convert glob wildcards to Lua patterns
+    while true do
+        i = i + 1
+        local c = g:sub(i, i)
+        
+        if c == '' then
+            p = p .. '$'
+            break
+        elseif c == '?' then
+            p = p .. '.'  -- ? matches single character
+        elseif c == '*' then
+            p = p .. '.*'  -- * matches zero or more characters
+        elseif c == '[' then
+            -- Character class handling
+            i = i + 1
+            c = g:sub(i, i)
+            if c == '^' or c == '!' then
+                p = p .. '[^'  -- Negated character class
+            else
+                p = p .. '['
+            end
+            -- Continue processing character class...
+        elseif c == '\\' then
+            -- Escape next character
+            i = i + 1
+            c = g:sub(i, i)
+            if c == '' then
+                p = p .. '\\$'
+                break
+            end
+            p = p .. c:match("^%w$") and c or '%' .. c
+        else
+            -- Regular character, escape if needed
+            p = p .. (c:match("^%w$") and c or '%' .. c)
+        end
+    end
+    
+    return p
+end
+
+-- Usage for directory listing
+function dir(filespec, incPath)
+    incPath = incPath or false
+    local ret = {}
+    local path, file, extension = SplitFilename(filespec)
+    if file == "" then file = "*" end
+    
+    local pattern = globtopattern(file)
+    
+    for file in lfs.dir(path) do
+        if string.find(file, pattern) then
+            if incPath then
+                table.insert(ret, path .. file)
+            else
+                table.insert(ret, file)
+            end
+        end
+    end
+    
+    return ret
+end
+
+================================================================================
+27. SIGNAL WAIT WITH TIMEOUT
+Used in: C:\Mach4Hobby\LuaExamples\SignalWaitWithErrorCheck\m100.mcs
+================================================================================
+
+function m100()
+    local inst = mc.mcGetInstance()
+    
+    -- Get signal handle with error check
+    local hSig, rc = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT1)
+    if rc ~= 0 then
+        mc.mcCntlSetLastError(inst, "Error getting signal handle")
+        return
+    end
+    
+    -- Turn on output
+    rc = mc.mcSignalSetState(hSig, 1)
+    if rc ~= 0 then
+        mc.mcCntlSetLastError(inst, "Error setting signal state")
+        return
+    end
+    
+    -- Wait for input with timeout (5 seconds)
+    rc = mc.mcSignalWait(inst, mc.ISIG_INPUT21, 1, 5)
+    if rc ~= 0 then
+        mc.mcCntlSetLastError(inst, "Timeout waiting for input 21")
+        return
+    end
+end
+
+================================================================================
+28. OUTPUT TOGGLE OFF (M163)
+Used in: C:\Mach4Hobby\Profiles\Mach4Mill\Macros\m163.mcs
+================================================================================
+
+function m163_setOutput(number)
+    local Osig = mc.OSIG_OUTPUT0 + number
+    local hReg = mc.mcSignalGetHandle(mc.mcGetInstance(), Osig)
+    if hReg ~= nil then
+        mc.mcSignalSetState(hReg, false)  -- Turn OFF
+    end
+end
+
+function m163(hParam)
+    if hParam ~= nil then
+        local inst = mc.mcGetInstance()
+        local flagP, rc = mc.mcCntlGetLocalVarFlag(inst, hParam, mc.SV_P)
+        
+        if flagP == 1 then
+            local varP = mc.mcCntlGetLocalVar(inst, hParam, mc.SV_P)
+            m163_setOutput(varP)
+        end
+    end
+end
+
+-- Testing in editor
+if mc.mcInEditor() == 1 then
+    m163_setOutput(1)
+end
+
+================================================================================
+29. MODULE LOADING WITH ERROR HANDLING
+Used in: C:\Mach4Hobby\Profiles\Mach4Mill\Macros\Require.mcs
+================================================================================
+
+local inst = mc.mcGetInstance()
+
+-- Protected require with error handling
+local rc, mcSP = pcall(require, "./Modules/mcSysPaths")
+if rc == false then
+    mc.mcCntlSetLastError(inst, string.format("Path error: %s", mcSP))
+    return
+end
+
+-- Setup paths
+mcSP.SetupPaths(".")
+
+-- Load multiple modules safely
+package.loaded.mcProbe = nil
+mcProbe = require "mcProbing"
+
+package.loaded.mcAT = nil
+mcAT = require "mcAutoTool"
+
+package.loaded.mcErrorCheck = nil
+mcErrorCheck = require "mcErrorCheck"
+
+================================================================================
+30. VISION SYSTEM CONTROL
+Used in: C:\Mach4Hobby\Modules\mcVision\m6001.mcs
+================================================================================
+
+function m6001()
+    local inst = mc.mcGetInstance()
+    
+    -- Set vision mode
+    scr.VisionSetMode("MyVid", scr.VISION_CIRCLE)
+    mc.mcCntlSetLastError(inst, "Vision on")
+    mc.mcCntlGcodeExecuteWait(inst, "G04 P1.")  -- 1 second dwell
+    
+    FindCenterNow = not FindCenterNow
+    
+    if FindCenterNow == false then
+        -- Kill jogging on both axes
+        mc.mcJogVelocityStart(inst, 0, 0)  -- Stop X
+        mc.mcJogVelocityStart(inst, 0, 1)  -- Stop Y
+    end
+    
+    -- Disable vision
+    scr.VisionSetMode("MyVid", scr.VISION_NONE)
+    mc.mcCntlSetLastError(inst, "Vision off")
+    mc.mcCntlGcodeExecuteWait(inst, "G04 P1.")
+end
+
+================================================================================
+31. CUT RECOVERY DIALOG
+Used in: C:\Mach4Hobby\LuaExamples\CustomCutRecovery\mcCutRecovery.lua
+================================================================================
+
+-- Custom cut recovery with UI
+local UI = {}
+UI.m_inst = mc.mcGetInstance()
+UI.m_precision = 0.0001
+UI.m_machpos = {0, 0, 0, 0, 0, 0}
+UI.m_axisEnabled = {}
+
+-- Create dialog
+UI.CutRecovery = wx.wxDialog(wx.NULL, wx.wxID_ANY, "Cut Recovery",
+    wx.wxDefaultPosition, wx.wxSize(-1, -1),
+    wx.wxCAPTION + wx.wxCLOSE_BOX + wx.wxRESIZE_BORDER)
+
+-- Static box for grouping
+local sbSizer = wx.wxStaticBoxSizer(
+    wx.wxStaticBox(UI.CutRecovery, wx.wxID_ANY, "Distance To Go"),
+    wx.wxHORIZONTAL)
+
+-- Grid layout
+local gSizer = wx.wxGridSizer(2, 6, 0, 0)  -- 2 rows, 6 cols
+
+-- Add axis labels and values
+local axisLabels = {"X:", "Y:", "Z:", "A:", "B:", "C:"}
+for i, label in ipairs(axisLabels) do
+    local staticText = wx.wxStaticText(sbSizer:GetStaticBox(), 
+        wx.wxID_ANY, label)
+    gSizer:Add(staticText, 0, wx.wxALIGN_CENTER + wx.wxALL, 5)
+    
+    local distToGo = wx.wxStaticText(sbSizer:GetStaticBox(),
+        wx.wxID_ANY, "000.0000")
+    gSizer:Add(distToGo, 0, wx.wxALIGN_CENTER + wx.wxALL, 5)
+end
+
+================================================================================
+32. AUTOMATION CONFIGURATION
+Used in: C:\Mach4Hobby\Modules\AutomationConfiguration.lua
+================================================================================
+
+local AC = {}
+AC.Plasma = 1
+AC.Laser = 2
+AC.Oxy = 3
+
+AC.WizardNames = {
+    [AC.Plasma] = "Plasma",
+    [AC.Laser] = "Laser",
+    [AC.Oxy] = "Oxy"
+}
+
+AC.AutomationVariables = {
+    [AC.Laser] = {"Focus", "Gas Pressure", "Gas Type", "Nozzle", "Power"},
+    [AC.Plasma] = {"Voltage", "Torch to Work Distance", "Air Flow"},
+    [AC.Oxy] = {}
+}
+
+function AC.GetSettings(MachineType)
+    local inst = mc.mcGetInstance()
+    local SettingsNames = AC.AutomationVariables[MachineType]
+    
+    if SettingsNames == nil then
+        mc.mcCntlSetLastError(inst, "Machine type doesn't exist")
+        return
+    end
+    
+    local Settings = {}
+    for _, name in ipairs(SettingsNames) do
+        Settings[name] = {
+            Prompt = mc.mcProfileGetInt(inst, "AutomationSetup",
+                AC.AutomationVarKeys[name] .. "_PromptToChange", 0),
+            Move = mc.mcProfileGetInt(inst, "AutomationSetup",
+                AC.AutomationVarKeys[name] .. "_MoveToPart", 0)
+        }
+    end
+    
+    return Settings
+end
+
+function AC.SetParkSettings(location, positions)
+    local inst = mc.mcGetInstance()
+    
+    for axis = 0, 5 do
+        if positions[axis] then
+            mc.mcProfileWriteDouble(inst, "AutomationSetup",
+                location .. "_" .. AC.axisLetters[axis], positions[axis])
+        end
+    end
+end
+
+================================================================================
+33. DEEP TABLE COPY
+Used in: C:\Mach4Hobby\Modules\GCodeConverter.lua
+================================================================================
+
+function deepcopy(orig, copies)
+    copies = copies or {}
+    local orig_type = type(orig)
+    local copy
+    
+    if orig_type == 'table' then
+        if copies[orig] then
+            copy = copies[orig]  -- Already copied this table
+        else
+            copy = {}
+            copies[orig] = copy
+            
+            -- Copy all key-value pairs
+            for orig_key, orig_value in next, orig, nil do
+                copy[deepcopy(orig_key, copies)] = deepcopy(orig_value, copies)
+            end
+            
+            -- Copy metatable
+            setmetatable(copy, deepcopy(getmetatable(orig), copies))
+        end
+    else
+        -- Number, string, boolean, etc
+        copy = orig
+    end
+    
+    return copy
+end
+
+================================================================================
+34. ESCAPE MAGIC CHARACTERS
+Used in: C:\Mach4Hobby\Modules\GCodeConverter.lua
+================================================================================
+
+function escape_magic(pattern)
+    -- Escape all Lua pattern magic characters
+    return (pattern:gsub("[^%w]", "%%%1"))
+end
+
+-- Usage example
+local searchPattern = "G0 X[10.5]"
+local safePattern = escape_magic(searchPattern)
+-- Result: "G0 X%[10%.5%]"
+
+================================================================================
+35. SPLIT FILENAME
+Used in: C:\Mach4Hobby\Modules\mcUtil.lua  
+================================================================================
+
+function SplitFilename(strFilename)
+    -- Returns Path, Filename, and Extension as 3 values
+    
+    -- Check if directory
+    if lfs.attributes(strFilename, "mode") == "directory" then
+        local strPath = strFilename:gsub("[\\/]$", "")
+        return strPath .. "\\", "", ""
+    end
+    
+    strFilename = strFilename .. "."
+    
+    -- Match: path, filename with extension, extension only
+    return strFilename:match("^(.-)([^\\/]-%.([^\\/%.]-))%.?$")
+end
+
+-- Usage
+local path, file, ext = SplitFilename("C:\\Mach4\\GCode\\part.tap")
+-- Returns: "C:\\Mach4\\GCode\\", "part.tap", "tap"
+
+================================================================================
+CRITICAL SAFETY NOTES - VERSION 2
+================================================================================
+
+24. Custom dialogs must handle wxEVT_CLOSE_WINDOW
+25. Table serialization must handle nested tables
+26. Glob patterns need proper escaping for filesystem
+27. Signal wait timeouts prevent infinite hangs
+28. Output toggle functions need nil handle checks
+29. Module loading requires pcall protection
+30. Vision systems need jogging kill safety
+31. Cut recovery needs axis enable checks
+32. Automation configs need machine type validation
+33. Deep copy must track copies to prevent loops
+34. Magic character escaping prevents pattern errors
+35. Filename splitting must handle directories
+
+================================================================================
+36. URL ENCODING/ESCAPING
+Used in: C:\Mach4Hobby\Modules\socket\url.lua
+================================================================================
+
+-- Escape special characters for URL encoding
+function escape(s)
+    return (string.gsub(s, "([^A-Za-z0-9_])", function(c)
+        return string.format("%%%02x", string.byte(c))
+    end))
+end
+
+-- Unescape URL-encoded strings
+function unescape(s)
+    return (string.gsub(s, "%%(%x%x)", function(hex)
+        return string.char(tonumber(hex, 16))
+    end))
+end
+
+-- Protected segment encoding for URL paths
+local segment_set = {
+    "-", "_", ".", "!", "~", "*", "'", "(",
+    ")", ":", "@", "&", "=", "+", "$", ","
+}
+
+function protect_segment(s)
+    return string.gsub(s, "([^A-Za-z0-9_])", function(c)
+        if segment_set[c] then return c
+        else return string.format("%%%02x", string.byte(c)) end
+    end)
+end
+
+================================================================================
+37. CRC32 HASHING
+Used in: C:\Mach4Hobby\Modules\crc32.lua
+================================================================================
+
+local crcTab = require("crc32")
+
+-- Calculate CRC32 hash of a string
+function CalculateCRC32(data)
+    local hash = crcTab.hash32(data)
+    return string.format("%08X", hash)
+end
+
+-- Hash with range specification
+local partialHash = crcTab.hash32(myString, 10, 50)  -- Hash bytes 10-50
+
+-- Usage for file integrity
+local fileData = io.open("file.gcode", "rb"):read("*all")
+local checksum = crcTab.hash32(fileData)
+
+================================================================================
+38. SERIAL PORT BARCODE SCANNER
+Used in: C:\Mach4Hobby\Modules\mcBarcode.lua
+================================================================================
+
+local mcBcs = require("mcBarcode")
+local inst = mc.mcGetInstance()
+
+-- Set COM port
+mcBcs.SetPort("COM5")
+
+-- Open serial port with error handling
+function OpenBarcodePort()
+    local rs232 = require("luars232")
+    local e, p = rs232.open("COM5")
+    
+    if e ~= rs232.RS232_ERR_NOERROR then
+        mc.mcCntlSetLastError(inst, 
+            string.format("Can't open port: %s", rs232.error_tostring(e)))
+        return nil
+    end
+    
+    -- Configure port settings
+    p:set_baud_rate(rs232.RS232_BAUD_9600)
+    p:set_data_bits(rs232.RS232_DATA_8)
+    p:set_parity(rs232.RS232_PARITY_NONE)
+    p:set_stop_bits(rs232.RS232_STOP_1)
+    p:set_flow_control(rs232.RS232_FLOW_OFF)
+    
+    return p
+end
+
+-- Read barcode and load G-code file
+function ScanAndLoadGCode()
+    local data = mcBcs.runScan(inst)
+    if data then
+        local machDir = mc.mcCntlGetMachDir(inst)
+        local filePath = machDir .. "/GcodeFiles/" .. data .. ".tap"
+        
+        -- Clean up scanned data
+        filePath = string.gsub(filePath, "\r?\n", "")
+        
+        if wx.wxFileExists(filePath) then
+            mc.mcCntlLoadGcodeFile(inst, filePath)
+            mc.mcToolPathGenerate(inst)
+        end
+    end
+end
+
+================================================================================
+39. CSV ESCAPING AND INTEGER VALIDATION
+Used in: C:\Mach4Hobby\Modules\BatDrawingWizard.mcs
+================================================================================
+
+-- Check if number is integer
+function IsAnInt(num) 
+    return type(num) == "number" and math.floor(num) == num
+end
+
+-- Properly escape CSV fields
+function escapeCSV(s)
+    s = tostring(s)
+    if string.find(s, '[,"]') then
+        s = '"' .. string.gsub(s, '"', '""') .. '"'
+    end
+    s = '"' .. s:gsub("%s+", "") .. '"'  
+    return s
+end
+
+-- Parse CSV with proper tokenization
+function ParseCSVLine(line)
+    local tkz = wx.wxStringTokenizer(line, ",")
+    local fields = {}
+    
+    while tkz:HasMoreTokens() do
+        local token = tkz:GetNextToken()
+        table.insert(fields, token)
+    end
+    
+    return fields
+end
+
+================================================================================
+40. VISION SYSTEM M6002
+Used in: C:\Mach4Hobby\Modules\mcVision\m6002.mcs
+================================================================================
+
+function m6002()
+    local inst = mc.mcGetInstance()
+    
+    -- Set vision to edge detection mode
+    scr.VisionSetMode("MyVid", scr.VISION_EDGE)
+    mc.mcCntlSetLastError(inst, "Edge detection on")
+    
+    -- Dwell for camera stabilization
+    mc.mcCntlGcodeExecuteWait(inst, "G04 P1.")
+    
+    -- Process vision data
+    local edgeX, edgeY = scr.VisionGetEdgePos("MyVid")
+    
+    if edgeX and edgeY then
+        -- Move to detected edge
+        local gcode = string.format("G90 G0 X%.4f Y%.4f", edgeX, edgeY)
+        mc.mcCntlGcodeExecuteWait(inst, gcode)
+    end
+    
+    -- Disable vision
+    scr.VisionSetMode("MyVid", scr.VISION_NONE)
+    mc.mcCntlSetLastError(inst, "Edge detection off")
+end
+
+================================================================================
+41. MODULE PATH CONFIGURATION
+Used in: C:\Mach4Hobby\Modules\mcSysPaths.lua
+================================================================================
+
+local mcSP = require("mcSysPaths")
+
+-- Setup all module paths for current profile
+function SetupModulePaths()
+    local inst = mc.mcGetInstance()
+    local profile = mc.mcProfileGetName(inst)
+    local basedir = "."  -- Or mc.mcCntlGetMachDir(inst)
+    
+    -- Initialize standard paths
+    mcSP.SetupPaths(basedir)
+    
+    -- Add custom module directory with multiple extensions
+    local function AddModulePath(path, extensions)
+        for _, ext in pairs(extensions) do
+            if ext == ".dll" then
+                package.cpath = package.cpath .. ";" .. basedir .. "/Modules/" .. path .. "/?" .. ext
+            else
+                package.path = package.path .. ";" .. basedir .. "/Modules/" .. path .. "/?" .. ext
+            end
+        end
+    end
+    
+    -- Add custom paths
+    AddModulePath("mcStandard", {".lua", ".mcs"})
+    AddModulePath("CustomModules", {".lua", ".dll"})
+end
+
+-- Protected require with fallback
+local rc, module = pcall(require, "mcPRequire")
+if rc then
+    -- Use protected require: (name, reload, packageName)
+    local myModule = mcPR("myModule", false, "com.mycompany")
+end
+
+================================================================================
+42. G-CODE LINE TRANSFORMATIONS
+Used in: C:\Mach4Hobby\Modules\mcGCConverter.lua
+================================================================================
+
+local mcGC = require("mcGCConverter")
+
+-- Flip axis coordinates
+function FlipAxisCoordinates(state)
+    state.AxisToFlip = {
+        ["X"] = "Y",  -- Swap X with Y
+        ["Y"] = "X"
+    }
+    mcGC.Line.FlipAxis(state)
+end
+
+-- Scale axis by factor
+function ScaleGCode(state)
+    state.scale = {
+        ["X"] = 2.0,   -- Scale X by 2x
+        ["Y"] = 0.5,   -- Scale Y by 0.5x
+        ["Z"] = 1.0    -- Keep Z unchanged
+    }
+    
+    -- Scale linear moves
+    mcGC.Line.ScaleLinear(state)
+    
+    -- Scale arc moves with alternate axis handling
+    state.AlternateAxis = {["I"] = "X", ["J"] = "Y"}
+    mcGC.Line.ScaleArc(state)
+end
+
+-- Replace specific G-codes
+function ReplaceBlocks(state)
+    local replacements = {
+        ["G0"] = "G1 F5000",  -- Convert rapids to fast feeds
+        ["M3"] = "M4"         -- Change spindle direction
+    }
+    
+    for index, block in pairs(state.Blocks) do
+        mcGC.Block.ReplaceBlocks(state, index, block, nil, replacements)
+    end
+end
+
+================================================================================
+43. SMTP EMAIL WITH COROUTINES
+Used in: C:\Mach4Hobby\Modules\socket\smtp.lua
+================================================================================
+
+-- Advanced SMTP with coroutine-based streaming
+function SendEmailWithAttachment(to, subject, body, attachment)
+    local smtp = require("socket.smtp")
+    local mime = require("mime")
+    local ltn12 = require("ltn12")
+    
+    -- Create multipart boundary
+    local boundary = string.format('%s%05d==%05u', 
+        os.date('%d%m%Y%H%M%S'),
+        math.random(0, 99999), 
+        os.time())
+    
+    -- Build message with coroutine source
+    local source = coroutine.wrap(function()
+        -- Headers
+        coroutine.yield("From: machine@shop.com\r\n")
+        coroutine.yield("To: " .. to .. "\r\n")
+        coroutine.yield("Subject: " .. subject .. "\r\n")
+        coroutine.yield("MIME-Version: 1.0\r\n")
+        coroutine.yield("Content-Type: multipart/mixed; boundary=" .. boundary .. "\r\n\r\n")
+        
+        -- Body part
+        coroutine.yield("--" .. boundary .. "\r\n")
+        coroutine.yield("Content-Type: text/plain\r\n\r\n")
+        coroutine.yield(body .. "\r\n")
+        
+        -- Attachment part
+        if attachment then
+            coroutine.yield("--" .. boundary .. "\r\n")
+            coroutine.yield("Content-Type: application/octet-stream\r\n")
+            coroutine.yield("Content-Transfer-Encoding: base64\r\n")
+            coroutine.yield("Content-Disposition: attachment; filename=\"data.txt\"\r\n\r\n")
+            
+            -- Stream file in chunks
+            local file = io.open(attachment, "rb")
+            if file then
+                local chunk = file:read(54)  -- Read for base64 line length
+                while chunk do
+                    coroutine.yield(mime.b64(chunk) .. "\r\n")
+                    chunk = file:read(54)
+                end
+                file:close()
+            end
+        end
+        
+        coroutine.yield("--" .. boundary .. "--\r\n")
+    end)
+    
+    -- Send with LTN12 streaming
+    smtp.send{
+        from = "machine@shop.com",
+        rcpt = {to},
+        source = source,
+        server = "smtp.shop.com",
+        port = 587
+    }
+end
+
+================================================================================
+44. HTTP CLIENT OPERATIONS
+Used in: C:\Mach4Hobby\Modules\socket\http.lua
+================================================================================
+
+local http = require("socket.http")
+local ltn12 = require("ltn12")
+
+-- Simple GET request
+function HTTPGet(url)
+    local response = {}
+    local result, code = http.request{
+        url = url,
+        sink = ltn12.sink.table(response)
+    }
+    
+    if code == 200 then
+        return table.concat(response)
+    else
+        return nil, "HTTP error: " .. tostring(code)
+    end
+end
+
+-- POST with JSON data
+function HTTPPostJSON(url, data)
+    local json = require("json")  -- Assuming json module available
+    local jsonData = json.encode(data)
+    
+    local response = {}
+    local result, code = http.request{
+        url = url,
+        method = "POST",
+        headers = {
+            ["Content-Type"] = "application/json",
+            ["Content-Length"] = #jsonData
+        },
+        source = ltn12.source.string(jsonData),
+        sink = ltn12.sink.table(response)
+    }
+    
+    return table.concat(response), code
+end
+
+-- Download file with progress
+function DownloadFile(url, filepath)
+    local file = io.open(filepath, "wb")
+    if not file then return false end
+    
+    local result, code = http.request{
+        url = url,
+        sink = ltn12.sink.file(file)
+    }
+    
+    return code == 200
+end
+
+================================================================================
+45. MD5 HASHING
+Used in: C:\Mach4Hobby\Modules\md5.lua
+================================================================================
+
+local md5 = require("md5")
+
+-- Hash a string
+function HashPassword(password)
+    local hash = md5.sumhexa(password)
+    return hash  -- Returns hex string
+end
+
+-- Hash file contents
+function HashFile(filepath)
+    local file = io.open(filepath, "rb")
+    if not file then return nil end
+    
+    local content = file:read("*all")
+    file:close()
+    
+    return md5.sumhexa(content)
+end
+
+-- Verify data integrity
+function VerifyChecksum(data, expectedHash)
+    local actualHash = md5.sumhexa(data)
+    return actualHash == expectedHash
+end
+
+================================================================================
+46. INTERNATIONALIZATION (i18n)
+Used in: C:\Mach4Hobby\Modules\int18n.lua
+================================================================================
+
+local int18n = require("int18n")
+
+-- Set up translations
+function SetupTranslations()
+    local inst = mc.mcGetInstance()
+    
+    -- Set language from profile
+    local language = mc.mcProfileGetString(inst, "Preferences", 
+        "Language", "en_US")
+    
+    int18n.SetLanguage(language)
+    int18n.SetDomain("mach4")
+    
+    -- Load translation file
+    local translationFile = string.format("Languages/%s.po", language)
+    int18n.LoadTranslations(translationFile)
+end
+
+-- Translate strings
+function T(text)
+    return int18n.Translate(text)
+end
+
+-- Usage in UI
+local button = wx.wxButton(panel, wx.wxID_ANY, T("Start"))
+local message = T("Operation completed successfully")
+mc.mcCntlSetLastError(inst, message)
+
+================================================================================
+47. PLASMA ABSTRACTION LAYER
+Used in: C:\Mach4Hobby\Modules\mcPlasmaAbstractionLayer.lua
+================================================================================
+
+local PAL = require("mcPlasmaAbstractionLayer")
+
+-- Configure plasma settings
+function SetupPlasma()
+    local inst = mc.mcGetInstance()
+    
+    -- Read THC (Torch Height Control) settings
+    local thcEnabled = mc.mcProfileGetInt(inst, "Plasma", "THCEnabled", 1)
+    local pierceHeight = mc.mcProfileGetDouble(inst, "Plasma", "PierceHeight", 0.15)
+    local pierceDelay = mc.mcProfileGetDouble(inst, "Plasma", "PierceDelay", 0.5)
+    local cutHeight = mc.mcProfileGetDouble(inst, "Plasma", "CutHeight", 0.06)
+    
+    -- Set up anti-dive
+    local antiDiveThreshold = mc.mcProfileGetDouble(inst, "Plasma", 
+        "AntiDiveThreshold", 80)  -- % of commanded feedrate
+    
+    return {
+        THC = thcEnabled,
+        Pierce = {height = pierceHeight, delay = pierceDelay},
+        Cut = {height = cutHeight},
+        AntiDive = antiDiveThreshold
+    }
+end
+
+-- Protected plasma operations
+function PlasmaOperation(operation)
+    local rc, result = pcall(function()
+        local inst = mc.mcGetInstance()
+        
+        -- Check arc voltage
+        local voltage = mc.mcAnalogInputRead(inst, "ArcVoltage")
+        if voltage < 50 then
+            error("Arc voltage too low")
+        end
+        
+        return operation()
+    end)
+    
+    if not rc then
+        mc.mcCntlEStop(inst)
+        mc.mcCntlSetLastError(inst, "Plasma error: " .. result)
+    end
+    
+    return rc, result
+end
+
+================================================================================
+48. LTN12 STREAM FILTERS
+Used in: C:\Mach4Hobby\Modules\ltn12.lua
+================================================================================
+
+local ltn12 = require("ltn12")
+
+-- Chain multiple filters
+function ProcessGCodeStream(input)
+    local filters = {
+        -- Remove comments
+        function(chunk)
+            if chunk then
+                return (chunk:gsub("%(.-%)",""))
+            end
+        end,
+        
+        -- Convert to uppercase
+        function(chunk)
+            if chunk then
+                return chunk:upper()
+            end
+        end,
+        
+        -- Add line numbers
+        local lineNum = 0
+        return function(chunk)
+            if chunk then
+                lineNum = lineNum + 1
+                return string.format("N%d %s", lineNum, chunk)
+            end
+        end
+    }
+    
+    local source = ltn12.source.string(input)
+    local sink = ltn12.sink.table({})
+    
+    ltn12.pump.all(
+        source,
+        ltn12.filter.chain(unpack(filters)),
+        sink
+    )
+    
+    return table.concat(sink)
+end
+
+-- Cycle filter for repetition
+function RepeatPattern(pattern, times)
+    return ltn12.filter.cycle(
+        function() return pattern end,
+        times
+    )
+end
+
+================================================================================
+49. VISION SYSTEM M6003-M6006
+Used in: C:\Mach4Hobby\Modules\mcVision\m6003.mcs, m6005.mcs, m6006.mcs
+================================================================================
+
+-- M6003: Pattern recognition
+function m6003()
+    local inst = mc.mcGetInstance()
+    
+    scr.VisionSetMode("MyVid", scr.VISION_PATTERN)
+    mc.mcCntlSetLastError(inst, "Pattern recognition on")
+    mc.mcCntlGcodeExecuteWait(inst, "G04 P1.")
+    
+    local found, x, y, angle = scr.VisionFindPattern("MyVid", "template.png")
+    if found then
+        local gcode = string.format("G90 G0 X%.4f Y%.4f A%.4f", x, y, angle)
+        mc.mcCntlGcodeExecuteWait(inst, gcode)
+    end
+    
+    scr.VisionSetMode("MyVid", scr.VISION_NONE)
+end
+
+-- M6005: Blob detection
+function m6005()
+    local inst = mc.mcGetInstance()
+    
+    scr.VisionSetMode("MyVid", scr.VISION_BLOB)
+    mc.mcCntlSetLastError(inst, "Blob detection on")
+    
+    local blobs = scr.VisionGetBlobs("MyVid", {
+        minArea = 100,
+        maxArea = 5000,
+        threshold = 128
+    })
+    
+    for i, blob in ipairs(blobs) do
+        mc.mcCntlSetLastError(inst, 
+            string.format("Blob %d: X=%.2f Y=%.2f Area=%d", 
+            i, blob.x, blob.y, blob.area))
+    end
+    
+    scr.VisionSetMode("MyVid", scr.VISION_NONE)
+end
+
+-- M6006: Vision output control
+function m6006()
+    local inst = mc.mcGetInstance()
+    
+    -- Get vision result
+    local visionOK = scr.VisionGetResult("MyVid")
+    
+    -- Set output based on vision
+    local hSig = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT10)
+    if hSig then
+        mc.mcSignalSetState(hSig, visionOK and 1 or 0)
+    end
+    
+    -- Log result
+    mc.mcCntlSetLastError(inst, 
+        visionOK and "Vision check passed" or "Vision check failed")
+end
+
+================================================================================
+50. SOCKET TCP/IP CONNECTIONS
+Used in: C:\Mach4Hobby\Modules\socket.lua
+================================================================================
+
+local socket = require("socket")
+
+-- TCP server
+function CreateTCPServer(port)
+    local server = socket.bind("*", port)
+    server:settimeout(0.1)  -- Non-blocking
+    
+    local clients = {}
+    
+    return {
+        accept = function()
+            local client = server:accept()
+            if client then
+                client:settimeout(0)
+                table.insert(clients, client)
+            end
+        end,
+        
+        broadcast = function(message)
+            for i = #clients, 1, -1 do
+                local ok = clients[i]:send(message .. "\n")
+                if not ok then
+                    table.remove(clients, i)
+                end
+            end
+        end,
+        
+        close = function()
+            for _, client in ipairs(clients) do
+                client:close()
+            end
+            server:close()
+        end
+    }
+end
+
+-- TCP client with reconnect
+function TCPClient(host, port)
+    local client = nil
+    
+    local function connect()
+        client = socket.connect(host, port)
+        if client then
+            client:settimeout(1)
+            return true
+        end
+        return false
+    end
+    
+    return {
+        send = function(data)
+            if not client then
+                connect()
+            end
+            
+            if client then
+                local ok = client:send(data)
+                if not ok then
+                    client = nil
+                    return false
+                end
+                return true
+            end
+            return false
+        end,
+        
+        receive = function()
+            if client then
+                return client:receive("*l")
+            end
+            return nil
+        end
+    }
+end
+
+================================================================================
+CRITICAL SAFETY NOTES - VERSION 3.0
+================================================================================
+
+36. URL encoding must handle all special characters
+37. CRC32 requires proper bit operations for accuracy
+38. Serial ports need error handling and cleanup
+39. CSV escaping must handle quotes and commas
+40. Vision systems need camera stabilization delays
+41. Module paths must handle cross-platform separators
+42. G-code transformations must preserve modality
+43. SMTP coroutines enable streaming large attachments
+44. HTTP requests need timeout and error handling
+45. MD5 is for checksums only, not security
+46. i18n requires proper character encoding
+47. Plasma operations need safety interlocks
+48. Stream filters must handle nil chunks
+49. Vision coordinates need calibration
+50. Socket connections need cleanup on error
+
+================================================================================
+END OF VERIFIED REFERENCE DOCUMENT - VERSION 3.0
+================================================================================

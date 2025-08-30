@@ -1,0 +1,1358 @@
+local inst = mc.mcGetInstance()
+local rc = 0
+
+-- Get machine enabled state properly
+local machEnabledHandle = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED)
+local machEnabled = 0
+if machEnabledHandle and machEnabledHandle > 0 then
+    machEnabled = mc.mcSignalGetState(machEnabledHandle)
+end
+
+-- Get machine state
+local machState, rc = mc.mcCntlGetState(inst)
+local inCycle = mc.mcCntlIsInCycle(inst)
+
+-- Initialize tracking variables for end of script
+local machStateOld = machState
+local machWasEnabled = machEnabled
+
+-- Get current tool
+local currentTool = mc.mcToolGetCurrent(inst)
+
+local STATE_IDLE = 0        -- Machine idle (CONFIRMED)
+local STATE_FRUN = 100      -- Feed running (CONFIRMED)
+local STATE_FHOLD = 101     -- Feed hold (CONFIRMED)
+local STATE_PHOLD = 102     -- Probe hold during G31 (CONFIRMED)
+local STATE_MRUN = 200      -- MDI/Macro running (CONFIRMED)
+local STATE_MRUN_FH = 201   -- MDI/Macro feed hold (CONFIRMED)
+local STATE_MHOLD = 103     -- Alternate hold state (probable)
+local STATE_HOLD_SYNC = 110 -- Hold sync state (probable)
+local STATE_STOP = 109      -- Stop state (probable)
+
+-- PRODUCTION MODE CONTROL - Set to false for debugging
+_G.PRODUCTION_MODE = false  -- Set to false to enable debug messages
+
+-- Debug print function that respects production mode
+local function debugPrint(message)
+    if not _G.PRODUCTION_MODE then
+        mc.mcCntlSetLastError(inst, message)
+    end
+end
+
+-- Initialize debug tracking on first run (simplified for production)
+if not _G.dustDebug then
+    _G.dustDebug = {
+        cycleCount = 0,
+        lastReportTime = os.clock(),
+        reportInterval = 10.0,  -- Increased interval for production
+        m6CompletionCount = 0,
+        motionCheckCount = 0,
+        bootStateChanges = 0,
+        lastBootState = -1,
+        flag481History = {},
+        maxHistorySize = 10,
+        lastFlag481 = -999,
+        clearAttemptLog = {},
+        motionLog = {},
+        stateTransitionLog = {}
+    }
+    if not _G.PRODUCTION_MODE then
+        mc.mcCntlSetLastError(inst, "DEBUG: Dust boot debug system initialized")
+    end
+end
+
+-- Increment cycle counter
+_G.dustDebug.cycleCount = _G.dustDebug.cycleCount + 1
+
+-- Function to add to history with timestamp (keep for error tracking)
+local function addToHistory(log, entry, maxSize)
+    if not _G.PRODUCTION_MODE then  -- Only track in debug mode
+        maxSize = maxSize or 10
+        table.insert(log, {time = os.clock(), entry = entry})
+        if #log > maxSize then
+            table.remove(log, 1)
+        end
+    end
+end
+
+-- COMMENTED OUT: #481 tracking for production
+-- Track #481 changes only in debug mode
+if not _G.PRODUCTION_MODE then
+    local current481 = mc.mcCntlGetPoundVar(inst, 481)
+    if current481 ~= _G.dustDebug.lastFlag481 then
+        local msg = string.format("Cycle %d: #481 changed %d->%d (state=%d, M6flag=%d)", 
+            _G.dustDebug.cycleCount, 
+            _G.dustDebug.lastFlag481, 
+            current481,
+            mc.mcCntlGetState(inst),
+            mc.mcCntlGetPoundVar(inst, 499))
+        addToHistory(_G.dustDebug.flag481History, msg, 10)
+        mc.mcCntlSetLastError(inst, "DEBUG 481: " .. msg)
+        _G.dustDebug.lastFlag481 = current481
+    end
+end
+
+
+
+
+
+
+-- Increment test counter
+testcount = testcount + 1
+
+-------------------------------------------------------
+--  Set plate align (G68) Led
+-------------------------------------------------------
+local curLedState = math.tointeger(scr.GetProperty("ledPlateAlign", "Value"))
+local curAlignState = math.tointeger((mc.mcCntlGetPoundVar(inst, 4016) - 69))
+curAlignState = math.abs(curAlignState)
+if (curLedState ~= curAlignState) then
+	scr.SetProperty("ledPlateAlign", "Value", tostring(curAlignState))
+end
+
+-------------------------------------------------------
+--  Coroutine resume
+-------------------------------------------------------
+if (wait ~= nil) and (machState == 0) then
+    local state = coroutine.status(wait)
+    if state == "suspended" then
+        coroutine.resume(wait)
+    end
+end
+
+-------------------------------------------------------
+--  Cycle time label update
+-------------------------------------------------------
+if (machEnabled == 1) then
+	local cycletime = mc.mcCntlGetRunTime(inst)
+	scr.SetProperty("CycleTime", "Label", SecondsToTime(cycletime))
+end
+
+-------------------------------------------------------
+--  Set Height Offset Led and Monitor H Sync
+-------------------------------------------------------
+local HOState = mc.mcCntlGetPoundVar(inst, 4008)
+local activeH = mc.mcCntlGetPoundVar(inst, 4120)
+
+-- Update LED
+if (HOState == 49) then
+    scr.SetProperty("ledHOffset", "Value", "0")
+else
+    scr.SetProperty("ledHOffset", "Value", "1")
+end
+
+-------------------------------------------------------
+--  Set Spindle Ratio DRO
+-------------------------------------------------------
+local spinmotormax, rangemax, ratio
+spinmotormax, rc = scr.GetProperty('droSpinMotorMax', 'Value')
+spinmotormax = tonumber(spinmotormax) or 1   
+rangemax, rc = scr.GetProperty('droRangeMax', 'Value')
+rangemax = tonumber(rangemax) or 1
+ratio = (rangemax / spinmotormax)    
+scr.SetProperty('droRatio', 'Value', tostring(ratio))
+
+-------------------------------------------------------
+--  Set Feedback Ratio DRO Updated 5-30-16
+-------------------------------------------------------
+local range, rc = mc.mcSpindleGetCurrentRange(inst)
+local fbratio, rc = mc.mcSpindleGetFeedbackRatio(inst, range)
+scr.SetProperty('droFeedbackRatio', 'Value', tostring(fbratio))
+
+-------------------------------------------------------
+--  PLC First Run
+-------------------------------------------------------
+if (testcount == 1) then
+    local iReg = mc.mcIoGetHandle (inst, "Keyboard/Enable")
+    mc.mcIoSetState(iReg, 1)
+    KeyboardInputsToggle()
+    DecToFrac(0)
+    DecToFrac(1)
+    DecToFrac(2)
+	
+    DROTable = {
+	[1034] = "droEdgeFinder",
+    [1035] = "droGageBlock",
+    [1036] = "droGageBlockT"
+    }
+
+    for name,number in pairs (DROTable) do
+        local droName = (DROTable[name])
+        local val = mc.mcProfileGetString(inst, "PersistentDROs", (droName), "NotFound")
+        if(val ~= "NotFound")then
+            scr.SetProperty((droName), "Value", val)
+        end
+    end
+end
+
+-- Initialize persistent globals on first run
+if not _G.toolPLCInit then
+    _G.toolPLCInit = true
+    _G.lastTool = -999
+	_G.lastSyncedTool = -999
+    _G.lastPollTime = os.clock()
+    _G.debounceStart = nil
+    _G.debouncing = false
+    _G.enablePromptDone = false
+    _G.toolPresentHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)
+    
+    if not _G.toolPresentHandle or _G.toolPresentHandle <= 0 then
+        mc.mcCntlSetLastError(inst, "ERROR: Invalid handle for Input #17 (Tool Present)")
+        _G.toolPresentHandle = nil
+    end
+    
+    mc.mcToolSetCurrent(inst, 0)
+end
+
+-- Function to prompt tool selection
+local function promptToolSelection(isStartup)
+    local virtualToolActive = mc.mcCntlGetPoundVar(inst, 406) >= 90
+    local suppressPrompt = mc.mcCntlGetPoundVar(inst, 498) == 1
+	
+	 if not _G.toolChoices or not _G.toolNumbers then
+        mc.mcCntlSetLastError(inst, "ERROR: Tool configuration not loaded")
+        mc.mcToolSetCurrent(inst, 0)
+        return
+    end
+
+    if virtualToolActive or suppressPrompt then
+        return
+    end
+    
+    local filteredChoices = {}
+    local filteredNumbers = {}
+    
+    if _G.toolChoices and _G.toolNumbers then
+        for i, toolNum in ipairs(_G.toolNumbers) do
+            if toolNum > 0 and toolNum < 90 then
+                table.insert(filteredChoices, _G.toolChoices[i])
+                table.insert(filteredNumbers, toolNum)
+            end
+        end
+    end
+    
+    if #filteredChoices == 0 then
+        mc.mcCntlSetLastError(inst, "ERROR: No physical tools configured")
+        mc.mcToolSetCurrent(inst, 1)
+        mc.mcCntlGcodeExecuteWait(inst, "G49")
+        wx.wxMilliSleep(100)
+        mc.mcCntlGcodeExecuteWait(inst, "G43 H1")
+        return
+    end
+    
+    local message = isStartup and 
+        "Tool detected in spindle at startup.\nSelect the actual tool:" or
+        "Tool inserted manually.\nSelect the tool number:"
+    
+    local dlg = wx.wxSingleChoiceDialog(wx.NULL, 
+        message, 
+        isStartup and "Tool Mismatch Detected" or "Tool Confirmation", 
+        filteredChoices)
+    
+    local timerPanel = wx.wxPanel(dlg, wx.wxID_ANY)
+    local timer = wx.wxTimer(timerPanel)
+    local spindleCancelled = false
+    
+    local input8Handle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT8)
+    local out2Handle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT2)
+    
+    local lastInput8 = 0
+    if input8Handle and input8Handle > 0 then
+        lastInput8 = mc.mcSignalGetState(input8Handle)
+    end
+    
+    local buttonPressStart = 0
+    local buttonHoldRequired = 0.5
+    local buttonHeld = false
+    
+    timerPanel:Connect(wx.wxEVT_TIMER, function(event)
+        if not input8Handle or input8Handle <= 0 then
+            return
+        end
+        
+        local currentInput8 = mc.mcSignalGetState(input8Handle)
+        
+        if out2Handle and out2Handle > 0 then
+            mc.mcSignalSetState(out2Handle, currentInput8)
+        end
+        
+        if currentInput8 == 1 and lastInput8 == 0 then
+            buttonPressStart = os.clock()
+            buttonHeld = false
+        elseif currentInput8 == 1 and lastInput8 == 1 then
+            if not buttonHeld and (os.clock() - buttonPressStart) >= buttonHoldRequired then
+                buttonHeld = true
+                spindleCancelled = true
+                
+                dlg:EndModal(wx.wxID_CANCEL)
+                timer:Stop()
+            end
+        elseif currentInput8 == 0 and lastInput8 == 1 then
+            buttonPressStart = 0
+            buttonHeld = false
+        end
+        
+        lastInput8 = currentInput8
+    end)
+    
+    timer:Start(50)
+    
+    local result = dlg:ShowModal()
+    
+    timer:Stop()
+    
+    if spindleCancelled then
+        mc.mcToolSetCurrent(inst, 0)
+        mc.mcCntlGcodeExecuteWait(inst, "G49")
+        
+        if UpdateToolPreview then
+            UpdateToolPreview()
+        end
+        
+        mc.mcCntlSetLastError(inst, "Tool removed - T0 set")
+        
+    elseif result == wx.wxID_OK then
+        local selection = dlg:GetSelection()
+        local newTool = filteredNumbers[selection + 1]
+        
+        _G.lastTool = -999
+        
+        mc.mcToolSetCurrent(inst, newTool)
+        wx.wxMilliSleep(50)
+        
+        mc.mcCntlGcodeExecuteWait(inst, "G49")
+        wx.wxMilliSleep(100)
+        
+        if newTool > 0 then
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G43 H%d", newTool))
+            wx.wxMilliSleep(100)
+            
+            _G.hOffsetLastSync = os.clock()
+            
+            local activeH = mc.mcCntlGetPoundVar(inst, 4120)
+            local desc = mc.mcToolGetDesc(inst, newTool) or "Unnamed"
+        else
+            _G.hOffsetLastSync = os.clock()
+        end
+        
+        if UpdateToolPreview then
+            UpdateToolPreview()
+        end
+    else
+        if isStartup then
+            mc.mcToolSetCurrent(inst, 1)
+            
+            mc.mcCntlGcodeExecuteWait(inst, "G49")
+            wx.wxMilliSleep(100)
+            mc.mcCntlGcodeExecuteWait(inst, "G43 H1")
+            
+            _G.hOffsetLastSync = os.clock()
+            
+            wx.wxMessageBox("Tool selection cancelled.\n\nTool has been set to T1 by default.\nPlease verify the correct tool number.", 
+                           "Tool Set to T1", wx.wxOK + wx.wxICON_WARNING)
+        else
+            wx.wxMessageBox("Tool change cancelled. Tool not updated.", "Info", wx.wxOK + wx.wxICON_INFORMATION)
+        end
+        
+        if UpdateToolPreview then
+            UpdateToolPreview()
+        end
+    end
+    
+    dlg:Destroy()
+end
+
+-- Check for enable condition
+if machEnabled == 1 and not _G.enablePromptDone and _G.toolPresentHandle then
+    local toolPresent = mc.mcSignalGetState(_G.toolPresentHandle)
+    
+    local m6Running = mc.mcCntlGetPoundVar(inst, 499) == 1
+    local suppressPrompt = mc.mcCntlGetPoundVar(inst, 498) == 1
+    
+    if toolPresent == 1 and currentTool == 0 and not suppressPrompt and currentTool < 90 then
+        promptToolSelection(true)
+    end
+    _G.enablePromptDone = true
+elseif machEnabled == 0 then
+    _G.enablePromptDone = false
+end
+
+-- Monitor current tool and sync dropdown
+currentTool = mc.mcToolGetCurrent(inst)
+if currentTool ~= _G.lastTool then
+    local toolChangeTime = os.clock()
+    _G.lastTool = currentTool
+	
+    local machState = mc.mcCntlGetState(inst)
+    local m6Running = mc.mcCntlGetPoundVar(inst, 499) == 1
+    
+    local timeSinceLastSync = toolChangeTime - (_G.hOffsetLastSync or 0)
+    
+    if machState == 0 and timeSinceLastSync > 1.0 then
+        local currentH = mc.mcCntlGetPoundVar(inst, 4120)
+        local compMode = mc.mcCntlGetPoundVar(inst, 4008)
+        
+        local needsSync = false
+        if currentTool == 0 and compMode == 43 then
+            needsSync = true
+        elseif currentTool > 0 and (compMode == 49 or currentH ~= currentTool) then
+            needsSync = true
+        end
+        
+        if needsSync then
+            mc.mcCntlGcodeExecuteWait(inst, "G49")
+            if currentTool > 0 then
+                mc.mcCntlGcodeExecuteWait(inst, string.format("G43 H%d", currentTool))
+            end
+            _G.hOffsetLastSync = os.clock()
+        end
+    end
+    
+    if not _G.selectedToolIndex then
+        local index = -1
+        if _G.toolNumbers then
+            for i, t in ipairs(_G.toolNumbers) do
+                if t == currentTool then
+                    index = i - 1
+                    break
+                end
+            end
+        end
+        
+        if index >= 0 then
+            scr.SetProperty("lstCurrentTool", "Value", tostring(index))
+        else
+            scr.SetProperty("lstCurrentTool", "Value", "0")
+        end
+        
+        if UpdateToolPreview then
+            UpdateToolPreview()
+        end
+    end
+end
+
+-- DUST/VACUUM/BOOT AUTOMATION
+
+-- Initialize on first run
+if not _G.dustAutoInit then
+    _G.dustAutoInit = true
+    _G.lastMachineState = mc.mcCntlGetState(inst)
+    _G.waitingForMotionAfterToolChange = false
+    _G.motionHasStarted = false
+    
+    if mc.mcCntlGetPoundVar(inst, 400) < -1e300 then
+        mc.mcCntlSetPoundVar(inst, 400, 0)
+    end
+    if mc.mcCntlGetPoundVar(inst, 401) < -1e300 then
+        mc.mcCntlSetPoundVar(inst, 401, 0)
+    end
+    if mc.mcCntlGetPoundVar(inst, 402) < -1e300 then
+        mc.mcCntlSetPoundVar(inst, 402, 0)
+    end
+    if mc.mcCntlGetPoundVar(inst, 481) < -1e300 then
+        mc.mcCntlSetPoundVar(inst, 481, 0)
+    end
+    if mc.mcCntlGetPoundVar(inst, 499) < -1e300 then
+        mc.mcCntlSetPoundVar(inst, 499, 0)
+    end
+    if mc.mcCntlGetPoundVar(inst, 496) < -1e300 then
+        mc.mcCntlSetPoundVar(inst, 496, 0)
+    end
+end
+
+local currentState = mc.mcCntlGetState(inst)
+local inCycle = mc.mcCntlIsInCycle(inst)
+
+local m6Flag = mc.mcCntlGetPoundVar(inst, 499)
+local m6Completed = mc.mcCntlGetPoundVar(inst, 481)
+
+
+
+-- CHECK FOR M6 COMPLETION
+if m6Completed == 1 then
+    -- CRITICAL: Clear flag immediately
+    mc.mcCntlSetPoundVar(inst, 481, 0)
+    
+    -- Only process if we haven't just processed this
+    if not _G.lastM6ProcessedTime or (os.clock() - _G.lastM6ProcessedTime) > 0.5 then
+        _G.lastM6ProcessedTime = os.clock()
+        
+        local currentTool = mc.mcToolGetCurrent(inst)
+        
+        -- Log completion ONCE
+        if not _G.PRODUCTION_MODE then
+            mc.mcCntlSetLastError(inst, string.format("M6 Complete: T%d, automation=#402=%d", 
+                currentTool, mc.mcCntlGetPoundVar(inst, 402)))
+        end
+        
+        -- Only setup dust boot if spindle pause not active
+        if not (_G.spinUpDwell and _G.spinUpDwell.pauseActive) then
+            if mc.mcCntlGetPoundVar(inst, 402) == 1 then -- Dust boot automation enabled
+                if currentTool > 0 and currentTool < 90 then
+                    -- Physical tool - arm dust boot to lower on motion
+                    _G.waitingForMotionAfterToolChange = true
+                    _G.motionHasStarted = false
+                    _G.motionCheckStartTime = os.clock()
+                    _G.motionCheckCycles = 0
+                    mc.mcCntlSetLastError(inst, string.format("T%d ready - boot will lower on first cut", currentTool))
+                    
+                elseif currentTool >= 90 and currentTool <= 99 then
+                    -- Virtual tool - raise boot
+                    local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+                    if hBoot and hBoot > 0 then
+                        mc.mcSignalSetState(hBoot, 0)
+                        if not _G.PRODUCTION_MODE then
+                            mc.mcCntlSetLastError(inst, string.format("Virtual T%d - boot raised", currentTool))
+                        end
+                    end
+                    _G.waitingForMotionAfterToolChange = false
+                    _G.motionHasStarted = false
+                    
+                elseif currentTool == 0 then
+                    -- T0 - no automation
+                    _G.waitingForMotionAfterToolChange = false
+                    _G.motionHasStarted = false
+                    if not _G.PRODUCTION_MODE then
+                        mc.mcCntlSetLastError(inst, "T0 - no boot automation")
+                    end
+                end
+            else
+                if not _G.PRODUCTION_MODE then
+                    mc.mcCntlSetLastError(inst, "Boot automation disabled (#402=0)")
+                end
+            end
+        end
+    end
+end
+
+
+-- Check if we should skip dust boot shutdown
+local skipDustShutdown = 0
+
+-- Skip if M6 is running
+if mc.mcCntlGetPoundVar(inst, 499) == 1 then
+    skipDustShutdown = 1
+end
+
+-- Skip if ANY virtual tool is active (T90-T99)
+local virtualTool = mc.mcCntlGetPoundVar(inst, 406) or 0
+if virtualTool >= 90 and virtualTool <= 99 then
+    skipDustShutdown = 1
+end
+
+-- PROGRAM START/STOP HANDLERS
+if currentState ~= _G.lastMachineState then
+    -- Log only in debug mode
+    if not _G.PRODUCTION_MODE then
+        local transitionMsg = string.format("State change: %d->%d", 
+            _G.lastMachineState or -1, currentState)
+        addToHistory(_G.dustDebug.stateTransitionLog, transitionMsg, 20)
+    end
+    
+    -- PROGRAM START: Idle -> Feed Run
+    if _G.lastMachineState == STATE_IDLE and currentState == STATE_FRUN then
+        -- Start dust collection if enabled
+        if mc.mcCntlGetPoundVar(inst, 400) == 1 then
+            local hDust = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT4)
+            if hDust and hDust > 0 then
+                mc.mcSignalSetState(hDust, 1)
+                mc.mcCntlSetLastError(inst, "Dust collection ON")
+            end
+        end
+        
+        -- Setup dust boot automation
+        _G.waitingForMotionAfterToolChange = false
+        _G.motionHasStarted = false
+        _G.motionCheckCycles = 0
+        
+        local currentTool = mc.mcToolGetCurrent(inst)
+        local bootAutomation = mc.mcCntlGetPoundVar(inst, 402)
+        
+        if currentTool > 0 and currentTool < 90 and bootAutomation == 1 then
+            _G.waitingForMotionAfterToolChange = true
+            _G.motionHasStarted = false
+            _G.motionCheckStartTime = os.clock()
+            _G.motionCheckCycles = 0
+            mc.mcCntlSetLastError(inst, string.format("T%d active - boot will lower on first cut", currentTool))
+        end
+        
+    -- PROGRAM END: Feed Run -> Idle
+    elseif _G.lastMachineState == STATE_FRUN and currentState == STATE_IDLE then
+        if skipDustShutdown == 1 then
+            local skipReason = ""
+            if mc.mcCntlGetPoundVar(inst, 499) == 1 then
+                skipReason = "M6 active"
+            elseif virtualTool >= 90 then
+                skipReason = string.format("Virtual tool T%d active", virtualTool)
+            end
+            if not _G.PRODUCTION_MODE then
+                mc.mcCntlSetLastError(inst, string.format("Skipping auto-stop (%s)", skipReason))
+            end
+        else
+            -- SHUTDOWN LOGIC
+            local hDust = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT4)
+            local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+            
+            if hDust and hDust > 0 then
+                mc.mcSignalSetState(hDust, 0)
+            end
+            
+            if hBoot and hBoot > 0 then
+                mc.mcSignalSetState(hBoot, 0)
+            end
+            
+            mc.mcCntlSetLastError(inst, "Program end - Dust OFF, Boot UP")
+            
+            if mc.mcCntlGetPoundVar(inst, 401) == 1 then
+                local hVac1 = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT5)
+                local hVac2 = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT6)
+                
+                if hVac1 and hVac1 > 0 then
+                    mc.mcSignalSetState(hVac1, 0)
+                end
+                if hVac2 and hVac2 > 0 then
+                    mc.mcSignalSetState(hVac2, 0)
+                end
+            end
+            
+            -- Reset all flags on program end
+            _G.waitingForMotionAfterToolChange = false
+            _G.motionHasStarted = false
+            _G.motionCheckCycles = 0
+        end
+    end
+    
+    _G.lastMachineState = currentState
+end  -- THIS IS THE ONLY 'end' THAT SHOULD BE HERE
+
+-- BOOT LOWERING ON MOTION
+local skipForSpindleDwell = false
+if _G.spinUpDwell ~= nil and type(_G.spinUpDwell) == "table" then
+    if _G.spinUpDwell.armed == true or _G.spinUpDwell.pauseActive == true then
+        skipForSpindleDwell = true
+    end
+end
+
+-- Track motion check cycles
+if _G.waitingForMotionAfterToolChange then
+    _G.motionCheckCycles = (_G.motionCheckCycles or 0) + 1
+end
+
+if not skipForSpindleDwell and inCycle == 1 and mc.mcCntlGetPoundVar(inst, 402) == 1 and not (mc.mcCntlGetPoundVar(inst, 499) == 1) then
+    
+    local currentTool = mc.mcToolGetCurrent(inst)
+    local hBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+    
+    if hBoot and hBoot > 0 then
+        local bootIsDown = mc.mcSignalGetState(hBoot)
+        
+        -- Track boot state changes (only in debug mode)
+        if not _G.PRODUCTION_MODE and bootIsDown ~= _G.dustDebug.lastBootState then
+            _G.dustDebug.bootStateChanges = _G.dustDebug.bootStateChanges + 1
+            mc.mcCntlSetLastError(inst, string.format("Boot state changed %d->%d", 
+                _G.dustDebug.lastBootState, bootIsDown))
+            _G.dustDebug.lastBootState = bootIsDown
+        end
+        
+        if _G.waitingForMotionAfterToolChange then
+            -- Check for timeout (30 seconds)
+            if _G.motionCheckStartTime and (os.clock() - _G.motionCheckStartTime) > 30 then
+                mc.mcCntlSetLastError(inst, "Motion wait timeout - resetting")
+                _G.waitingForMotionAfterToolChange = false
+                _G.motionHasStarted = false
+                _G.motionCheckCycles = 0
+            else
+                -- Motion detection
+                local motionMode = mc.mcCntlGetPoundVar(inst, 4000)
+                local xVel = mc.mcAxisGetVel(inst, 0)
+                local yVel = mc.mcAxisGetVel(inst, 1)
+                local zVel = mc.mcAxisGetVel(inst, 2)
+                local currentFeed = mc.mcCntlGetPoundVar(inst, mc.SV_FEEDRATE)
+                
+                -- Motion detection with multiple methods
+                local threshold = 0.5
+                local motionDetected = false
+                local detectionMethod = ""
+                
+                if math.abs(xVel) > threshold or math.abs(yVel) > threshold or math.abs(zVel) > threshold then
+                    motionDetected = true
+                    detectionMethod = "Velocity"
+                elseif motionMode >= 1 and motionMode <= 3 and currentFeed and currentFeed > 0 then
+                    motionDetected = true  
+                    detectionMethod = "FeedMode"
+                elseif motionMode >= 1 and motionMode <= 3 then
+                    -- Check position delta
+                    if not _G.lastAxisPositions then
+                        _G.lastAxisPositions = {
+                            x = mc.mcAxisGetMachinePos(inst, 0),
+                            y = mc.mcAxisGetMachinePos(inst, 1),
+                            z = mc.mcAxisGetMachinePos(inst, 2)
+                        }
+                    else
+                        local xPos = mc.mcAxisGetMachinePos(inst, 0)
+                        local yPos = mc.mcAxisGetMachinePos(inst, 1)
+                        local zPos = mc.mcAxisGetMachinePos(inst, 2)
+                        
+                        local xDelta = math.abs(xPos - _G.lastAxisPositions.x)
+                        local yDelta = math.abs(yPos - _G.lastAxisPositions.y)
+                        local zDelta = math.abs(zPos - _G.lastAxisPositions.z)
+                        
+                        if xDelta > 0.001 or yDelta > 0.001 or zDelta > 0.001 then
+                            motionDetected = true
+                            detectionMethod = "Position"
+                        end
+                        
+                        _G.lastAxisPositions = {x = xPos, y = yPos, z = zPos}
+                    end
+                end
+                
+                if motionDetected then
+                    _G.motionHasStarted = true
+                    if not _G.PRODUCTION_MODE then
+                        addToHistory(_G.dustDebug.motionLog, detectionMethod, 10)
+                    end
+                end
+                
+                -- Lower the boot if motion has started and boot is up
+                if _G.motionHasStarted and bootIsDown == 0 then
+                    if currentTool > 0 and currentTool < 90 then
+                        mc.mcSignalSetState(hBoot, 1)
+                        mc.mcCntlSetLastError(inst, string.format("Dust boot lowered for T%d", currentTool))
+                        _G.waitingForMotionAfterToolChange = false
+                        _G.motionHasStarted = false
+                        _G.motionCheckCycles = 0
+                        _G.lastAxisPositions = nil
+                    end
+                elseif _G.motionHasStarted and bootIsDown == 1 then
+                    _G.waitingForMotionAfterToolChange = false
+                    _G.motionHasStarted = false
+                    _G.motionCheckCycles = 0
+                end
+            end
+        end
+        
+        -- Safety: raise boot for virtual tools
+        if currentTool >= 90 and currentTool <= 99 and bootIsDown == 1 then
+            mc.mcSignalSetState(hBoot, 0)
+            if not _G.PRODUCTION_MODE then
+                mc.mcCntlSetLastError(inst, string.format("Boot raised for virtual tool T%d", currentTool))
+            end
+        end
+    end
+end
+
+
+
+-- ===== HOMING INDICATOR AND WARNING RESET =====
+do
+    local inst = mc.mcGetInstance()
+    
+    if _G.lastHomingFlashState == nil then
+        _G.lastHomingFlashState = nil
+        _G.lastHomedState = nil
+        _G.AXES_HOMED = false
+    end
+    
+    local allHomed = true
+    local unhomedAxes = {}
+    
+    for axis = 0, 5 do
+        local enabledOk, enabled = pcall(mc.mcAxisIsEnabled, inst, axis)
+        local homedOk, homed = pcall(mc.mcAxisIsHomed, inst, axis)
+        
+        if enabledOk and homedOk then
+            if enabled == 1 and homed ~= 1 then
+                allHomed = false
+                table.insert(unhomedAxes, axis)
+            end
+        end
+    end
+    
+    local flashOn = (math.floor(testcount / 6) % 2) == 0
+    
+    if not allHomed then
+        if _G.lastHomingFlashState ~= flashOn or _G.lastHomedState ~= allHomed then
+            local color = flashOn and "#FFFF00" or "#4B4B4B"
+            
+            pcall(scr.SetProperty, "btnRefAllAxes", "Bg Color", color)
+            pcall(scr.SetProperty, "btnRefAllAxes", "Fg Color", "#000000")
+            pcall(scr.SetProperty, "btnRefAllAxes", "Label", "HOME\nREQUIRED")
+            
+            _G.lastHomingFlashState = flashOn
+        end
+    else
+        if _G.lastHomedState == false or _G.lastHomedState == nil then
+            pcall(scr.SetProperty, "btnRefAllAxes", "Bg Color", "#4B4B4B")
+            pcall(scr.SetProperty, "btnRefAllAxes", "Fg Color", "#FFFFFF")
+            pcall(scr.SetProperty, "btnRefAllAxes", "Label", "Ref All\nAxis")
+        end
+        
+        if _G.HOMING_WARNING_IGNORED then
+            _G.HOMING_WARNING_IGNORED = false
+        end
+    end
+    
+    _G.lastHomedState = allHomed
+    _G.AXES_HOMED = allHomed
+end
+
+-- Work Offset Monitoring Section
+if not _G.lastWorkOffset then
+    _G.lastWorkOffset = -1
+end
+
+if not _G.tabMonitor then
+    _G.tabMonitor = {
+        lastTab = -1,
+        checkCounter = 0,
+        checkInterval = 5,
+        needsRefresh = false
+    }
+end
+
+local currentOffset = mc.mcCntlGetPoundVar(inst, mc.SV_MOD_GROUP_14 or 5220)
+
+if currentOffset ~= _G.lastWorkOffset then
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+    
+    if _G.lastWorkOffset ~= -1 then
+        if currentOffset >= 54 and currentOffset <= 59 then
+            mc.mcCntlSetLastError(inst, string.format("Work Offset: G%.0f", currentOffset))
+        elseif math.abs(currentOffset - 54.1) < 0.01 then
+            local pNumber = mc.mcCntlGetPoundVar(inst, mc.SV_BUFP or 5219)
+            mc.mcCntlSetLastError(inst, string.format("WARNING: G54.1 P%d active - not shown in UI", pNumber))
+        else
+            mc.mcCntlSetLastError(inst, string.format("WARNING: Unknown work offset %.1f", currentOffset))
+        end
+    end
+    
+    _G.lastWorkOffset = currentOffset
+end
+
+_G.tabMonitor.checkCounter = _G.tabMonitor.checkCounter + 1
+if _G.tabMonitor.checkCounter >= _G.tabMonitor.checkInterval then
+    _G.tabMonitor.checkCounter = 0
+    
+    local ok, tabStr = pcall(scr.GetProperty, "MainTabs", "Current Tab")
+    if ok and tabStr then
+        local currentTab = tonumber(tabStr) or -1
+        
+        if currentTab ~= _G.tabMonitor.lastTab and currentTab >= 0 then
+            _G.tabMonitor.needsRefresh = true
+            _G.tabMonitor.lastTab = currentTab
+        end
+    end
+end
+
+if _G.tabMonitor.needsRefresh then
+    _G.tabMonitor.needsRefresh = false
+    
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+    
+    if SyncSoftLimitsButton then
+        SyncSoftLimitsButton()
+    end
+    
+    if SyncDustButtons then
+        SyncDustButtons()
+    end
+end
+
+-- SOFT LIMITS STATE MONITORING
+if not _G.softLimitsInit then
+    _G.softLimitsInit = true
+    _G.lastSoftLimitsState = nil
+end
+
+local function getActualSoftLimitsEnabled()
+    for axis = 0, 5 do
+        if mc.mcAxisIsEnabled(inst, axis) == 1 then
+            local state = mc.mcSoftLimitGetState(inst, axis)
+            if state and state == 1 then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+local softLimitsEnabled = getActualSoftLimitsEnabled()
+
+if softLimitsEnabled ~= _G.lastSoftLimitsState then
+    if softLimitsEnabled == 1 then
+        scr.SetProperty("btnSoftLimits", "Bg Color", "#00FF00")
+        scr.SetProperty("btnSoftLimits", "Label", "Soft Limits\nENABLED")
+        
+        if _G.lastSoftLimitsState ~= nil then
+            mc.mcCntlSetLastError(inst, "Soft limits ENABLED")
+        end
+    else
+        scr.SetProperty("btnSoftLimits", "Bg Color", "#FF0000")
+        scr.SetProperty("btnSoftLimits", "Label", "Soft Limits\nDISABLED")
+        
+        if _G.lastSoftLimitsState ~= nil then
+            mc.mcCntlSetLastError(inst, "WARNING: Soft limits DISABLED")
+        end
+    end
+    
+    _G.lastSoftLimitsState = softLimitsEnabled
+end
+
+-- TOUCH PROBE BUTTON STATE MONITORING
+if not _G.lastProbeOutputState then 
+    _G.lastProbeOutputState = -1 
+end
+
+local output7Handle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7)
+if output7Handle and output7Handle > 0 then
+    local probeActive = mc.mcSignalGetState(output7Handle)
+    
+    if probeActive ~= _G.lastProbeOutputState then
+        if probeActive == 1 then
+            scr.SetProperty("btnTouchProbe", "Bg Color", "#00FF00")
+            scr.SetProperty("btnTouchProbe", "Label", "Deactivate Probe\nChange to T0")
+        else
+            scr.SetProperty("btnTouchProbe", "Bg Color", "#FF0000")
+            scr.SetProperty("btnTouchProbe", "Label", "Activate Probe\nChange to T90")
+        end
+        _G.lastProbeOutputState = probeActive
+    end
+end
+
+-- LASER BUTTON STATE MONITORING
+if not _G.lastLaserOutputState then 
+    _G.lastLaserOutputState = -1 
+end
+
+local output1Handle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT1)
+if output1Handle and output1Handle > 0 then
+    local laserActive = mc.mcSignalGetState(output1Handle)
+    
+    if laserActive ~= _G.lastLaserOutputState then
+        if laserActive == 1 then
+            scr.SetProperty("btnLaserDown", "Bg Color", "#00FF00")
+            scr.SetProperty("btnLaserDown", "Label", "Deactivate Laser\nChange to T0")
+        else
+            scr.SetProperty("btnLaserDown", "Bg Color", "#FF0000")
+            scr.SetProperty("btnLaserDown", "Label", "Activate Laser\nChange to T91")
+        end
+        _G.lastLaserOutputState = laserActive
+    end
+end
+
+-- Input 8 to Output 2 Mirroring and Tool Detection
+if not _G.lastInput8State then 
+    _G.lastInput8State = -1 
+    _G.toolCheckPending = false
+    _G.toolCheckTime = 0
+    _G.toolCheckStartTime = nil
+    _G.lastToolSensorState = -1
+end
+
+local input8Handle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT8)
+if input8Handle and input8Handle > 0 then
+    local input8State = mc.mcSignalGetState(input8Handle)
+    
+    if input8State ~= _G.lastInput8State then
+        local out2Handle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT2)
+        if out2Handle and out2Handle > 0 then
+            mc.mcSignalSetState(out2Handle, input8State)
+        end
+        
+        if input8State == 0 and _G.lastInput8State == 1 then
+            _G.toolCheckPending = true
+            _G.toolCheckTime = os.clock() + 1.0
+        end
+        
+        _G.lastInput8State = input8State
+    end
+end
+
+-- Handle pending tool check after delay
+if _G.toolCheckPending and os.clock() >= _G.toolCheckTime then
+    
+    if not _G.toolCheckStartTime then
+        _G.toolCheckStartTime = os.clock()
+    end
+    
+    if os.clock() - _G.toolCheckStartTime > 30 then
+        mc.mcCntlSetLastError(inst, "Tool check cancelled - machine stayed busy for 30 seconds")
+        _G.toolCheckPending = false
+        _G.toolCheckStartTime = nil
+        _G.lastToolSensorState = mc.mcSignalGetState(mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17))
+        return
+    end
+    
+    local machState = mc.mcCntlGetState(inst)
+    local inCycle = mc.mcCntlIsInCycle(inst)
+    
+    local inMacro = (machState == mc.MC_STATE_MRUN_MACRO) or 
+                    (machState == mc.MC_STATE_MRUN_MACRO_HOLD) or
+                    (machState == mc.MC_STATE_MRUN_MACROH)
+    
+    if machState ~= 0 or inCycle == 1 then
+        _G.toolCheckPending = true
+        _G.toolCheckTime = os.clock() + 1.0
+        return
+    end
+    
+    _G.toolCheckPending = false
+    _G.toolCheckStartTime = nil
+    
+    local toolPresentHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)
+    if not toolPresentHandle or toolPresentHandle <= 0 then
+        return
+    end
+    
+    local toolPresent = mc.mcSignalGetState(toolPresentHandle)
+    local currentTool = mc.mcToolGetCurrent(inst)
+    
+    if toolPresent == 1 and (_G.lastToolSensorState == 0 or _G.lastToolSensorState == -1) then
+        
+        local virtualToolActive = mc.mcCntlGetPoundVar(inst, 406) >= 90
+        
+        if virtualToolActive then
+            if RetractVirtualTool then
+                RetractVirtualTool()
+                mc.mcCntlSetLastError(inst, "Virtual tool retracted for manual change")
+            else
+                mc.mcCntlSetLastError(inst, "ERROR: RetractVirtualTool function not found!")
+            end
+            currentTool = mc.mcToolGetCurrent(inst)
+        end
+        
+        promptToolSelection(false)
+    end
+    
+    _G.lastToolSensorState = toolPresent
+end
+
+-- LOW AIR PRESSURE MONITORING
+if not _G.lowAirInit then
+    _G.lowAirInit = true
+    _G.lastLowAirState = -1
+    _G.lowAirDisabled = false
+    _G.lowAirDialogShown = false
+    _G.lowAirDebounceCount = 0
+    _G.restoredDialogShown = false
+end
+
+local lowAirHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT6)
+
+if lowAirHandle and lowAirHandle > 0 then
+    local rawAirState = mc.mcSignalGetState(lowAirHandle)
+    
+    if rawAirState ~= _G.lastLowAirState then
+        _G.lowAirDebounceCount = _G.lowAirDebounceCount + 1
+        
+        if _G.lowAirDebounceCount < 3 then
+            return
+        end
+        
+        _G.lowAirDebounceCount = 0
+        
+        if rawAirState == 1 then
+            if not _G.lowAirDisabled then
+                local machState = mc.mcCntlGetState(inst)
+                local inCycle = mc.mcCntlIsInCycle(inst)
+                
+                if inCycle == 1 then
+                    mc.mcCntlFeedHold(inst)
+                    
+                    local waitCount = 0
+                    while mc.mcCntlIsInCycle(inst) == 1 and waitCount < 5 do
+                        waitCount = waitCount + 1
+                    end
+                    
+                    mc.mcCntlCycleStop(inst)
+                end
+                
+                local spindleOn = mc.mcSpindleGetCommandRPM(inst) > 0
+                if spindleOn then
+                    mc.mcSpindleSetDirection(inst, 0)
+                end
+                
+                mc.mcCntlEnable(inst, 0)
+                _G.lowAirDisabled = true
+                _G.restoredDialogShown = false
+                
+                mc.mcCntlSetLastError(inst, "*** MACHINE DISABLED: LOW AIR PRESSURE DETECTED ***")
+                
+                if not _G.lowAirDialogShown then
+                    _G.lowAirDialogShown = true
+                    
+                    coroutine.create(function()
+                        wx.wxMessageBox(
+                            "LOW AIR PRESSURE DETECTED!\n\n" ..
+                            "Machine has been disabled for safety.\n" ..
+                            "1. Check air compressor\n" ..
+                            "2. Check for air leaks\n" ..
+                            "3. Restore air pressure above minimum\n" ..
+                            "4. Re-enable machine when pressure is normal",
+                            "CRITICAL: Low Air Pressure",
+                            wx.wxOK + wx.wxICON_ERROR
+                        )
+                    end)
+                end
+            end
+            
+        else
+            if _G.lowAirDisabled then
+                mc.mcCntlSetLastError(inst, "Air pressure restored - machine can be re-enabled")
+                _G.lowAirDisabled = false
+                _G.lowAirDialogShown = false
+                
+                if not _G.restoredDialogShown then
+                    _G.restoredDialogShown = true
+                    
+                    coroutine.create(function()
+                        wx.wxMessageBox(
+                            "Air pressure has been restored.\n\n" ..
+                            "Please verify system is safe before re-enabling machine.",
+                            "Air Pressure Restored",
+                            wx.wxOK + wx.wxICON_INFORMATION
+                        )
+                    end)
+                end
+            end
+        end
+        
+        _G.lastLowAirState = rawAirState
+    else
+        _G.lowAirDebounceCount = 0
+    end
+    
+    if rawAirState == 1 then
+        local machEnabledHandle = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED)
+        if machEnabledHandle and machEnabledHandle > 0 then
+            local currentlyEnabled = mc.mcSignalGetState(machEnabledHandle)
+            
+            if currentlyEnabled == 1 and _G.lowAirDisabled then
+                mc.mcCntlEnable(inst, 0)
+                mc.mcCntlSetLastError(inst, "*** CANNOT ENABLE: Air pressure still too low! ***")
+                
+                if testcount % 100 == 0 then
+                    mc.mcCntlSetLastError(inst, "*** WARNING: Fix air pressure before enabling! ***")
+                end
+            end
+        end
+    end
+    
+    if testcount % 10 == 0 then
+        if scr.GetProperty("btnAirPressure", "Bg Color") ~= nil then
+            if rawAirState == 1 then
+                scr.SetProperty("btnAirPressure", "Bg Color", "#FF0000")
+                scr.SetProperty("btnAirPressure", "Label", "Air Pressure\nLOW!")
+            else
+                scr.SetProperty("btnAirPressure", "Bg Color", "#00FF00")
+                scr.SetProperty("btnAirPressure", "Label", "Air Pressure\nNORMAL")
+            end
+        end
+        
+        if scr.GetProperty("ledAirPressure", "Value") ~= nil then
+            scr.SetProperty("ledAirPressure", "Value", rawAirState == 1 and "0" or "1")
+        end
+    end
+    
+elseif _G.lastLowAirState ~= -2 then
+    mc.mcCntlSetLastError(inst, "WARNING: Cannot monitor air pressure - Input 6 not configured")
+    _G.lastLowAirState = -2
+end
+
+-- ================================
+-- Spindle Spin-UP Delay with Motion Pause (Feed Hold)
+-- FIXED VERSION - Using defined state constants
+-- ================================
+local inst = mc.mcGetInstance()
+
+-- Initialize spindle dwell system
+if not _G.spinUpDwell then
+    _G.spinUpDwell = {
+        armed = false,
+        delaySeconds = 0,
+        pauseActive = false,
+        pauseStartTime = 0,
+        lastSpindleState = 0,
+        cycleStartIssued = false
+    }
+    mc.mcCntlSetLastError(inst, "SPINDLE DELAY: Feed hold system initialized")
+end
+
+-- Wrap entire spindle delay logic in error handler
+local ok, err = pcall(function()
+    -- Check if M6 armed the delay
+    local spinUpFlag = mc.mcCntlGetPoundVar(inst, 495)
+    if spinUpFlag == 1 then
+        _G.spinUpDwell.armed = true
+        _G.spinUpDwell.delaySeconds = mc.mcCntlGetPoundVar(inst, 496) or 0.7
+        _G.spinUpDwell.pauseActive = false
+        _G.spinUpDwell.pauseStartTime = 0
+        _G.spinUpDwell.cycleStartIssued = false
+        mc.mcCntlSetPoundVar(inst, 495, 0)
+        
+        mc.mcCntlSetLastError(inst, string.format("SPINDLE DELAY: Armed - will pause motion for %.1fs when spindle starts", _G.spinUpDwell.delaySeconds))
+    end
+
+    -- Simple spindle detection
+    local function getSpindleRunning()
+        -- Check spindle ON signal
+        local hSpindleOn = mc.mcSignalGetHandle(inst, mc.OSIG_SPINDLEON)
+        if hSpindleOn and hSpindleOn > 0 then
+            return mc.mcSignalGetState(hSpindleOn) == 1
+        end
+        
+        -- Fallback: Check commanded RPM
+        local rpm = mc.mcSpindleGetCommandRPM(inst)
+        return rpm and rpm > 0
+    end
+
+    -- Handle spindle delay with feed hold
+    if _G.spinUpDwell.armed or _G.spinUpDwell.pauseActive then
+        local spindleOn = getSpindleRunning() and 1 or 0
+        local currentState = mc.mcCntlGetState(inst)
+        
+        -- Detect spindle start and initiate feed hold
+        if _G.spinUpDwell.armed and not _G.spinUpDwell.pauseActive then
+            if _G.spinUpDwell.lastSpindleState == 0 and spindleOn == 1 then
+                -- Spindle just started - pause motion
+                -- Using state constants instead of hardcoded numbers
+                if currentState == STATE_FRUN or currentState == STATE_MRUN then
+                    mc.mcCntlFeedHold(inst)
+                    _G.spinUpDwell.pauseActive = true
+                    _G.spinUpDwell.pauseStartTime = os.clock()
+                    _G.spinUpDwell.armed = false
+                    mc.mcCntlSetLastError(inst, string.format("SPINDLE DELAY: Motion paused for %.1fs spindle spin-up", _G.spinUpDwell.delaySeconds))
+                else
+                    -- Not in a running state, just clear the flag
+                    _G.spinUpDwell.armed = false
+                    mc.mcCntlSetLastError(inst, "SPINDLE DELAY: Not in run state, skipping pause")
+                end
+            end
+        end
+        
+        -- Check if pause period has elapsed and resume
+        if _G.spinUpDwell.pauseActive and not _G.spinUpDwell.cycleStartIssued then
+            local elapsed = os.clock() - _G.spinUpDwell.pauseStartTime
+            
+            if elapsed >= _G.spinUpDwell.delaySeconds then
+                -- Time's up - resume motion
+                local holdState = mc.mcCntlGetState(inst)
+                
+                debugPrint(string.format("DEBUG: Time's up! Current state = %d", holdState))
+                
+                -- Using state constants - STATE_FHOLD is now 101!
+                if holdState == STATE_FHOLD or holdState == STATE_MHOLD or 
+                   holdState == STATE_HOLD_SYNC or holdState == STATE_MRUN_FH then
+                    mc.mcCntlCycleStart(inst)
+                    _G.spinUpDwell.cycleStartIssued = true
+                    mc.mcCntlSetLastError(inst, "SPINDLE DELAY: Resuming motion after spin-up delay")
+                else
+                    -- Not in hold anymore (user may have stopped)
+                    _G.spinUpDwell.pauseActive = false
+                    _G.spinUpDwell.cycleStartIssued = false
+                    mc.mcCntlSetLastError(inst, string.format("SPINDLE DELAY: Not in hold state (%d), clearing pause flag", holdState))
+                end
+            else
+                -- Still waiting - report progress every 200ms
+                if (testcount % 10) == 0 then
+                    local remaining = _G.spinUpDwell.delaySeconds - elapsed
+                    mc.mcCntlSetLastError(inst, string.format("SPINDLE DELAY: %.1fs remaining...", remaining))
+                end
+            end
+        end
+        
+        -- Clear pause flag once motion resumes
+        if _G.spinUpDwell.cycleStartIssued then
+            local resumeState = mc.mcCntlGetState(inst)
+            -- Using state constants
+            if resumeState == STATE_FRUN or resumeState == STATE_MRUN then
+                _G.spinUpDwell.pauseActive = false
+                _G.spinUpDwell.cycleStartIssued = false
+                mc.mcCntlSetLastError(inst, "SPINDLE DELAY: Motion resumed successfully")
+            end
+        end
+        
+        _G.spinUpDwell.lastSpindleState = spindleOn
+    end
+
+    -- Reset on machine idle or stop
+    local machState = mc.mcCntlGetState(inst)
+    -- Using state constants
+    if machState == STATE_IDLE or machState == STATE_STOP then
+        if _G.spinUpDwell.armed or _G.spinUpDwell.pauseActive then
+            _G.spinUpDwell.armed = false
+            _G.spinUpDwell.pauseActive = false
+            _G.spinUpDwell.pauseStartTime = 0
+            _G.spinUpDwell.cycleStartIssued = false
+            mc.mcCntlSetLastError(inst, "SPINDLE DELAY: Reset due to idle/stop")
+        end
+    end
+end)
+
+-- Handle any errors in spindle delay logic
+if not ok then
+    mc.mcCntlSetLastError(inst, "SPINDLE DELAY ERROR: " .. tostring(err))
+    -- Reset to safe state
+    _G.spinUpDwell = _G.spinUpDwell or {}
+    _G.spinUpDwell.pauseActive = false
+    _G.spinUpDwell.armed = false
+    _G.spinUpDwell.cycleStartIssued = false
+end
+
+
+	-- Periodic status report (only in debug mode)
+	if not _G.PRODUCTION_MODE and os.clock() - _G.dustDebug.lastReportTime > _G.dustDebug.reportInterval then
+		_G.dustDebug.lastReportTime = os.clock()
+		
+		-- Only report if interesting things are happening
+		if _G.waitingForMotionAfterToolChange or _G.dustDebug.m6CompletionCount > 0 then
+			mc.mcCntlSetLastError(inst, string.format("STATUS: Cycle=%d, M6Count=%d, Waiting=%s", 
+				_G.dustDebug.cycleCount,
+				_G.dustDebug.m6CompletionCount,
+				tostring(_G.waitingForMotionAfterToolChange)))
+		end
+	end
+
+
+
+
+-- TEMPORARY: State discovery helper
+if not _G.stateLogger then
+    _G.stateLogger = {
+        lastState = -1,
+        stateNames = {
+            [0] = "IDLE",
+            [100] = "FRUN",
+            [101] = "FHOLD",      -- CONFIRMED: Feed hold
+            [102] = "PROBE",      -- DISCOVERED: Probing state
+            [200] = "MRUN",
+            [201] = "MRUN_FH",
+        }
+    }
+end
+
+local currentState = mc.mcCntlGetState(inst)
+if currentState ~= _G.stateLogger.lastState then
+    local stateName = _G.stateLogger.stateNames[currentState] or "UNKNOWN"
+    mc.mcCntlSetLastError(inst, string.format("STATE: %d (%s)", currentState, stateName))
+    
+    -- Special check for feed hold
+    if _G.stateLogger.lastState == 100 and stateName == "UNKNOWN" then
+        mc.mcCntlSetLastError(inst, string.format("DISCOVERED: Feed hold state = %d", currentState))
+    end
+    
+    _G.stateLogger.lastState = currentState
+end
+
+
+
+
+
+-------------------------------------------------------
+-- This is the last thing we do. So keep it at the end of the script!
+machStateOld = machState;
+machWasEnabled = machEnabled;

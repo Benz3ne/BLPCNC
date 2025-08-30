@@ -1,29 +1,8 @@
 local inst = mc.mcGetInstance()
 local rc = 0
 
--- Sentinel value for invalid/uninitialized pound variables
-local SENTINEL_VALUE = -999999
-
--- Safe pound variable getter with sentinel handling
-local function getPV(n, default)
-    local v = mc.mcCntlGetPoundVar(inst, n)
-    if v == nil or v <= -1e307 then 
-        return default or SENTINEL_VALUE 
-    end
-    return v
-end
-
--- Safe numeric conversion helper
-local function num(v, default)
-    v = tonumber(v)
-    if v == nil or v ~= v then -- NaN check (v~=v)
-        return default or 0
-    end
-    return v
-end
-
 -- Get machine enabled state properly
-local machEnabledHandle = _G.handleCache and _G.handleCache.machEnabled or mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED)
+local machEnabledHandle = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED)
 local machEnabled = 0
 if machEnabledHandle and machEnabledHandle > 0 then
     machEnabled = mc.mcSignalGetState(machEnabledHandle)
@@ -51,25 +30,13 @@ local STATE_HOLD_SYNC = 110 -- Hold sync state (probable)
 local STATE_STOP = 109      -- Stop state (probable)
 
 -- PRODUCTION MODE CONTROL - Set to false for debugging
--- Can also be controlled via pound variable #4990 (1=debug, 0=production)
-local debugPV = getPV(4990, 0)
-_G.PRODUCTION_MODE = (debugPV ~= 1)  -- Debug enabled if #4990 == 1
+_G.PRODUCTION_MODE = true  -- Set to false to enable debug messages
 
 -- Debug print function that respects production mode
-local function debugPrint(tag, message)
+local function debugPrint(message)
     if not _G.PRODUCTION_MODE then
-        if message then
-            mc.mcCntlSetLastError(inst, string.format("[%s] %s", tag, message))
-        else
-            -- Single argument - no tag
-            mc.mcCntlSetLastError(inst, tostring(tag))
-        end
+        mc.mcCntlSetLastError(inst, message)
     end
-end
-
--- Shorter alias for debug
-local function dbg(tag, msg)
-    debugPrint(tag, msg)
 end
 
 -- Simple debug counter if needed
@@ -109,13 +76,7 @@ end
 -------------------------------------------------------
 if (machEnabled == 1) then
 	local cycletime = mc.mcCntlGetRunTime(inst)
-	local timeStr = SystemLib and SystemLib.Display and SystemLib.Display.SecondsToTime 
-		and SystemLib.Display.SecondsToTime(cycletime) 
-		or string.format("%02d:%02d:%05.2f", 
-			math.floor(cycletime/3600), 
-			math.floor((cycletime%3600)/60), 
-			cycletime%60)
-	scr.SetProperty("CycleTime", "Label", timeStr)
+	scr.SetProperty("CycleTime", "Label", SecondsToTime(cycletime))
 end
 
 -------------------------------------------------------
@@ -194,26 +155,8 @@ if not _G.toolPLCInit then
     mc.mcToolSetCurrent(inst, 0)
 end
 
--- Cache signal handles for performance (avoid repeated lookups)
-if not _G.signalHandlesInit then
-    _G.signalHandlesInit = true
-    _G.handleCache = {
-        machEnabled = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED),
-        output1 = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT1),
-        output2 = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT2),
-        output3 = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3),
-        output4 = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT4),
-        output5 = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT5),
-        output6 = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT6),
-        output7 = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7),
-        input6 = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT6),
-        input8 = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT8),
-        input17 = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)
-    }
-end
-
--- Non-blocking tool prompt request - sets flags for ScreenLoad to handle
-local function requestToolPrompt(isStartup)
+-- Function to prompt tool selection
+local function promptToolSelection(isStartup)
     local virtualToolActive = mc.mcCntlGetPoundVar(inst, 406) >= 90
     local suppressPrompt = mc.mcCntlGetPoundVar(inst, 498) == 1
 	
@@ -227,14 +170,167 @@ local function requestToolPrompt(isStartup)
         return
     end
     
-    -- Just set flags for ScreenLoad timer to detect and handle
-    _G.needToolPrompt = true
-    _G.toolPromptIsStartup = isStartup
-    _G.toolPromptRequestTime = os.clock()
+    local filteredChoices = {}
+    local filteredNumbers = {}
+    
+    if _G.toolChoices and _G.toolNumbers then
+        for i, toolNum in ipairs(_G.toolNumbers) do
+            if toolNum > 0 and toolNum < 90 then
+                table.insert(filteredChoices, _G.toolChoices[i])
+                table.insert(filteredNumbers, toolNum)
+            end
+        end
+    end
+    
+    if #filteredChoices == 0 then
+        mc.mcCntlSetLastError(inst, "ERROR: No physical tools configured")
+        mc.mcToolSetCurrent(inst, 1)
+        mc.mcCntlGcodeExecuteWait(inst, "G49")
+        wx.wxMilliSleep(100)
+        mc.mcCntlGcodeExecuteWait(inst, "G43 H1")
+        return
+    end
+    
+    local message = isStartup and 
+        "Tool detected in spindle at startup.\\nSelect the actual tool:" or
+        "Tool inserted manually.\\nSelect the tool number:"
+    
+    local dlg = wx.wxSingleChoiceDialog(wx.NULL, 
+        message, 
+        isStartup and "Tool Mismatch Detected" or "Tool Confirmation", 
+        filteredChoices)
+    
+    local timerPanel = wx.wxPanel(dlg, wx.wxID_ANY)
+    local timer = wx.wxTimer(timerPanel)
+    local spindleCancelled = false
+    
+    local input8Handle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT8)
+    local out2Handle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT2)
+    local toolPresentHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)  -- ADD THIS
+    
+    local lastInput8 = 0
+    if input8Handle and input8Handle > 0 then
+        lastInput8 = mc.mcSignalGetState(input8Handle)
+    end
+    
+    -- Track initial tool presence state
+    local lastToolPresent = 1  -- Assume tool present when dialog opened
+    if toolPresentHandle and toolPresentHandle > 0 then
+        lastToolPresent = mc.mcSignalGetState(toolPresentHandle)
+    end
+    
+    local buttonPressStart = 0
+    local buttonHoldRequired = 0.5
+    local buttonHeld = false
+    
+   timerPanel:Connect(wx.wxEVT_TIMER, function(event)
+    -- CHECK FOR TOOL REMOVAL FIRST
+    if toolPresentHandle and toolPresentHandle > 0 then
+        local currentToolPresent = mc.mcSignalGetState(toolPresentHandle)
+        
+        if currentToolPresent == 0 and lastToolPresent == 1 then
+            spindleCancelled = true
+            dlg:EndModal(wx.wxID_CANCEL)
+            timer:Stop()
+            return
+        end
+        lastToolPresent = currentToolPresent
+    end
+    
+    -- PROTECTED MIRRORING - Check M6 flag first!
+    local m6Running = mc.mcCntlGetPoundVar(inst, 499)
+    if m6Running ~= 1 then  -- Only mirror if M6 NOT running
+        if input8Handle and input8Handle > 0 and out2Handle and out2Handle > 0 then
+            local currentInput8 = mc.mcSignalGetState(input8Handle)
+            mc.mcSignalSetState(out2Handle, currentInput8)
+            
+            -- Rest of button hold detection...
+            if currentInput8 == 1 and lastInput8 == 0 then
+                buttonPressStart = os.clock()
+                buttonHeld = false
+            elseif currentInput8 == 1 and lastInput8 == 1 then
+                if not buttonHeld and (os.clock() - buttonPressStart) >= buttonHoldRequired then
+                    buttonHeld = true
+                    spindleCancelled = true
+                    dlg:EndModal(wx.wxID_CANCEL)
+                    timer:Stop()
+                end
+            elseif currentInput8 == 0 and lastInput8 == 1 then
+                buttonPressStart = 0
+                buttonHeld = false
+            end
+            
+            lastInput8 = currentInput8
+        end
+    end
+end)
+    
+    timer:Start(50)
+    
+    local result = dlg:ShowModal()
+    
+    timer:Stop()
+    
+    if spindleCancelled then
+        mc.mcToolSetCurrent(inst, 0)
+        mc.mcCntlGcodeExecuteWait(inst, "G49")
+        
+        if UpdateToolPreview then
+            UpdateToolPreview()
+        end
+        
+        mc.mcCntlSetLastError(inst, "Tool removed - T0 set")
+        
+    elseif result == wx.wxID_OK then
+        local selection = dlg:GetSelection()
+        local newTool = filteredNumbers[selection + 1]
+        
+        _G.lastTool = -999
+        
+        mc.mcToolSetCurrent(inst, newTool)
+        wx.wxMilliSleep(50)
+        
+        mc.mcCntlGcodeExecuteWait(inst, "G49")
+        wx.wxMilliSleep(100)
+        
+        if newTool > 0 then
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G43 H%d", newTool))
+            wx.wxMilliSleep(100)
+            
+            _G.hOffsetLastSync = os.clock()
+            
+            local activeH = mc.mcCntlGetPoundVar(inst, 4120)
+            local desc = mc.mcToolGetDesc(inst, newTool) or "Unnamed"
+        else
+            _G.hOffsetLastSync = os.clock()
+        end
+        
+        if UpdateToolPreview then
+            UpdateToolPreview()
+        end
+    else
+        if isStartup then
+            mc.mcToolSetCurrent(inst, 1)
+            
+            mc.mcCntlGcodeExecuteWait(inst, "G49")
+            wx.wxMilliSleep(100)
+            mc.mcCntlGcodeExecuteWait(inst, "G43 H1")
+            
+            _G.hOffsetLastSync = os.clock()
+            
+            wx.wxMessageBox("Tool selection cancelled.\\n\\nTool has been set to T1 by default.\\nPlease verify the correct tool number.", 
+                           "Tool Set to T1", wx.wxOK + wx.wxICON_WARNING)
+        else
+            wx.wxMessageBox("Tool change cancelled. Tool not updated.", "Info", wx.wxOK + wx.wxICON_INFORMATION)
+        end
+        
+        if UpdateToolPreview then
+            UpdateToolPreview()
+        end
+    end
+    
+    dlg:Destroy()
 end
-
--- Legacy function name for compatibility
-local promptToolSelection = requestToolPrompt
 
 -- Check for enable condition
 if machEnabled == 1 and not _G.enablePromptDone and _G.toolPresentHandle then
@@ -323,7 +419,7 @@ end
 -- Optimized button update function - only updates on state change
 local function UpdateAllDustButtons()
     -- Dust Boot
-    local bootHandle = _G.handleCache and _G.handleCache.output3 or mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
+    local bootHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3)
     if bootHandle and bootHandle > 0 then
         local bootState = mc.mcSignalGetState(bootHandle)
         if bootState ~= _G.dustButtonStates.boot then
@@ -334,7 +430,7 @@ local function UpdateAllDustButtons()
     end
     
     -- Dust Collection
-    local dustHandle = _G.handleCache and _G.handleCache.output4 or mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT4)
+    local dustHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT4)
     if dustHandle and dustHandle > 0 then
         local dustState = mc.mcSignalGetState(dustHandle)
         if dustState ~= _G.dustButtonStates.collect then
@@ -345,7 +441,7 @@ local function UpdateAllDustButtons()
     end
     
     -- Rear Vacuum (OUTPUT5)
-    local vacRearHandle = _G.handleCache and _G.handleCache.output5 or mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT5)
+    local vacRearHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT5)
     if vacRearHandle and vacRearHandle > 0 then
         local vacRearState = mc.mcSignalGetState(vacRearHandle)
         if vacRearState ~= _G.dustButtonStates.vacRear then
@@ -356,7 +452,7 @@ local function UpdateAllDustButtons()
     end
     
     -- Front Vacuum (OUTPUT6)
-    local vacFrontHandle = _G.handleCache and _G.handleCache.output6 or mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT6)
+    local vacFrontHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT6)
     if vacFrontHandle and vacFrontHandle > 0 then
         local vacFrontState = mc.mcSignalGetState(vacFrontHandle)
         if vacFrontState ~= _G.dustButtonStates.vacFront then
@@ -367,20 +463,193 @@ local function UpdateAllDustButtons()
     end
 end
 
--- Unified dust/boot control (single source of truth)
-if dustLib then
-    dustLib.init(inst)     -- idempotent; safe per tick
-    dustLib.update(inst)   -- compute policy + write OUTPUT3/4
+-- ============================================
+-- DUST CONTROL SYSTEM INITIALIZATION & LOGIC
+-- ============================================
+-- Initialize dust automation FIRST (before any usage)
+if not _G.dustAutoInit then
+    _G.dustAutoInit = true
+    _G.lastCycleState = false
+    _G.lastDustTarget = -1  
+    _G.lastBootTarget = -1  
+    _G.resyncCounter = 0
+    _G.bootTransitionBlock = 0
+    _G.lastM6Running = 0
+    _G.lastVirtualActive = 0
+    
+    -- Cache signal handles once at startup
+    _G.dustHandles = {
+        spindleOn = mc.mcSignalGetHandle(inst, mc.OSIG_SPINDLEON),
+        dustCollect = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT4),
+        dustBoot = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT3),
+        vacRear = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT5),
+        vacFront = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT6)
+    }
+    
+    -- Properly initialize spindle state to prevent false change detection
+    if _G.dustHandles.spindleOn and _G.dustHandles.spindleOn > 0 then
+        _G.lastSpindleState = mc.mcSignalGetState(_G.dustHandles.spindleOn)
+    else
+        _G.lastSpindleState = 0
+    end
+    
+    -- Initialize pound vars if needed
+    local initVars = {400, 401, 402, 403, 404, 405, 410, 496, 499}
+    for _, var in ipairs(initVars) do
+        if mc.mcCntlGetPoundVar(inst, var) < -1e300 then
+            mc.mcCntlSetPoundVar(inst, var, 0)
+        end
+    end
+    
+    -- Read actual output states on startup for sync
+    if _G.dustHandles.dustCollect and _G.dustHandles.dustCollect > 0 then
+        _G.lastDustTarget = mc.mcSignalGetState(_G.dustHandles.dustCollect)
+    end
+    if _G.dustHandles.dustBoot and _G.dustHandles.dustBoot > 0 then
+        _G.lastBootTarget = mc.mcSignalGetState(_G.dustHandles.dustBoot)
+    end
 end
 
--- Unified tool control (single source of truth)
-if ToolLib then
-    ToolLib.init(inst)     -- idempotent; safe per tick
-    ToolLib.update(inst)   -- handles OUTPUT1/2/7 and state
+-- MAIN DUST CONTROL LOGIC (only run after init)
+if _G.dustHandles then  -- CRITICAL: Check handles exist first!
+    
+    local currentState = mc.mcCntlGetState(inst)
+    local inCycle = mc.mcCntlIsInCycle(inst)
+    local m6Flag = mc.mcCntlGetPoundVar(inst, 499)
+    
+    -- Check spindle state changes
+    if _G.dustHandles.spindleOn and _G.dustHandles.spindleOn > 0 then
+        local spindleOn = mc.mcSignalGetState(_G.dustHandles.spindleOn)
+        
+        -- Only process if spindle state CHANGED
+        if spindleOn ~= _G.lastSpindleState then
+            -- Only clear overrides on spindle START, not stop
+            if spindleOn == 1 then
+                -- Spindle starting - clear any manual overrides
+                mc.mcCntlSetPoundVar(inst, 405, 0)  -- Clear dust override
+                mc.mcCntlSetPoundVar(inst, 410, 0)  -- Clear boot override
+            end
+            _G.lastSpindleState = spindleOn
+            
+            -- Force recalculation of targets
+            _G.lastDustTarget = -1
+            _G.lastBootTarget = -1
+        end
+    end
+    
+    -- DUST COLLECTION CONTROL
+	if _G.dustHandles.dustCollect and _G.dustHandles.dustCollect > 0 then
+		local dustCollectAuto = mc.mcCntlGetPoundVar(inst, 400)
+		local override = mc.mcCntlGetPoundVar(inst, 405)
+		local laserToolActive = (mc.mcToolGetCurrent(inst) == 91)  -- ADD THIS LINE
+		
+		-- Only recalculate if in auto mode with no override AND laser not active
+		if dustCollectAuto == 1 and override == 0 and not laserToolActive then  -- MODIFIED THIS LINE
+			local spindleOn = (_G.lastSpindleState == 1)
+			local newTarget = (inCycle == 1 or spindleOn or (m6Flag == 1 and inCycle == 1)) and 1 or 0
+			
+			-- Update pound var with new target
+			mc.mcCntlSetPoundVar(inst, 404, newTarget)
+		end
+        
+        -- Apply target to output if it changed
+        local target = mc.mcCntlGetPoundVar(inst, 404)
+        if target ~= _G.lastDustTarget then
+            mc.mcSignalSetState(_G.dustHandles.dustCollect, target)
+            _G.lastDustTarget = target
+        end
+    end
+    
+    -- DUST BOOT CONTROL
+    -- OLD: local isEmergency = (currentState == 109 or currentState == 103) or 
+    --                     (machEnabled == 0 and machStateOld ~= currentState)
+    local isEmergency = (currentState == 109 or currentState == 103) or 
+                        (machEnabled == 0)
+    
+    -- Initialize emergency state tracking
+    if not _G.emergencyLaserShutoff then
+        _G.emergencyLaserShutoff = false
+    end
+    
+    if isEmergency then
+        -- Emergency - force boot up and turn off laser (ONCE per emergency event)
+        if not _G.emergencyLaserShutoff then
+            if _G.dustHandles.dustBoot and _G.dustHandles.dustBoot > 0 then
+                mc.mcSignalSetState(_G.dustHandles.dustBoot, 0)
+                mc.mcCntlSetPoundVar(inst, 403, 0)
+                _G.lastBootTarget = 0
+            end
+            
+            -- Emergency laser shutoff - turn off ESS test mode (ONCE only)
+            local success1, hregActivate = pcall(mc.mcRegGetHandle, inst, "ESS/Laser/Test_Mode_Activate")
+            local success2, hregEnable = pcall(mc.mcRegGetHandle, inst, "ESS/Laser/Test_Mode_Enable")
+            
+            local wasActive = false
+            if success1 and hregActivate and mc.mcRegGetValue(hregActivate) == 1 then
+                mc.mcRegSetValue(hregActivate, 0)  -- Stop firing
+                wasActive = true
+            end
+            if success2 and hregEnable and mc.mcRegGetValue(hregEnable) == 1 then
+                mc.mcRegSetValue(hregEnable, 0)    -- Disarm system  
+                wasActive = true
+            end
+            
+            if wasActive then
+                mc.mcCntlSetLastError(inst, "EMERGENCY: Laser deactivated and disarmed")
+            end
+            _G.emergencyLaserShutoff = true
+        end
+    else
+        -- Normal operation - reset emergency flag
+        _G.emergencyLaserShutoff = false
+        
+        local virtualTool = mc.mcCntlGetPoundVar(inst, 406)
+        local bootAuto = mc.mcCntlGetPoundVar(inst, 402)
+        local bootOverride = mc.mcCntlGetPoundVar(inst, 410)
+        
+        local bootTarget = -1
+        
+        -- Determine what boot position should be
+        if m6Flag == 1 or virtualTool >= 90 then
+            bootTarget = 0  -- Force UP
+        elseif bootAuto == 1 and bootOverride == 0 then
+            -- Check for transition from M6 or virtual tool
+            if (m6Flag == 0 and _G.lastM6Running == 1) or 
+               (virtualTool < 90 and _G.lastVirtualActive >= 90) then
+                _G.bootTransitionBlock = os.clock() + 0.5  -- 500ms transition delay
+            end
+            
+            -- Auto mode - check if in transition block
+            if os.clock() < _G.bootTransitionBlock then
+                -- During transition, maintain current position
+                bootTarget = _G.lastBootTarget
+            else
+                -- Normal auto mode based on spindle
+                bootTarget = (_G.lastSpindleState == 1) and 1 or 0
+            end
+        else
+            -- Manual or override - use existing target
+            bootTarget = mc.mcCntlGetPoundVar(inst, 403)
+        end
+        
+        -- Update tracking variables for next cycle
+        _G.lastM6Running = m6Flag
+        _G.lastVirtualActive = virtualTool
+        
+        -- Only apply if changed
+        if bootTarget ~= _G.lastBootTarget and _G.dustHandles.dustBoot and _G.dustHandles.dustBoot > 0 then
+            mc.mcSignalSetState(_G.dustHandles.dustBoot, bootTarget)
+            mc.mcCntlSetPoundVar(inst, 403, bootTarget)
+            _G.lastBootTarget = bootTarget
+        end
+    end
+    
+    -- Update button display only on state changes
+    UpdateAllDustButtons()
+    
+    -- Store cycle state
+    _G.lastCycleState = (inCycle == 1)
 end
-
--- Update button display (library doesn't handle UI)
-UpdateAllDustButtons()
 
 
 
@@ -550,7 +819,7 @@ if not _G.lastProbeOutputState then
     _G.lastProbeOutputState = -1 
 end
 
-local output7Handle = _G.handleCache and _G.handleCache.output7 or mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7)
+local output7Handle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7)
 if output7Handle and output7Handle > 0 then
     local probeActive = mc.mcSignalGetState(output7Handle)
     
@@ -571,7 +840,7 @@ if not _G.lastLaserOutputState then
     _G.lastLaserOutputState = -1 
 end
 
-local output1Handle = _G.handleCache and _G.handleCache.output1 or mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT1)
+local output1Handle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT1)
 if output1Handle and output1Handle > 0 then
     local laserActive = mc.mcSignalGetState(output1Handle)
     
@@ -616,11 +885,9 @@ if not _G.lastInput8State then
     _G.toolCheckTime = 0
     _G.toolCheckStartTime = nil
     _G.lastToolSensorState = -1
-    _G.toolSettleNeeded = false
-    _G.toolSettleTime = 0
 end
 
-local input8Handle = _G.handleCache and _G.handleCache.input8 or mc.mcSignalGetHandle(inst, mc.ISIG_INPUT8)
+local input8Handle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT8)
 if input8Handle and input8Handle > 0 then
     local input8State = mc.mcSignalGetState(input8Handle)
     
@@ -629,9 +896,10 @@ if input8Handle and input8Handle > 0 then
     
     -- Only mirror if M6 is NOT running
     if m6Running ~= 1 then
-        -- ToolLib now handles OUTPUT2 writes with proper protection
-        -- Keeping the handle check for future use
-        local out2Handle = _G.handleCache and _G.handleCache.output2 or mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT2)
+        local out2Handle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT2)
+        if out2Handle and out2Handle > 0 then
+            mc.mcSignalSetState(out2Handle, input8State)
+        end
     end
     
     -- Rest of the code for detecting button release...
@@ -655,8 +923,7 @@ if _G.toolCheckPending and os.clock() >= _G.toolCheckTime then
         mc.mcCntlSetLastError(inst, "Tool check cancelled - machine stayed busy for 30 seconds")
         _G.toolCheckPending = false
         _G.toolCheckStartTime = nil
-        local handle17 = _G.handleCache and _G.handleCache.input17 or mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)
-        _G.lastToolSensorState = mc.mcSignalGetState(handle17)
+        _G.lastToolSensorState = mc.mcSignalGetState(mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17))
         return
     end
     
@@ -676,17 +943,7 @@ if _G.toolCheckPending and os.clock() >= _G.toolCheckTime then
     _G.toolCheckPending = false
     _G.toolCheckStartTime = nil
     
-    -- Set flag to wait for signal settling (non-blocking)
-    _G.toolSettleNeeded = true
-    _G.toolSettleTime = os.clock() + 0.05  -- 50ms delay
-    return
-end
-
--- Handle tool signal settling delay (non-blocking replacement for wxMilliSleep)
-if _G.toolSettleNeeded and os.clock() >= _G.toolSettleTime then
-    _G.toolSettleNeeded = false
-    
-    local toolPresentHandle = _G.handleCache and _G.handleCache.input17 or mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)
+    local toolPresentHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17)
     if not toolPresentHandle or toolPresentHandle <= 0 then
         return
     end
@@ -741,7 +998,7 @@ if not _G.lowAirInit then
     _G.restoredDialogShown = false
 end
 
-local lowAirHandle = _G.handleCache and _G.handleCache.input6 or mc.mcSignalGetHandle(inst, mc.ISIG_INPUT6)
+local lowAirHandle = mc.mcSignalGetHandle(inst, mc.ISIG_INPUT6)
 
 if lowAirHandle and lowAirHandle > 0 then
     local rawAirState = mc.mcSignalGetState(lowAirHandle)
@@ -785,15 +1042,18 @@ if lowAirHandle and lowAirHandle > 0 then
                 if not _G.lowAirDialogShown then
                     _G.lowAirDialogShown = true
                     
-                    -- Set flag for ScreenLoad timer to show dialog
-                    _G.needLowAirDialog = true
-                    _G.lowAirDialogType = "error"
-                    _G.lowAirDialogMessage = "LOW AIR PRESSURE DETECTED!\n\n" ..
-                        "Machine has been disabled for safety.\n" ..
-                        "1. Check air compressor\n" ..
-                        "2. Check for air leaks\n" ..
-                        "3. Restore air pressure above minimum\n" ..
-                        "4. Re-enable machine when pressure is normal"
+                    coroutine.create(function()
+                        wx.wxMessageBox(
+                            "LOW AIR PRESSURE DETECTED!\n\n" ..
+                            "Machine has been disabled for safety.\n" ..
+                            "1. Check air compressor\n" ..
+                            "2. Check for air leaks\n" ..
+                            "3. Restore air pressure above minimum\n" ..
+                            "4. Re-enable machine when pressure is normal",
+                            "CRITICAL: Low Air Pressure",
+                            wx.wxOK + wx.wxICON_ERROR
+                        )
+                    end)
                 end
             end
             
@@ -806,11 +1066,14 @@ if lowAirHandle and lowAirHandle > 0 then
                 if not _G.restoredDialogShown then
                     _G.restoredDialogShown = true
                     
-                    -- Set flag for ScreenLoad timer to show dialog
-                    _G.needLowAirDialog = true
-                    _G.lowAirDialogType = "info"
-                    _G.lowAirDialogMessage = "Air pressure has been restored.\n\n" ..
-                        "Please verify system is safe before re-enabling machine."
+                    coroutine.create(function()
+                        wx.wxMessageBox(
+                            "Air pressure has been restored.\n\n" ..
+                            "Please verify system is safe before re-enabling machine.",
+                            "Air Pressure Restored",
+                            wx.wxOK + wx.wxICON_INFORMATION
+                        )
+                    end)
                 end
             end
         end
@@ -821,7 +1084,7 @@ if lowAirHandle and lowAirHandle > 0 then
     end
     
     if rawAirState == 1 then
-        local machEnabledHandle = _G.handleCache and _G.handleCache.machEnabled or mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED)
+        local machEnabledHandle = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED)
         if machEnabledHandle and machEnabledHandle > 0 then
             local currentlyEnabled = mc.mcSignalGetState(machEnabledHandle)
             

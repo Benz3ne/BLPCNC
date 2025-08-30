@@ -1,31 +1,4 @@
 local inst = mc.mcGetInstance()
--- Get current state
-local dustHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT4)
-if not dustHandle or dustHandle <= 0 then
-    mc.mcCntlSetLastError(inst, "ERROR: Dust collection signal not found")
-    return
-end
-local current = mc.mcSignalGetState(dustHandle)
--- Toggle target
-local newTarget = 1 - current
-
--- SET OVERRIDE FIRST to prevent race condition
-mc.mcCntlSetPoundVar(inst, 405, 1)  -- Set override flag FIRST
-mc.mcCntlSetPoundVar(inst, 404, newTarget)  -- Then set target
--- Update tracking variable
-if _G.lastDustTarget then 
-    _G.lastDustTarget = newTarget 
-end
--- Apply the change
-mc.mcSignalSetState(dustHandle, newTarget)
-
--- Update button appearance
-if newTarget == 1 then
-    scr.SetProperty("btnDustCollect", "Bg Color", "#00FF00")
-    scr.SetProperty("btnDustCollect", "Label", "Dust Collect\nON")
-    mc.mcCntlSetLastError(inst, "Manual: Dust ON (until spindle change)")
-else
-    scr.SetProperty("btnDustCollect", "Bg Color", "#FF0000")
-    scr.SetProperty("btnDustCollect", "Label", "Dust Collect\nOFF")
-    mc.mcCntlSetLastError(inst, "Manual: Dust OFF (until spindle change)")
+if dustLib and dustLib.manualToggleDust then
+    dustLib.manualToggleDust(inst)
 end

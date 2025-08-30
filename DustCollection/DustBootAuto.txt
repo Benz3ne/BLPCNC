@@ -1,12 +1,6 @@
 local inst = mc.mcGetInstance()
-local currentMode = mc.mcCntlGetPoundVar(inst, 402)
-if currentMode == 0 then
-    mc.mcCntlSetPoundVar(inst, 402, 1)
-    mc.mcCntlSetPoundVar(inst, 410, 0)  -- Clear any override
-    scr.SetProperty("btnDustBootAuto", "Bg Color", "#00FF00")
-    mc.mcCntlSetLastError(inst, "Dust boot AUTO mode")
-else
-    mc.mcCntlSetPoundVar(inst, 402, 0)
-    scr.SetProperty("btnDustBootAuto", "Bg Color", "#FF0000")
-    mc.mcCntlSetLastError(inst, "Dust boot MANUAL mode")
+local current = mc.mcCntlGetPoundVar(inst, 402)
+local want = (current == 0) and 1 or 0
+if dustLib and dustLib.toggleBootAuto then
+    dustLib.toggleBootAuto(inst, want == 1)
 end

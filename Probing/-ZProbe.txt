@@ -1,5 +1,6 @@
--- Probe -Z - Button Left-Down Script for Mach4 v2.0
+-- Probe -Z - Button Left-Down Script for Mach4 v3.0
 -- Compatible with M311 v1.4.0+ with sentinel mode and H-compensation
+-- Updated to use ProbeLib v2.1 enhanced library functions
 
 -- Required Pound Variables:
 -- #303 = Fast feedrate for probing
@@ -13,111 +14,48 @@
 -- Required Macro:
 -- m311.mcs must exist in your profile's Macros folder
 
-local inst = mc.mcGetInstance()
-if not inst then 
-    return 
-end
+-- Load libraries
+local ProbeLib = require("ProbeLib")
+local SystemLib = require("SystemLib")
+local UILib = require("UILib")
+
+local inst = ProbeLib.Core.GetInstance()
 
 -- ============================================
 -- CONSTANTS
 -- ============================================
-local SENTINEL_VALUE = -999999.0      -- Impossible machine position for failure detection
-local PROBE_SIGNAL = mc.ISIG_PROBE1   -- Touch probe signal
+local SENTINEL_VALUE = ProbeLib.CONSTANTS.SENTINEL_VALUE
+local PROBE_SIGNAL = ProbeLib.CONSTANTS.PROBE_SIGNAL
 
 -- ============================================
--- TOOL CHECK
+-- ROTATION CHECK
 -- ============================================
--- Check if T90 (probe) is active
-local currentTool = mc.mcToolGetCurrent(inst)
--- Check if probe is physically deployed (output 7)
-local probeDownHandle = mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7)
-local probeDeployed = mc.mcSignalGetState(probeDownHandle)
-
--- Check both conditions - T90 is current AND probe is deployed
-if currentTool ~= 90 or probeDeployed ~= 1 then
-    -- Determine parent window
-    local parent = wx.NULL
-    local app = wx.wxGetApp()
-    if app then
-        local ok, top = pcall(function() return app:GetTopWindow() end)
-        if ok and top then parent = top end
-    end
-    
-    -- Show error dialog
-    local dlgW, dlgH = 340, 180
-    local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
-    local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
-    local posX = math.floor((sw - dlgW) / 2)
-    local posY = math.floor((sh - dlgH) / 2)
-    
-    local errorDlg = wx.wxDialog(parent, wx.wxID_ANY,
-        "Probe Not Active",
-        wx.wxPoint(posX, posY), wx.wxSize(dlgW, dlgH),
-        wx.wxDEFAULT_DIALOG_STYLE)
-    
-    local panel = wx.wxPanel(errorDlg, wx.wxID_ANY)
-    local sizer = wx.wxBoxSizer(wx.wxVERTICAL)
-    
-    -- Error message
-    local msg = wx.wxStaticText(panel, wx.wxID_ANY,
-        "Please activate T90 (probe) before using Z probe.\n\n" ..
-        "Click 'Change Tool to T90' to activate the probe,\n" ..
-        "or 'Cancel' to exit.")
-    msg:SetFont(wx.wxFont(10, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
-    sizer:Add(msg, 1, wx.wxALL + wx.wxALIGN_CENTER, 20)
-    
-    -- Button sizer
-    local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
-    
-    -- Change Tool button
-    local changeBtn = wx.wxButton(panel, wx.wxID_ANY, "Change Tool to T90")
-    changeBtn:SetMinSize(wx.wxSize(130, 28))
-    btnSizer:Add(changeBtn, 0, wx.wxRIGHT, 10)
-    
-    -- Cancel button
-    local cancelBtn = wx.wxButton(panel, wx.wxID_CANCEL, "Cancel")
-    cancelBtn:SetMinSize(wx.wxSize(90, 28))
-    btnSizer:Add(cancelBtn, 0, wx.wxLEFT, 0)
-    
-    sizer:Add(btnSizer, 0, wx.wxALIGN_CENTER + wx.wxBOTTOM, 15)
-    
-    -- Handle Change Tool button
-    changeBtn:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_BUTTON_CLICKED, function(event)
-        errorDlg:EndModal(wx.wxID_YES)  -- Use YES as indicator to change tool
-    end)
-    
-    panel:SetSizer(sizer)
-    errorDlg:Centre()
-    
-    local result = errorDlg:ShowModal()
-    errorDlg:Destroy()
-    
-    if result == wx.wxID_YES then
-        -- Execute tool change and exit - user will need to click probe again
-        mc.mcCntlGcodeExecuteWait(inst, "T90 M6")
-        mc.mcCntlSetLastError(inst, "T90 activated - click Probe -Z again to continue")
-        return
-    else
-        return  -- User cancelled
-    end
+if not ProbeLib.Safety.CheckRotation(inst, "warn") then
+    return  -- User cancelled due to rotation
 end
 
 -- ============================================
--- PROFILE STORAGE HELPERS
+-- TOOL CHECK (using ProbeLib)
 -- ============================================
-local function ProfileGetInt(section, key, default)
-    local strValue = mc.mcProfileGetString(inst, section, key, tostring(default))
-    return tonumber(strValue) or default
-end
-
-local function ProfileSetInt(section, key, value)
-    return mc.mcProfileWriteString(inst, section, key, tostring(value))
+if not ProbeLib.Core.ActivateProbeTool(inst) then
+    return  -- User cancelled tool activation
 end
 
 -- ============================================
--- LOAD SAVED SETTINGS
+-- PROBE PRECHECK
 -- ============================================
-local lastAction = ProfileGetInt("ProbeZ", "ActionMode", 1)
+if not ProbeLib.Safety.EnsureProbeNotTripped(inst) then
+    return  -- Probe is stuck triggered
+end
+
+-- ============================================
+-- LOAD SAVED SETTINGS (using ProbeLib)
+-- ============================================
+local settings = SystemLib.Storage.CreateSettings(inst, "ProbeZ", {
+    ActionMode = 1
+})
+
+local lastAction = settings:getInt("ActionMode", 1)
 
 -- ============================================
 -- CREATE DIALOG
@@ -130,22 +68,10 @@ if app then
     if ok and top then parent = top end
 end
 
--- Dialog dimensions (compact)
-local dlgW, dlgH = 300, 200
-local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
-local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
-local posX = math.floor((sw - dlgW) / 2)
-local posY = math.floor((sh - dlgH) / 2)
-
--- Create main dialog
-local dlg = wx.wxDialog(parent, wx.wxID_ANY,
-    "Probe -Z Setup",
-    wx.wxPoint(posX, posY), wx.wxSize(dlgW, dlgH),
-    wx.wxDEFAULT_DIALOG_STYLE)
-
--- Main panel
-local panel = wx.wxPanel(dlg, wx.wxID_ANY)
-local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+-- Create resizable dialog with saved geometry
+local dlg, panel, mainSizer = UILib.ResizableDialog.CreateWithPanel(
+    parent, "Probe -Z Setup", "ZProbeDialog", 300, 200
+)
 
 -- Declare UI elements
 local instructText, datumText
@@ -161,22 +87,23 @@ instructText:SetFont(wx.wxFont(9, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL
 datumText = wx.wxStaticText(panel, wx.wxID_ANY, "")
 datumText:SetFont(wx.wxFont(9, wx.wxFONTFAMILY_DEFAULT, wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL))
 
-local actionChoices = {"Set Datum", "Print Coords"}
-actionRadio = wx.wxRadioBox(panel, wx.wxID_ANY,
-    "Action", wx.wxDefaultPosition, wx.wxDefaultSize,
-    actionChoices, 2, wx.wxRA_SPECIFY_COLS)
-actionRadio:SetSelection(lastAction - 1)
+actionRadio = UILib.Controls.ActionRadio(panel, lastAction - 1)
 
 -- Function to update datum description
 local function UpdateDatumDescription()
     local action = actionRadio:GetSelection() + 1
     
-    local description = ""
+    -- Use library function for consistent formatting
+    local axes = {z = true}  -- Only Z axis for this probe
+    local description = ProbeLib.UI.DatumSummary(action, axes)
+    
+    -- Add more detailed description
     if action == 1 then  -- Set Datum
-        description = "Datum will be set to:\n• Z0 at surface\n• X Y unchanged"
+        description = description .. "\n• Z0 at surface\n• X Y unchanged"
     else  -- Print Coords
-        description = "Will print coordinates of:\n• Surface (machine Z)\n• Surface (work Z)"
+        description = description .. "\n• Surface (machine Z)\n• Surface (work Z)"
     end
+    
     datumText:SetLabel(description)
     panel:Layout()
 end
@@ -229,7 +156,7 @@ if dlg:ShowModal() == wx.wxID_OK then
     local actionSel = actionRadio:GetSelection() + 1
     
     -- Save settings
-    ProfileSetInt("ProbeZ", "ActionMode", actionSel)
+    settings:setInt("ActionMode", actionSel)
     
     dlg:Destroy()
     
@@ -237,18 +164,8 @@ if dlg:ShowModal() == wx.wxID_OK then
     -- MAIN PROBE EXECUTION WITH CLEANUP
     -- ============================================
     local function ExecuteZProbe()
-        -- Save state BEFORE any operations
-        local startState = {
-            -- Machine positions for movements
-            machX = mc.mcAxisGetMachinePos(inst, 0),
-            machY = mc.mcAxisGetMachinePos(inst, 1),
-            machZ = mc.mcAxisGetMachinePos(inst, 2),
-            
-            -- Work positions for display only
-            workX = mc.mcAxisGetPos(inst, mc.X_AXIS),
-            workY = mc.mcAxisGetPos(inst, mc.Y_AXIS),
-            workZ = mc.mcAxisGetPos(inst, mc.Z_AXIS)
-        }
+        -- Capture complete machine state using new ProbeLib function
+        local startState = ProbeLib.Core.CaptureState(inst)
         
         -- Main probe sequence variables
         local success = false
@@ -257,26 +174,8 @@ if dlg:ShowModal() == wx.wxID_OK then
         
         -- Cleanup function that ALWAYS runs
         local function ProbeCleanup()
-            -- Clear sentinel mode flag if it was set
-            mc.mcCntlSetPoundVar(inst, 388, 0)
-            
-            -- Clear probe latch
-            pcall(mc.mcCntlGcodeExecuteWait, inst, "G31.2")
-            
-            -- Clear runtime variables
-            mc.mcCntlSetPoundVar(inst, 389, -1e308)
-            mc.mcCntlSetPoundVar(inst, 390, -1e308)
-            mc.mcCntlSetPoundVar(inst, 391, -1e308)
-            mc.mcCntlSetPoundVar(inst, 394, -1e308)
-            
-            -- Report status
-            if not success then
-                if errorMsg then
-                    mc.mcCntlSetLastError(inst, "Z probe failed: " .. errorMsg)
-                else
-                    mc.mcCntlSetLastError(inst, "Z probe failed - see previous error")
-                end
-            end
+            -- Use ProbeLibrary cleanup
+            ProbeLib.Cleanup.Standard(inst, success, errorMsg)
             -- Success messages are handled by Set Datum or Print Coords modes
         end
         
@@ -324,38 +223,16 @@ if dlg:ShowModal() == wx.wxID_OK then
                     -- Silent fail on logging errors
                 end
                 
-                -- Get probe parameters from pound variables
-                local fastFeed = mc.mcCntlGetPoundVar(inst, 303)
-                local slowFeed = mc.mcCntlGetPoundVar(inst, 304)
-                local maxTravel = mc.mcCntlGetPoundVar(inst, 305)
-                
-                -- Validate and set defaults
-                if type(fastFeed) ~= "number" or fastFeed <= 0 then fastFeed = 30 end
-                if type(slowFeed) ~= "number" or slowFeed <= 0 then slowFeed = 5 end
-                if type(maxTravel) ~= "number" or maxTravel <= 0 then maxTravel = 1.0 end
+                -- Get validated probe parameters using new ProbeLib function
+                local params = ProbeLib.Core.GetProbeParameters(inst)
                 
                 -- No status message before probing
                 
-                -- Enable sentinel mode for M311
-                mc.mcCntlSetPoundVar(inst, 388, 1)  -- Set sentinel mode flag
-                
-                -- Set sentinel values before probe
-                mc.mcCntlSetPoundVar(inst, 389, SENTINEL_VALUE)
-                mc.mcCntlSetPoundVar(inst, 390, SENTINEL_VALUE)
-                mc.mcCntlSetPoundVar(inst, 391, SENTINEL_VALUE)
-                mc.mcCntlSetPoundVar(inst, 392, SENTINEL_VALUE)
-                mc.mcCntlSetPoundVar(inst, 394, SENTINEL_VALUE)
-                
-                -- Execute Z probe using S5 M311 (probe -Z direction)
+                -- Execute Z probe using ProbeLib (S5 = probe -Z direction)
                 mc.mcCntlGcodeExecuteWait(inst, "G4 P0.1")  -- Small dwell to let system settle
-                local rc = mc.mcCntlGcodeExecuteWait(inst, "S5 M311")
+                local success, surfaceWorkZ, surfaceMachZ = ProbeLib.Movement.ExecuteProbe(inst, 5, "Z surface")
                 
-                -- Clear sentinel mode flag (M311 should do this but be explicit)
-                mc.mcCntlSetPoundVar(inst, 388, 0)
-                
-                -- Check for probe failure using sentinel
-                local surfaceMachZ = mc.mcCntlGetPoundVar(inst, 389)  -- Machine coordinate
-                if surfaceMachZ == SENTINEL_VALUE or surfaceMachZ < -1e300 then
+                if not success then
                     local msg = string.format(
                         "Z PROBE FAILURE\n\n" ..
                         "The probe did not make contact within %.3f inches.\n\n" ..
@@ -364,14 +241,13 @@ if dlg:ShowModal() == wx.wxID_OK then
                         "• Surface is beyond probe travel distance\n" ..
                         "• Probe may be damaged or disconnected\n\n" ..
                         "The probe sequence has stopped.",
-                        maxTravel or 1.0)
+                        params.maxTravel)
                     
                     wx.wxMessageBox(msg, "Probe Failure", wx.wxOK + wx.wxICON_ERROR)
                     error("Z probe failed - no surface detected")
                 end
                 
-                -- Get the probed Z position (edge position from M311)
-                local surfaceWorkZ = mc.mcCntlGetPoundVar(inst, 391)
+                -- Validate results
                 if type(surfaceWorkZ) ~= "number" or surfaceWorkZ < -1e300 then
                     local msg = "Z PROBE ERROR\n\n" ..
                                 "Invalid surface position returned from probe.\n" ..
@@ -382,10 +258,10 @@ if dlg:ShowModal() == wx.wxID_OK then
                 end
                 
                 -- Log the Z probe
-                LogProbeEvent("S5 M311", startState.workX, startState.workY, surfaceWorkZ)
+                LogProbeEvent("S5 M311", startState.work.x, startState.work.y, surfaceWorkZ)
                 
                 -- Return to safe height after Z probe (using machine coordinates)
-                mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 Z%.4f", startState.machZ))
+                mc.mcCntlGcodeExecuteWait(inst, string.format("G53 G0 Z%.4f", startState.machine.z))
                 
                 -- Set datum or print results
                 if actionSel == 1 then  -- Set Datum
@@ -420,17 +296,9 @@ if dlg:ShowModal() == wx.wxID_OK then
                             datumMachZ = surfaceMachZ
                         end
                         
-                        -- Keep X and Y offsets unchanged (get current machine offsets)
-                        local currentXOffset = mc.mcCntlGetPoundVar(inst, offsets.x)
-                        local currentYOffset = mc.mcCntlGetPoundVar(inst, offsets.y)
-                        
-                        -- Set Z offset to surface using machine coordinates
-                        mc.mcCntlSetPoundVar(inst, offsets.z, datumMachZ)
-                        
-                        -- Force work offset update using G10 L20 (machine coordinates)
+                        -- Use library function for datum setting (only Z axis)
                         local offsetP = currentOffset - 53  -- G54=P1, G55=P2, etc.
-                        local g10Command = string.format("G10 L20 P%d Z%.4f", offsetP, datumMachZ)
-                        mc.mcCntlGcodeExecuteWait(inst, g10Command)
+                        ProbeLib.Core.ApplyOrPrint(inst, 1, {z = datumMachZ}, offsetP)
                         
                         -- Now activate the work offset
                         local gcode = string.format("G%d", currentOffset)
@@ -482,8 +350,15 @@ if dlg:ShowModal() == wx.wxID_OK then
         return success
     end
     
-    -- Execute with error handling
-    local success, result = pcall(ExecuteZProbe)
+    -- Execute with enhanced error handling and cleanup
+    local success, result = ProbeLib.Error.SafeExecute(
+        inst, 
+        ExecuteZProbe,
+        function(wasSuccess, errorMsg)
+            -- Cleanup function - always runs
+            ProbeLib.Cleanup.Standard(inst, wasSuccess, errorMsg)
+        end
+    )
     
     if not success then
         mc.mcCntlSetLastError(inst, "ERROR: " .. tostring(result))

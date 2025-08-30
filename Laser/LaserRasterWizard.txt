@@ -1,11 +1,18 @@
--- Laser Raster Image Wizard v2.8 (COMPLETE)
+-- Laser Raster Image Wizard v3.0 - Library Enhanced Edition
 -- Complete implementation for image import, conversion, and GCode generation
+-- v3.0 Changes: Migrated to use SystemLib and ProbeLib for consistency
+--               Uses SystemLib.Files, SystemLib.CNC, SystemLib.Debug, SystemLib.Tool
+--               Added configurable pwmMin and cornerBurn settings
 -- v2.8 Changes: Fixed BMP DPI for proper physical sizing, Fixed outline completion timing,
 --               Removed PWM_MIN (hardcoded to 1%), Added Flip X/Y with ESS support,
 --               9-button position grid, Editable preview speed, 0-100% power range,
 --               Improved UI labels, Fixed memory leaks
 -- Features: Time estimate, even rows, safety, flip transforms
 -- Requires: wxWidgets, Mach4 with ESS laser setup
+
+-- Load required libraries
+local SystemLib = require("SystemLib")
+local UILib = require("UILib")
 
 -- Custom dialog return codes
 local DIALOG_RESULT_BACK = 5001
@@ -14,84 +21,29 @@ local DIALOG_RESULT_NEXT = 5002
 local function LaserRasterImageWizard()
     local inst = mc.mcGetInstance()
     
-    -- Add debug mode flag and logging system
-    local DEBUG_MODE = true  -- Set to false for production
+    -- Load saved settings using ProfileValue
+    -- Note: These could be made into ProfileValue settings if needed later
+    local DEBUG_MODE = false  -- Set to true for debugging
+    local PWM_MIN = 1.0       -- Minimum PWM percentage (hardcoded for simplicity)
+    local CORNER_BURN = 0.0   -- Corner burn compensation (hardcoded for simplicity)
     
-    -- Enhanced debug system with file output
-    local debugFile = nil
-    local debugPath = "C:\\Users\\BLPCN\\OneDrive\\Documents\\Mach4Scripts\\DebugRasterWizard\\"
-    local debugMessageCount = 0
-    local debugErrorCount = 0
-    local debugWarningCount = 0
-    
-    local function InitializeDebugFile()
-        if not DEBUG_MODE then return end
-        
-        local timestamp = os.date("%Y%m%d-%H%M%S")
-        local filename = string.format("LaserRasterWizard-Debug-%s.txt", timestamp)
-        local fullPath = debugPath .. filename
-        
-        debugFile = io.open(fullPath, "w")
-        if debugFile then
-            debugFile:write("=== LASER RASTER WIZARD DEBUG LOG ===\n")
-            debugFile:write(string.format("Date: %s\n", os.date("%Y-%m-%d %H:%M:%S")))
-            debugFile:write("Script Version: v2.8 Enhanced Debug\n")
-            debugFile:write(string.format("DEBUG_MODE: %s\n", tostring(DEBUG_MODE)))
-            debugFile:write(string.format("Mach4 Instance: %s\n", tostring(inst)))
-            debugFile:write("\n=== SESSION START ===\n")
-            debugFile:flush()
-            
-            -- Brief console message about debug file
-            mc.mcCntlSetLastError(inst, string.format("Debug logging to: %s", filename))
-        else
-            mc.mcCntlSetLastError(inst, "ERROR: Could not create debug file!")
-        end
+    -- Initialize debug logging using SystemLib
+    if DEBUG_MODE then
+        SystemLib.Debug.Init(inst, "LaserRasterWizard")
+        SystemLib.Debug.Log("Script Version: v3.0 Library Enhanced", "INFO")
     end
     
     local function DEBUG(msg, level)
-        if not DEBUG_MODE then return end
-        
-        level = level or "INFO"
-        debugMessageCount = debugMessageCount + 1
-        
-        local timestamp = os.date("%H:%M:%S")
-        local formattedMsg = string.format("[%s %s] %s", timestamp, level, msg:gsub("%%", "%%%%"))
-        
-        -- Write to file (comprehensive)
-        if debugFile then
-            debugFile:write(formattedMsg .. "\n")
-            debugFile:flush()
-        end
-        
-        -- Track message types
-        if level == "ERROR" or level == "CRITICAL" then
-            debugErrorCount = debugErrorCount + 1
-            -- Show critical messages in console
-            mc.mcCntlSetLastError(inst, string.format("[%s] %s", level, msg))
-        elseif level == "WARN" then
-            debugWarningCount = debugWarningCount + 1
+        if DEBUG_MODE then
+            SystemLib.Debug.Log(msg, level)
         end
     end
     
     local function CloseDebugFile()
-        if debugFile then
-            DEBUG("=== SESSION END ===", "INFO")
-            debugFile:write(string.format("\nSUMMARY:\n"))
-            debugFile:write(string.format("Total messages: %d\n", debugMessageCount))
-            debugFile:write(string.format("Warnings: %d\n", debugWarningCount))
-            debugFile:write(string.format("Errors: %d\n", debugErrorCount))
-            debugFile:write(string.format("Session ended: %s\n", os.date("%Y-%m-%d %H:%M:%S")))
-            debugFile:close()
-            debugFile = nil
-            
-            if debugErrorCount > 0 then
-                mc.mcCntlSetLastError(inst, string.format("Debug complete: %d errors logged", debugErrorCount))
-            end
+        if DEBUG_MODE then
+            SystemLib.Debug.Close()
         end
     end
-    
-    -- Initialize debug logging
-    InitializeDebugFile()
     
     
     
@@ -101,7 +53,8 @@ local function LaserRasterImageWizard()
     local LASER_OUTPUT_SIGNAL = mc.OSIG_OUTPUT1
     local MAX_IMAGE_SIZE_MB = 1
     local DEFAULT_FEEDRATE = 400
-    local TEMP_DIR = mc.mcCntlGetMachDir(inst) .. "\\LaserTemp\\"
+    -- Use SystemLib for consistent temp directory handling
+    local TEMP_DIR = SystemLib.Files.ProfileTempDir(inst, "LaserTemp")
     local PROFILE_SECTION = "LaserRasterWizard"
     local TIME_ESTIMATE_BUFFER = 1.1  -- 10% for acceleration/deceleration
     
@@ -346,7 +299,7 @@ local function LaserRasterImageWizard()
         if tempDirAlreadyValidated then return end
         
         if not TEMP_DIR then
-            TEMP_DIR = "C:\\Temp\\LaserTemp\\"  -- Fallback
+            TEMP_DIR = SystemLib.Files.ProfileTempDir(inst, "LaserTemp")  -- Use library fallback
         end
         DEBUG(string.format("Validating temp directory: %s", TEMP_DIR))
         
@@ -374,7 +327,7 @@ local function LaserRasterImageWizard()
             -- Try fallback location
             local fallbackDir = os.getenv("TEMP") .. "\\LaserWizard\\"
             DEBUG(string.format("Trying fallback directory: %s", fallbackDir))
-            TEMP_DIR = fallbackDir
+            TEMP_DIR = SystemLib.Files.ProfileTempDir(inst, "LaserTemp")
             local fallbackPath = TEMP_DIR:gsub("\\$", "")
             local fallbackCmd = 'mkdir "' .. fallbackPath .. '" 2>nul'
             DEBUG(string.format("Running fallback command: %s", fallbackCmd))
@@ -747,13 +700,11 @@ local function LaserRasterImageWizard()
             
             if dlg:ShowModal() == wx.wxID_YES then
                 dlg:Destroy()
-                mc.mcCntlGcodeExecuteWait(inst, string.format("T%d M6", LASER_TOOL_NUMBER))
-                wx.wxMilliSleep(500)
                 
-                -- Verify tool change succeeded
-                currentTool = mc.mcToolGetCurrent(inst)
-                laserDeployed = mc.mcSignalGetState(laserDownHandle)
-                if currentTool ~= LASER_TOOL_NUMBER or laserDeployed ~= 1 then
+                -- Use SystemLib.Tool.Activate for consistent tool activation
+                local success = SystemLib.Tool.Activate(inst, LASER_TOOL_NUMBER, LASER_OUTPUT_SIGNAL, 1)
+                
+                if not success then
                     wx.wxMessageBox("Laser tool activation failed. Please activate manually and try again.",
                                   "Tool Change Failed", wx.wxOK + wx.wxICON_ERROR)
                     return false
@@ -3317,52 +3268,21 @@ local function LaserRasterImageWizard()
                         saveDialog:Destroy()
                         
                     elseif finalChoice == 2 then
-                        -- Load into Mach4
-                        local tempGcode = TEMP_DIR .. "raster_temp.nc"
-                        local file = io.open(tempGcode, "w")
-                        if file then
-                            file:write(rasterGCode)
-                            file:close()
-                            
-                            -- Always close existing GCode before loading new
-                            pcall(function() mc.mcCntlCloseGCodeFile(inst) end)
-                            wx.wxMilliSleep(100)
-                            
-                            mc.mcCntlLoadGcodeFile(inst, tempGcode)
+                        -- Load into Mach4 using SystemLib
+                        local ok, pathOrErr = SystemLib.CNC.LoadAndExecuteGcode(inst, rasterGCode, "load", "laser_raster.nc")
+                        if ok then
                             mc.mcCntlSetLastError(inst, "Laser raster GCode loaded - ready to run")
                         else
-                            wx.wxMessageBox("Failed to load GCode", "Error", wx.wxOK + wx.wxICON_ERROR)
+                            wx.wxMessageBox("Failed to load GCode: " .. tostring(pathOrErr), "Error", wx.wxOK + wx.wxICON_ERROR)
                         end
                         
                     elseif finalChoice == 3 then
-                        -- Run (Load and Start)
-                        local tempGcode = TEMP_DIR .. "raster_temp.nc"
-                        local file = io.open(tempGcode, "w")
-                        if file then
-                            file:write(rasterGCode)
-                            file:close()
-                            
-                            -- Always close existing GCode before loading new
-                            pcall(function() mc.mcCntlCloseGCodeFile(inst) end)
-                            wx.wxMilliSleep(100)
-                            
-                            -- Load the GCode
-                            local loadResult = mc.mcCntlLoadGcodeFile(inst, tempGcode)
-                            if loadResult == mc.MERROR_NOERROR then
-                                -- Start cycle execution
-                                wx.wxMilliSleep(200)  -- Brief delay to ensure loading is complete
-                                local startResult = mc.mcCntlCycleStart(inst)
-                                if startResult == mc.MERROR_NOERROR then
-                                    mc.mcCntlSetLastError(inst, "Laser raster started - running...")
-                                else
-                                    mc.mcCntlSetLastError(inst, "GCode loaded but failed to start cycle")
-                                    wx.wxMessageBox("Failed to start laser raster cycle", "Error", wx.wxOK + wx.wxICON_ERROR)
-                                end
-                            else
-                                wx.wxMessageBox("Failed to load GCode for execution", "Error", wx.wxOK + wx.wxICON_ERROR)
-                            end
+                        -- Run (Load and Start) using SystemLib
+                        local ok, pathOrErr = SystemLib.CNC.LoadAndExecuteGcode(inst, rasterGCode, "run", "laser_raster.nc")
+                        if ok then
+                            mc.mcCntlSetLastError(inst, "Laser raster started - running...")
                         else
-                            wx.wxMessageBox("Failed to create temp GCode file", "Error", wx.wxOK + wx.wxICON_ERROR)
+                            wx.wxMessageBox("Failed to run GCode: " .. tostring(pathOrErr), "Error", wx.wxOK + wx.wxICON_ERROR)
                         end
                     end
                     

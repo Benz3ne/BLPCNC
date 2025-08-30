@@ -290,7 +290,7 @@ function ToolLib.requestDeploy(inst, toolNum)
     
     -- Handle G68 rotation if active
     local g68Active = (getPV(inst, 4016, 69) == 68)
-    if g68Active and SystemLib and SystemLib.G68 then
+    if g68Active then
         -- Store current G68 state before applying offset
         local currentX = getPV(inst, 1245, 0)  -- G68 X center
         local currentY = getPV(inst, 1246, 0)  -- G68 Y center

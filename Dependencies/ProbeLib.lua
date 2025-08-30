@@ -915,6 +915,99 @@ function ProbeLib.Logging.LogEvent(inst, probeType, x, y, z, details)
     return true
 end
 
+-- Log probe error with detailed context
+-- Parameters:
+--   inst: Mach4 instance
+--   operation: Operation that failed
+--   error: Error message
+--   context: Optional context table with additional info
+function ProbeLib.Logging.LogError(inst, operation, error, context)
+    local details = string.format("ERROR: %s", error)
+    
+    if context then
+        local contextParts = {}
+        for k, v in pairs(context) do
+            table.insert(contextParts, string.format("%s=%s", k, tostring(v)))
+        end
+        details = details .. " [" .. table.concat(contextParts, ", ") .. "]"
+    end
+    
+    -- Log to CSV
+    ProbeLib.Logging.LogEvent(inst, operation, nil, nil, nil, details)
+    
+    -- Also log to Mach4 error log
+    mc.mcCntlSetLastError(inst, string.format("PROBE ERROR - %s: %s", operation, error))
+end
+
+-- Create diagnostic report for troubleshooting
+-- Parameters:
+--   inst: Mach4 instance
+-- Returns:
+--   String with diagnostic information
+function ProbeLib.Logging.GenerateDiagnostics(inst)
+    local lines = {
+        "=== Probe Diagnostics ===",
+        string.format("Generated: %s", os.date("%Y-%m-%d %H:%M:%S")),
+        "",
+        "-- Tool Status --"
+    }
+    
+    -- Tool information
+    local currentTool = mc.mcToolGetCurrent(inst)
+    local probeDeployed = mc.mcSignalGetState(mc.mcSignalGetHandle(inst, mc.OSIG_OUTPUT7))
+    local probeTriggered = mc.mcSignalGetState(mc.mcSignalGetHandle(inst, mc.ISIG_PROBE1))
+    
+    table.insert(lines, string.format("Current Tool: T%d", currentTool))
+    table.insert(lines, string.format("Probe Deployed: %s", probeDeployed == 1 and "Yes" or "No"))
+    table.insert(lines, string.format("Probe Triggered: %s", probeTriggered == 1 and "Yes" or "No"))
+    
+    -- Position information
+    table.insert(lines, "")
+    table.insert(lines, "-- Position --")
+    
+    local state = ProbeLib.Core.CaptureState(inst)
+    table.insert(lines, string.format("Machine: X%.4f Y%.4f Z%.4f",
+                                     state.machine.x, state.machine.y, state.machine.z))
+    table.insert(lines, string.format("Work: X%.4f Y%.4f Z%.4f",
+                                     state.work.x, state.work.y, state.work.z))
+    
+    -- Probe parameters
+    table.insert(lines, "")
+    table.insert(lines, "-- Probe Parameters --")
+    
+    local params = ProbeLib.Core.GetProbeParameters(inst)
+    table.insert(lines, string.format("Tip Diameter: %.4f", params.tipDiameter))
+    table.insert(lines, string.format("Fast Feed: %.1f", params.fastFeed))
+    table.insert(lines, string.format("Slow Feed: %.1f", params.slowFeed))
+    table.insert(lines, string.format("Max Travel: %.4f", params.maxTravel))
+    
+    -- Work offset
+    table.insert(lines, "")
+    table.insert(lines, "-- Work Offset --")
+    
+    local offset, vars = ProbeLib.WorkOffset.GetCurrent(inst)
+    table.insert(lines, string.format("Active: G%d", offset))
+    
+    -- Soft limits
+    table.insert(lines, "")
+    table.insert(lines, "-- Soft Limits --")
+    
+    for axis = 0, 2 do
+        local axisName = ({"X", "Y", "Z"})[axis + 1]
+        local enabled = mc.mcSoftLimitGetState(inst, axis) == 1
+        
+        if enabled then
+            local min = mc.mcAxisGetSoftlimitMin(inst, axis)
+            local max = mc.mcAxisGetSoftlimitMax(inst, axis)
+            table.insert(lines, string.format("%s: %.4f to %.4f", axisName, min, max))
+        else
+            table.insert(lines, string.format("%s: Disabled", axisName))
+        end
+    end
+    
+    return table.concat(lines, "\n")
+end
+
 -- ============================================
 -- UI MODULE - UI utilities
 -- ============================================

@@ -924,6 +924,12 @@ function RetractVirtualTool()
 end
 _G.RetractVirtualTool = RetractVirtualTool
 
+--[[
+============================================
+***** MARKED FOR DELETION *****
+This is the OLD pound variable implementation that's been replaced by ToolLib
+107 lines of orphaned code - DO NOT USE
+============================================
 -- Original function replaced with ToolLib wrapper
 -- ToolLib now handles all virtual tool state management
 local function RetractVirtualTool_REPLACED()
@@ -1033,6 +1039,7 @@ local function RetractVirtualTool_REPLACED()
     
     return true  -- Successfully retracted
 end
+]]--
 
 
 

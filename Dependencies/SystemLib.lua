@@ -687,6 +687,160 @@ function SystemLib.Laser.EmergencyShutoff(inst)
 end
 
 -- =======================
+-- Settings Module - Profile settings management
+-- =======================
+SystemLib.Settings = {}
+
+-- Create a settings manager for a profile section
+-- This eliminates the need for individual ProfileGetInt/Float functions
+-- Parameters:
+--   inst: Mach4 instance
+--   sectionName: Profile section name
+-- Returns:
+--   Settings manager object with get/set methods
+function SystemLib.Settings.CreateManager(inst, sectionName)
+    local manager = {
+        inst = inst,
+        section = sectionName,
+        cache = {},
+        dirty = false
+    }
+    
+    -- Get integer value with validation
+    function manager:getInt(key, default)
+        -- Check cache first
+        if self.cache[key] ~= nil then
+            return self.cache[key]
+        end
+        
+        -- Read from profile
+        local strValue = mc.mcProfileGetString(self.inst, self.section, key, "")
+        
+        if strValue == "" then
+            self.cache[key] = default
+            return default
+        end
+        
+        local value = tonumber(strValue)
+        if not value then
+            mc.mcCntlSetLastError(self.inst, 
+                string.format("WARNING: Invalid integer for %s.%s, using %d", 
+                             self.section, key, default))
+            value = default
+        end
+        
+        self.cache[key] = value
+        return value
+    end
+    
+    -- Get float value with validation
+    function manager:getFloat(key, default)
+        -- Check cache first
+        if self.cache[key] ~= nil then
+            return self.cache[key]
+        end
+        
+        -- Read from profile
+        local strValue = mc.mcProfileGetString(self.inst, self.section, key, "")
+        
+        if strValue == "" then
+            self.cache[key] = default
+            return default
+        end
+        
+        local value = tonumber(strValue)
+        if not value then
+            mc.mcCntlSetLastError(self.inst, 
+                string.format("WARNING: Invalid float for %s.%s, using %.4f", 
+                             self.section, key, default))
+            value = default
+        end
+        
+        self.cache[key] = value
+        return value
+    end
+    
+    -- Get string value
+    function manager:getString(key, default)
+        if self.cache[key] ~= nil then
+            return self.cache[key]
+        end
+        
+        local value = mc.mcProfileGetString(self.inst, self.section, key, default or "")
+        self.cache[key] = value
+        return value
+    end
+    
+    -- Get boolean value
+    function manager:getBool(key, default)
+        local strValue = self:getString(key, default and "1" or "0")
+        return strValue == "1" or strValue == "true"
+    end
+    
+    -- Set integer value
+    function manager:setInt(key, value)
+        self.cache[key] = value
+        self.dirty = true
+        return mc.mcProfileWriteString(self.inst, self.section, key, tostring(value))
+    end
+    
+    -- Set float value
+    function manager:setFloat(key, value)
+        self.cache[key] = value
+        self.dirty = true
+        return mc.mcProfileWriteString(self.inst, self.section, key, string.format("%.6f", value))
+    end
+    
+    -- Set string value
+    function manager:setString(key, value)
+        self.cache[key] = value
+        self.dirty = true
+        return mc.mcProfileWriteString(self.inst, self.section, key, value)
+    end
+    
+    -- Set boolean value
+    function manager:setBool(key, value)
+        return self:setString(key, value and "1" or "0")
+    end
+    
+    -- Clear cache to force re-read
+    function manager:clearCache()
+        self.cache = {}
+        self.dirty = false
+    end
+    
+    -- Save all cached values (batch write)
+    function manager:flush()
+        if not self.dirty then
+            return
+        end
+        
+        for key, value in pairs(self.cache) do
+            local strValue
+            if type(value) == "boolean" then
+                strValue = value and "1" or "0"
+            elseif type(value) == "number" then
+                strValue = string.format("%.6f", value)
+            else
+                strValue = tostring(value)
+            end
+            
+            mc.mcProfileWriteString(self.inst, self.section, key, strValue)
+        end
+        
+        self.dirty = false
+        mc.mcProfileFlush(self.inst)
+    end
+    
+    return manager
+end
+
+-- Quick helper to get a settings manager for common probe settings
+function SystemLib.Settings.GetProbeSettings(inst, scriptName)
+    return SystemLib.Settings.CreateManager(inst, scriptName or "ProbeSettings")
+end
+
+-- =======================
 -- Module Return
 -- =======================
 return SystemLib

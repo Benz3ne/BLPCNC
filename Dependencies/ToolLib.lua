@@ -519,29 +519,69 @@ end
 ToolLib.G68 = {
     -- Clear any stored G68 state tracking
     ClearState = function(inst)
-        -- TODO: Clear G68 tracking variables
-        -- Should reset #440-443 (G68_STORED_X/Y/R and G68_NEEDS_RESTORE)
-        -- This is called when starting fresh with a virtual tool
+        -- Clear G68 tracking variables (#440-443)
+        mc.mcCntlSetPoundVar(inst, 440, 0)  -- G68_STORED_X
+        mc.mcCntlSetPoundVar(inst, 441, 0)  -- G68_STORED_Y
+        mc.mcCntlSetPoundVar(inst, 442, 0)  -- G68_STORED_R
+        mc.mcCntlSetPoundVar(inst, 443, 0)  -- G68_NEEDS_RESTORE flag
     end,
     
     -- Store current G68 state before removing virtual tool offsets
     StoreState = function(inst, xDelta, yDelta)
-        -- TODO: Implementation needed
-        -- 1. Check if G68 is active (pound var #4016 == 68)
-        -- 2. If active, store current G68 center (vars #1245, #1246) and rotation (#1247)
-        -- 3. Calculate how the center needs to adjust when offsets are removed
-        -- 4. Store this info in pound vars #440-443
-        -- 5. Return true if G68 adjustment will be needed
-        return false  -- For now, indicate no adjustment needed
+        -- Check if G68 is active (pound var #4016 == 68 means G68 is active)
+        local g68Active = mc.mcCntlGetPoundVar(inst, 4016)
+        if g68Active ~= 68 then
+            return false  -- G68 not active, no adjustment needed
+        end
+        
+        -- Store current G68 center and rotation
+        local currentX = mc.mcCntlGetPoundVar(inst, 1245)  -- G68 X center
+        local currentY = mc.mcCntlGetPoundVar(inst, 1246)  -- G68 Y center
+        local currentR = mc.mcCntlGetPoundVar(inst, 1247)  -- G68 rotation angle
+        
+        -- Store these values for later restoration
+        mc.mcCntlSetPoundVar(inst, 440, currentX)  -- Store original X
+        mc.mcCntlSetPoundVar(inst, 441, currentY)  -- Store original Y
+        mc.mcCntlSetPoundVar(inst, 442, currentR)  -- Store rotation
+        mc.mcCntlSetPoundVar(inst, 443, 1)         -- Set restore flag
+        
+        -- Return true to indicate G68 adjustment will be needed
+        return true
     end,
     
     -- Restore original G68 state after virtual tool offsets removed
     RestoreState = function(inst)
-        -- TODO: Implementation needed
-        -- 1. Check if G68 restoration is needed (pound var #443)
-        -- 2. If needed, restore the original G68 center and rotation from #440-442
-        -- 3. This maintains the rotation point relative to the workpiece
-        -- 4. Clear the restoration flag
+        -- Check if G68 restoration is needed
+        local needsRestore = mc.mcCntlGetPoundVar(inst, 443)
+        if needsRestore ~= 1 then
+            return  -- No restoration needed
+        end
+        
+        -- Get stored G68 state
+        local storedX = mc.mcCntlGetPoundVar(inst, 440)  -- Original X center
+        local storedY = mc.mcCntlGetPoundVar(inst, 441)  -- Original Y center
+        local storedR = mc.mcCntlGetPoundVar(inst, 442)  -- Original rotation
+        
+        -- Restore the original G68 center and rotation
+        mc.mcCntlGcodeExecuteWait(inst, string.format("G68 X%.4f Y%.4f R%.4f", 
+            storedX, storedY, storedR))
+        
+        -- Clear the restoration flag
+        mc.mcCntlSetPoundVar(inst, 443, 0)
+    end,
+    
+    -- Get current G68 state (helper function for debugging)
+    GetState = function(inst)
+        return {
+            active = mc.mcCntlGetPoundVar(inst, 4016) == 68,
+            currentX = mc.mcCntlGetPoundVar(inst, 1245),
+            currentY = mc.mcCntlGetPoundVar(inst, 1246),
+            currentR = mc.mcCntlGetPoundVar(inst, 1247),
+            storedX = mc.mcCntlGetPoundVar(inst, 440),
+            storedY = mc.mcCntlGetPoundVar(inst, 441),
+            storedR = mc.mcCntlGetPoundVar(inst, 442),
+            needsRestore = mc.mcCntlGetPoundVar(inst, 443) == 1
+        }
     end
 }
 

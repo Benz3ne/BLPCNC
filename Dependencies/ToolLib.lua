@@ -533,13 +533,36 @@ function ToolLib.recover(inst)
             mc.mcSignalSetState(S.handles.laser, 0)
         end
         
-        -- Clear G52 offset
-        mc.mcCntlGcodeExecuteWait(inst, "G52 X0 Y0")
+        -- Get stored deltas for possible restoration
+        local xDelta = getPV(inst, PV.X_DELTA, 0)
+        local yDelta = getPV(inst, PV.Y_DELTA, 0)
+        
+        -- Try to restore work offsets if deltas are valid
+        if xDelta > -1e300 and yDelta > -1e300 and math.abs(xDelta) < MAX_OFFSET and math.abs(yDelta) < MAX_OFFSET then
+            -- POUND VARIABLE METHOD: Attempt to restore work offsets
+            for i = 0, 5 do
+                local baseVar = 5221 + (i * 20)  -- G54=#5221, G55=#5241, etc.
+                local currentX = getPV(inst, baseVar, 0)
+                local currentY = getPV(inst, baseVar + 1, 0)
+                
+                if currentX and currentY and currentX > -1e300 and currentY > -1e300 then
+                    if math.abs(currentX) < 1000 and math.abs(currentY) < 1000 then
+                        -- Restore offset: add back to work coordinates
+                        setPV(inst, baseVar, currentX + xDelta)
+                        setPV(inst, baseVar + 1, currentY + yDelta)
+                    end
+                end
+            end
+            pushLog("Work offsets restored during recovery")
+        else
+            pushLog("WARNING: Cannot restore work offsets - deltas invalid or corrupted")
+        end
         
         -- Clear G68 if it was being managed
         if getPV(inst, PV.G68_NEEDS_RESTORE, 0) == 1 then
             mc.mcCntlGcodeExecuteWait(inst, "G69")
             setPV(inst, PV.G68_NEEDS_RESTORE, 0)
+            pushLog("G68 cleared during recovery")
         end
         
         -- Clear state
@@ -550,7 +573,7 @@ function ToolLib.recover(inst)
         mc.mcToolSetCurrent(inst, 0)
         mc.mcCntlGcodeExecuteWait(inst, "G49")
         
-        return true, "Virtual tool cleared, G52 reset"
+        return true, "Virtual tool cleared, work offsets restored if possible"
     end
     
     return false, "No recovery needed"

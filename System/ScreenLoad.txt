@@ -131,6 +131,12 @@ SigLib = {
                 RetractVirtualTool()  -- This properly handles outputs and offsets
                 mc.mcCntlSetLastError(inst, "Virtual tool retracted after recovery")
             else
+                --[[
+                ============================================
+                ***** MARKED FOR DELETION *****
+                Orphaned fallback code - ToolLib handles this properly
+                This incomplete fallback doesn't restore work offsets
+                ============================================
                 -- Fallback if global function missing
                 -- Just clear the state, outputs already turned off in disable
                 mc.mcCntlSetPoundVar(inst, 406, 0)  -- Clear virtual tool state
@@ -139,6 +145,8 @@ SigLib = {
                 mc.mcToolSetCurrent(inst, 0)
                 mc.mcCntlGcodeExecuteWait(inst, "G49")
                 mc.mcCntlSetLastError(inst, "WARNING: Virtual tool state cleared (RetractVirtualTool not found)")
+                ]]--
+                mc.mcCntlSetLastError(inst, "ERROR: RetractVirtualTool function not found - check ToolLib!")
             end
         end
         

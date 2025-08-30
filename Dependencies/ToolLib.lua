@@ -1,4 +1,4 @@
-﻿-- ToolLib.lua v1.0
+-- ToolLib.lua v1.0
 -- Single owner of tool-related outputs and state
 -- Manages physical tools, virtual tools, and tool change operations
 
@@ -95,10 +95,83 @@ end
 
 -- Check if machine is in safe state for modal changes
 local function isSafeForModalChange(inst)
-    -- Only block during program execution; allow changes while axes move
-    if mc.mcCntlIsInCycle(inst) == 1 then
+    -- Check if in cycle
+    local inCycle = mc.mcCntlIsInCycle(inst)
+    if inCycle == 1 then
+        mc.mcCntlSetLastError(inst, "DEBUG: In cycle check failed - mcCntlIsInCycle=1")
         return false, "Cannot change modes during program execution"
     end
+    
+    -- State check removed - it's useless since M6 always runs as state 200 (macro)
+    -- The important checks are: not in cycle and axes not moving
+    
+    -- Check for axis motion
+    for axis = 0, 5 do
+        if mc.mcAxisIsEnabled(inst, axis) == 1 then
+            local vel = mc.mcAxisGetVel(inst, axis)
+            if math.abs(vel) > 0.001 then
+                local axisName = ({"X","Y","Z","A","B","C"})[axis + 1]
+                mc.mcCntlSetLastError(inst, string.format("DEBUG: Axis %s in motion - vel=%.4f", axisName, vel))
+                return false, string.format("Axes in motion (%s vel=%.4f)", axisName, vel)
+            end
+        end
+    end
+    
+    return true
+end
+
+-- Get virtual tool configuration
+local function getVirtualToolConfig(inst, toolNum)
+    if toolNum == 90 then
+        return {
+            name = "Probe",
+            xOffset = getPV(inst, PV.PROBE_X_OFFSET, 0),
+            yOffset = getPV(inst, PV.PROBE_Y_OFFSET, 0),
+            output = OUTPUT.PROBE
+        }
+    elseif toolNum == 91 then
+        return {
+            name = "Laser",
+            xOffset = getPV(inst, PV.LASER_X_OFFSET, 0),
+            yOffset = getPV(inst, PV.LASER_Y_OFFSET, 0),
+            output = OUTPUT.LASER
+        }
+    else
+        -- Tools 92-99 not configured
+        return nil
+    end
+end
+
+-- ============================================
+-- INITIALIZATION
+-- ============================================
+function ToolLib.init(inst)
+    if S.init then return true end
+    
+    -- Get handles
+    S.handles = {
+        probe = getHandle(inst, OUTPUT.PROBE),
+        laser = getHandle(inst, OUTPUT.LASER),
+        clamp = getHandle(inst, OUTPUT.CLAMP),
+        toolPresent = getHandle(inst, INPUT.TOOL_PRESENT),
+        clampButton = getHandle(inst, INPUT.CLAMP_BUTTON),
+    }
+    
+    -- Initialize state from hardware
+    if S.handles.probe then
+        S.lastOutputs.probe = mc.mcSignalGetState(S.handles.probe)
+    end
+    if S.handles.laser then
+        S.lastOutputs.laser = mc.mcSignalGetState(S.handles.laser)
+    end
+    if S.handles.clamp then
+        S.lastOutputs.clamp = mc.mcSignalGetState(S.handles.clamp)
+    end
+    
+    S.lastVirtual = getPV(inst, PV.VIRTUAL_TOOL, 0)
+    S.init = true
+    
+    pushLog("ToolLib initialized")
     return true
 end
 
@@ -688,6 +761,3 @@ ToolLib.G68 = {
 }
 
 return ToolLib
-
-
-

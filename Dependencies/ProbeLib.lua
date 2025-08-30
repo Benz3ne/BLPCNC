@@ -868,6 +868,40 @@ function ProbeLib.Calculations.CheckPerpendicularity(width1, width2, tolerance)
     return ratio >= tolerance
 end
 
+-- Compensate position for probe tip radius
+-- Parameters:
+--   position: Current probe position
+--   tipRadius: Probe tip radius (half of tip diameter)
+--   direction: 1=+X, 2=-X, 3=+Y, 4=-Y, 5=-Z, 6=+Z
+-- Returns:
+--   Compensated position accounting for tip radius
+function ProbeLib.Calculations.CompensateForTip(position, tipRadius, direction)
+    -- Compensation map for each direction
+    local compensation = {
+        [1] = -tipRadius,  -- +X: subtract radius (probe approached from left)
+        [2] = tipRadius,   -- -X: add radius (probe approached from right)
+        [3] = -tipRadius,  -- +Y: subtract radius (probe approached from front)
+        [4] = tipRadius,   -- -Y: add radius (probe approached from back)
+        [5] = tipRadius,   -- -Z: add radius (probe approached from above)
+        [6] = -tipRadius   -- +Z: subtract radius (probe approached from below)
+    }
+    
+    -- Get compensation value for this direction
+    local comp = compensation[direction] or 0
+    
+    -- Apply compensation based on axis
+    if direction <= 2 then
+        -- X axis compensation
+        return position + comp
+    elseif direction <= 4 then
+        -- Y axis compensation
+        return position + comp
+    else
+        -- Z axis compensation
+        return position + comp
+    end
+end
+
 -- ============================================
 -- LOGGING MODULE - Event logging to CSV
 -- ============================================

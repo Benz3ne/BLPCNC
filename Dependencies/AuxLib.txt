@@ -319,3 +319,5 @@ function AuxLib.Update(inst)
         end
     end
 end
+
+return AuxLib

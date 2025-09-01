@@ -486,6 +486,8 @@ if not _G.PopulateTools then
   end
 end
 
+if _G.PopulateTools then pcall(_G.PopulateTools) end
+
 -- ===== UI service for legacy PLC flags (tool prompt / low air) =====
 local _panel = wx.wxPanel(wx.NULL, wx.wxID_ANY, wx.wxDefaultPosition, wx.wxSize(0,0))
 local _timer = wx.wxTimer(_panel)

@@ -1168,7 +1168,7 @@ function SystemLib.WaitIdleOr(inst, opts)
     opts = opts or {}
     local tmo   = opts.timeout_ms or 8000
     local step  = opts.poll_ms or 20
-    local pred  = opts.until
+    local pred  = opts["until"]
 
     -- Preserve original semantics: IDLE OR predicate()
     local function idle_or_pred()

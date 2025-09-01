@@ -142,11 +142,6 @@ end
 -------------------------------------------------------
 
 
-
-
-
-
-
 -- PLC END: per-tick orchestration
 (function()
   local mc = mc
@@ -254,10 +249,6 @@ end
     end
   end
 end)()
-
-
-
-
 
 
 --This is the last thing we do.  So keep it at the end of the script!

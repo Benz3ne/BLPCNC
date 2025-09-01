@@ -1295,11 +1295,11 @@ function ToolLib.M6.Clamp(inst, state, opts)
     if want == nil then return false, "Clamp: state must be 'lock' or 'unlock'" end
 
     if not opts.dryRun then _sig_write(inst, out, want) end
-    if opts.in and (opts.expect ~= nil) and not opts.dryRun then
+    if opts["in"] and (opts.expect ~= nil) and not opts.dryRun then
         local t0 = wx.wxGetUTCTimeMillis():ToNumber()
         local tmo = tonumber(opts.timeout_ms or 2000)
         while true do
-            local got = _sig_read(inst, opts.in)
+            local got = _sig_read(inst, opts["in"])
             if got == (opts.expect and 1 or 0) then return true, nil end
             if (wx.wxGetUTCTimeMillis():ToNumber() - t0) > tmo then
                 return false, "Clamp: timeout waiting for input"
@@ -1324,7 +1324,7 @@ Returns: ok(bool), err(string|nil)
 ]]
 function ToolLib.M6.VerifyPresent(inst, expect, opts)
     opts = opts or {}
-    if not opts.in then return false, "VerifyPresent: input not specified" end
+    if not opts["in"] then return false, "VerifyPresent: input not specified" end
     if opts.dryRun then return true, nil end
     local t0 = wx.wxGetUTCTimeMillis():ToNumber()
     local tmo = tonumber(opts.timeout_ms or 800)
@@ -1333,7 +1333,7 @@ function ToolLib.M6.VerifyPresent(inst, expect, opts)
     local last = nil
 
     while true do
-        local now = _sig_read(inst, opts.in)
+        local now = _sig_read(inst, opts["in"])
         if now == (expect and 1 or 0) then
             if last == now then
                 stableFor = stableFor + 10

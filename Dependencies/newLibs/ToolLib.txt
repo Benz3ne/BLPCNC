@@ -1,0 +1,1653 @@
+-- ToolLib.lua v2.0
+-- Manages physical tools, virtual tools (probe/laser), and all probe operations
+-- Single owner of tool-related outputs and probe functionality
+
+local ToolLib = {}
+
+-- Load SystemLib for core utilities
+local SystemLib = require("SystemLib")
+
+-- Constants
+local SENTINEL = -999999
+
+-- Pound variables
+local PV = {
+    -- Virtual tool state
+    VIRTUAL_TOOL = 406,      -- Active virtual tool (0=none, 90-99=virtual)
+    X_DELTA = 407,           -- X offset applied
+    Y_DELTA = 408,           -- Y offset applied
+    
+    -- Virtual tool config
+    PROBE_X_OFFSET = 301,    -- Probe X offset from spindle
+    PROBE_Y_OFFSET = 302,    -- Probe Y offset from spindle
+    LASER_X_OFFSET = 318,    -- Laser X offset
+    LASER_Y_OFFSET = 319,    -- Laser Y offset
+    
+    -- Probe configuration
+    TIP_DIAMETER = 300,      -- Probe tip diameter
+    FAST_FEED = 303,         -- Fast probe feedrate
+    SLOW_FEED = 304,         -- Slow probe feedrate
+    MAX_TRAVEL = 305,        -- Maximum probe travel
+    Z_OFFSET = 320,          -- Z offset for probe calibration
+    LIFT_HEIGHT = 321,       -- Probe lift height after contact
+    
+    -- M311 sentinel system
+    SENTINEL_FLAG = 388,     -- 0=normal, 1=sentinel active
+    RESULT_X_PLUS = 389,     -- +X probe result
+    RESULT_X_MINUS = 390,    -- -X probe result
+    RESULT_Y_PLUS = 391,     -- +Y probe result
+    RESULT_Y_MINUS = 392,    -- -Y probe result
+    RESULT_Z_MINUS = 394,    -- -Z probe result
+    RESULT_Z_PLUS = 393,     -- +Z probe result
+    
+    -- Tool change state
+    M6_RUNNING = 499,        -- 1 during tool change
+    LAST_PHYSICAL = 351,     -- Last physical tool before virtual
+}
+
+-- State
+local state = {
+    init = false,
+    outputs = {
+        probe = -1,
+        laser = -1,
+        clamp = -1,
+    }
+}
+
+local function _mdi(inst, gcode, wait, timeout_ms)
+    -- Prefer SystemLib.MDIExec if available; else block with ExecuteWait
+    if SystemLib and SystemLib.MDIExec then
+        local ok, err = SystemLib.MDIExec(inst, gcode, { wait_idle = (wait ~= false), timeout_ms = timeout_ms or 8000 })
+        return ok, err
+    else
+        if wait == false then
+            mc.mcCntlGcodeExecute(inst, gcode)
+        else
+            mc.mcCntlGcodeExecuteWait(inst, gcode)
+        end
+        return true, nil
+    end
+end
+
+local function _safeZ(inst, z, feed)
+    if z == nil then return "" end
+    if SystemLib and SystemLib.SafeZ then
+        return SystemLib.SafeZ({ mode = "machine", z = z, type = (feed and "feed" or "rapid"), feed = feed })
+    else
+        if feed then
+            return string.format("G90 G53 G1 Z%.4f F%.3f\n", z, feed)
+        else
+            return string.format("G90 G53 G0 Z%.4f\n", z)
+        end
+    end
+end
+
+local function _line(fmt, ...)
+    return string.format(fmt, ...):gsub("[\r\n]*$", "") .. "\n"
+end
+
+local function _sig_write(inst, nameOrId, v)
+    if SystemLib and SystemLib.Signals and SystemLib.Signals.Write then
+        SystemLib.Signals.Write(inst, { [nameOrId] = (v and 1 or 0) })
+    else
+        local id = (type(nameOrId) == "string" and mc[nameOrId]) or nameOrId
+        local h = mc.mcSignalGetHandle(inst, id)
+        if h and h ~= 0 then mc.mcSignalSetState(h, (v and 1 or 0)) end
+    end
+end
+
+local function _sig_read(inst, nameOrId)
+    local id = (type(nameOrId) == "string" and mc[nameOrId]) or nameOrId
+    local h = mc.mcSignalGetHandle(inst, id)
+    if not h or h == 0 then return 0 end
+    return mc.mcSignalGetState(h) or 0
+end
+
+local function _sleep_ms(ms) wx.wxMilliSleep(ms or 0) end
+
+--[[ ToolLib.Init
+Initialize library and state
+Params:
+  inst: Mach4 instance
+Returns:
+  success: true if initialized
+--]]
+function ToolLib.Init(inst)
+    if state.init then return true end
+    
+    -- Initialize SystemLib if needed
+    SystemLib.Init(inst)
+    
+    -- Get initial output states
+    state.outputs.probe = SystemLib.SignalGetState(inst, mc.OSIG_OUTPUT7) or 0
+    state.outputs.laser = SystemLib.SignalGetState(inst, mc.OSIG_OUTPUT1) or 0
+    state.outputs.clamp = SystemLib.SignalGetState(inst, mc.OSIG_OUTPUT2) or 0
+    
+    state.init = true
+    SystemLib.Log(inst, "ToolLib initialized", "INFO")
+    return true
+end
+
+--[[ ToolLib.Update
+Update virtual tool outputs based on state
+Params:
+  inst: Mach4 instance
+Returns:
+  none
+--]]
+function ToolLib.Update(inst)
+    if not state.init then ToolLib.Init(inst) end
+    
+    local virtualTool = tonumber(SystemLib.PoundVarGet(inst, PV.VIRTUAL_TOOL)) or 0
+    local m6Running = tonumber(SystemLib.PoundVarGet(inst, PV.M6_RUNNING)) or 0
+    
+    -- Determine target outputs
+    local targetProbe = (virtualTool == 90) and 1 or 0
+    local targetLaser = (virtualTool == 91) and 1 or 0
+    
+    -- Update probe output
+    if targetProbe ~= state.outputs.probe then
+        SystemLib.SignalSetState(inst, mc.OSIG_OUTPUT7, targetProbe)
+        state.outputs.probe = targetProbe
+        SystemLib.Log(inst, "Probe output: " .. targetProbe, "DEBUG")
+    end
+    
+    -- Update laser output
+    if targetLaser ~= state.outputs.laser then
+        SystemLib.SignalSetState(inst, mc.OSIG_OUTPUT1, targetLaser)
+        state.outputs.laser = targetLaser
+        SystemLib.Log(inst, "Laser output: " .. targetLaser, "DEBUG")
+    end
+    
+    -- Tool clamp mirroring (protected during M6)
+    if m6Running ~= 1 and virtualTool < 90 then
+        local input8 = SystemLib.SignalGetState(inst, mc.ISIG_INPUT8) or 0
+        if input8 ~= state.outputs.clamp then
+            SystemLib.SignalSetState(inst, mc.OSIG_OUTPUT2, input8)
+            state.outputs.clamp = input8
+        end
+    end
+end
+
+--[[ ToolLib.GetCurrent
+Get current tool number
+Params:
+  inst: Mach4 instance
+Returns:
+  tool: Current tool number
+--]]
+function ToolLib.GetCurrent(inst)
+    return mc.mcToolGetCurrent(inst)
+end
+
+--[[ ToolLib.SetCurrent
+Set current tool with height offset sync
+Params:
+  inst: Mach4 instance
+  tool: Tool number to set
+Returns:
+  success: true if successful
+--]]
+function ToolLib.SetCurrent(inst, tool)
+    mc.mcToolSetCurrent(inst, tool)
+    
+    -- Sync height offset
+    mc.mcCntlGcodeExecuteWait(inst, "G49")
+    if tool > 0 and tool < 90 then
+        mc.mcCntlGcodeExecuteWait(inst, string.format("G43 H%d", tool))
+    end
+    
+    SystemLib.Log(inst, "Tool set: T" .. tool, "INFO")
+    return true
+end
+
+--[[ ToolLib.IsVirtual
+Check if tool number is virtual
+Params:
+  tool: Tool number
+Returns:
+  virtual: true if tool >= 90
+--]]
+function ToolLib.IsVirtual(tool)
+    return tool >= 90 and tool <= 99
+end
+
+--[[ ToolLib.OpenClamp
+Open tool clamp (OUTPUT2)
+Params:
+  inst: Mach4 instance
+Returns:
+  success: true if successful
+--]]
+function ToolLib.OpenClamp(inst)
+    SystemLib.SignalSetState(inst, mc.OSIG_OUTPUT2, 1)
+    state.outputs.clamp = 1
+    return true
+end
+
+--[[ ToolLib.CloseClamp
+Close tool clamp (OUTPUT2)
+Params:
+  inst: Mach4 instance
+Returns:
+  success: true if successful
+--]]
+function ToolLib.CloseClamp(inst)
+    SystemLib.SignalSetState(inst, mc.OSIG_OUTPUT2, 0)
+    state.outputs.clamp = 0
+    return true
+end
+
+--[[ ToolLib.IsToolPresent
+Check if tool present sensor is active
+Params:
+  inst: Mach4 instance
+Returns:
+  present: true if tool detected
+--]]
+function ToolLib.IsToolPresent(inst)
+    return SystemLib.SignalGetState(inst, mc.ISIG_INPUT17) == 1
+end
+
+--[[ ToolLib.DeployVirtual
+Deploy virtual tool with offset application (supports all fixtures incl. G54.1 P1..Pn)
+Params:
+  inst: Mach4 instance
+  tool: Virtual tool number (90-99)
+Returns:
+  success: true if deployed or nil on error
+--]]
+function ToolLib.DeployVirtual(inst, tool)
+    -- B4: Concurrency guard
+    local okIdle = select(1, SystemLib.Await(inst, { idle = true }, { timeout_ms = 2000 }))
+    if not okIdle then return false, "Machine not idle" end
+
+    -- Validate tool number
+    if not ToolLib.IsVirtual(tool) then
+        SystemLib.Log(inst, "Invalid virtual tool: " .. tostring(tool), "ERROR")
+        return nil
+    end
+
+    -- Already deployed?
+    local current = tonumber(SystemLib.PoundVarGet(inst, PV.VIRTUAL_TOOL)) or 0
+    if current == tool then return true end
+
+    -- Retract a different virtual tool if active
+    if current >= 90 then
+        ToolLib.RetractVirtual(inst)
+    end
+
+    -- Resolve offsets for requested virtual tool
+    local xOffset, yOffset
+    if tool == 90 then
+        xOffset = SystemLib.PoundVarGet(inst, PV.PROBE_X_OFFSET) or 0
+        yOffset = SystemLib.PoundVarGet(inst, PV.PROBE_Y_OFFSET) or 0
+    elseif tool == 91 then
+        xOffset = SystemLib.PoundVarGet(inst, PV.LASER_X_OFFSET) or 0
+        yOffset = SystemLib.PoundVarGet(inst, PV.LASER_Y_OFFSET) or 0
+    else
+        SystemLib.Log(inst, "Virtual tool T" .. tostring(tool) .. " not configured", "ERROR")
+        return nil
+    end
+
+    -- B2: Remove MAX_OFFSET guard to permit full-range offsets
+
+    -- Save & clear rotation if present (own rotation lifecycle)
+    if SystemLib.G68.SaveState(inst) then
+        SystemLib.G68.Clear(inst)
+    end
+
+    -- Apply WCS deltas across ALL fixtures (basic + expanded G54.1 banks)
+    -- Sign: shift coordinates opposite the tool offset so spindle coordinates stay consistent.
+    SystemLib.WorkOffset.AddDelta(inst, { dx = -xOffset, dy = -yOffset }, { scope = "all" })
+
+    -- If rotation was active, restore with pivot adjusted by +tool offset (compensate for WCS shift)
+    local st = SystemLib.G68.GetState and SystemLib.G68.GetState(inst)
+    if st and st.active then
+        SystemLib.G68.RestoreState(inst, { dx =  xOffset, dy =  yOffset })
+    end
+
+    -- Persist virtual-tool bookkeeping
+    SystemLib.PoundVarSet(inst, PV.VIRTUAL_TOOL, tool)
+    SystemLib.PoundVarSet(inst, PV.X_DELTA, xOffset)
+    SystemLib.PoundVarSet(inst, PV.Y_DELTA, yOffset)
+
+    -- Set current tool and clear H-offset
+    mc.mcToolSetCurrent(inst, tool)
+    SystemLib.MDIExec(inst, "G49")
+
+    SystemLib.Log(inst, "Virtual tool T" .. tostring(tool) .. " deployed", "INFO")
+    return true
+end
+
+--[[ ToolLib.RetractVirtual
+Retract virtual tool and restore offsets across ALL fixtures, preserving physical pivot.
+Params:
+  inst: Mach4 instance
+Returns:
+  success: true if retracted
+--]]
+function ToolLib.RetractVirtual(inst)
+    -- B4: Concurrency guard
+    local okIdle = select(1, SystemLib.Await(inst, { idle = true }, { timeout_ms = 2000 }))
+    if not okIdle then return false, "Machine not idle" end
+
+    local current = tonumber(SystemLib.PoundVarGet(inst, PV.VIRTUAL_TOOL)) or 0
+    if current < 90 then return true end
+
+    -- Get stored deltas
+    local xDelta = SystemLib.PoundVarGet(inst, PV.X_DELTA) or 0
+    local yDelta = SystemLib.PoundVarGet(inst, PV.Y_DELTA) or 0
+
+    -- Own any residual rotation, then clear before changing WCS
+    if SystemLib.G68.IsActive(inst) then
+        SystemLib.G68.SaveState(inst) -- idempotent
+        SystemLib.G68.Clear(inst)
+    end
+
+    -- Restore WCS offsets first (undo the deployment shift) across ALL fixtures
+    SystemLib.G68.RestoreState(inst, { dx = -xDelta, dy = -yDelta })
+
+    -- Restore the original rotation with NO delta; WCS is already back in place
+    SystemLib.G68.RestoreState(inst)
+
+    -- Clear state
+    SystemLib.PoundVarSet(inst, PV.VIRTUAL_TOOL, 0)
+    SystemLib.PoundVarSet(inst, PV.X_DELTA, 0)
+    SystemLib.PoundVarSet(inst, PV.Y_DELTA, 0)
+
+    mc.mcToolSetCurrent(inst, 0)
+    SystemLib.MDIExec(inst, "G49")
+
+    SystemLib.Log(inst, "Virtual tool retracted", "INFO")
+    return true
+end
+
+--[[ ToolLib.GetProbeParams
+Get probe configuration parameters
+Params:
+  inst: Mach4 instance
+Returns:
+  table: {tipDiameter, xOffset, yOffset, fastFeed, slowFeed, maxTravel, zOffset, liftHeight}
+--]]
+function ToolLib.GetProbeParams(inst)
+    local params = {}
+    
+    -- Get parameters with validation
+    params.tipDiameter = SystemLib.PoundVarGet(inst, PV.TIP_DIAMETER)
+    if not params.tipDiameter or params.tipDiameter < 0.001 then
+        SystemLib.Log(inst, "ERROR: Probe tip diameter #300 not set", "ERROR")
+        return nil
+    end
+    
+    params.xOffset = SystemLib.PoundVarGet(inst, PV.PROBE_X_OFFSET) or 0
+    params.yOffset = SystemLib.PoundVarGet(inst, PV.PROBE_Y_OFFSET) or 0
+    params.fastFeed = SystemLib.PoundVarGet(inst, PV.FAST_FEED) or 30
+    params.slowFeed = SystemLib.PoundVarGet(inst, PV.SLOW_FEED) or 5
+    params.maxTravel = SystemLib.PoundVarGet(inst, PV.MAX_TRAVEL) or 1
+    params.zOffset = SystemLib.PoundVarGet(inst, PV.Z_OFFSET) or 0
+    params.liftHeight = SystemLib.PoundVarGet(inst, PV.LIFT_HEIGHT) or 0.1
+    
+    -- Validate ranges
+    if params.fastFeed < 0.1 or params.fastFeed > 500 then
+        SystemLib.Log(inst, "Invalid fast feed rate", "ERROR")
+        return nil
+    end
+    
+    if params.slowFeed < 0.1 or params.slowFeed > 100 then
+        SystemLib.Log(inst, "Invalid slow feed rate", "ERROR")
+        return nil
+    end
+    
+    params.probeRadius = params.tipDiameter / 2.0
+    
+    return params
+end
+
+--[[ ToolLib.EnableSentinel
+Enable sentinel mode for probe miss detection
+Params:
+  inst: Mach4 instance
+Returns:
+  none
+--]]
+function ToolLib.EnableSentinel(inst)
+    SystemLib.PoundVarSet(inst, PV.SENTINEL_FLAG, 1)
+    
+    -- Set all result vars to sentinel
+    local sentinelVars = {
+        PV.RESULT_X_PLUS, PV.RESULT_X_MINUS,
+        PV.RESULT_Y_PLUS, PV.RESULT_Y_MINUS,
+        PV.RESULT_Z_PLUS, PV.RESULT_Z_MINUS
+    }
+    
+    for _, var in ipairs(sentinelVars) do
+        SystemLib.PoundVarSet(inst, var, SENTINEL)
+    end
+end
+
+--[[ ToolLib.DisableSentinel
+Disable sentinel mode after probe
+Params:
+  inst: Mach4 instance
+Returns:
+  none
+--]]
+function ToolLib.DisableSentinel(inst)
+    SystemLib.PoundVarSet(inst, PV.SENTINEL_FLAG, 0)
+end
+
+--[[ ToolLib.ExecuteProbe
+Execute probe operation with M311
+Params:
+  inst: Mach4 instance
+  direction: 1=+X, 2=-X, 3=+Y, 4=-Y, 5=-Z, 6=+Z
+  label: Optional label for logging
+Returns:
+  hit: true if probe made contact
+  position: Contact position or nil
+--]]
+function ToolLib.ExecuteProbe(inst, direction, label)
+    label = label or "probe"
+    
+    -- Validate probe is not stuck
+    if SystemLib.SignalGetState(inst, mc.ISIG_PROBE1) == 1 then
+        -- Try to clear
+        mc.mcCntlGcodeExecuteWait(inst, "G31.2")
+        wx.wxMilliSleep(100)
+        
+        if SystemLib.SignalGetState(inst, mc.ISIG_PROBE1) == 1 then
+            SystemLib.Log(inst, "Probe stuck triggered", "ERROR")
+            return false, nil
+        end
+    end
+    
+    -- Enable sentinel
+    ToolLib.EnableSentinel(inst)
+    
+    -- Execute M311
+    local gcode = string.format("M311 S%d", direction)
+    mc.mcCntlGcodeExecuteWait(inst, gcode)
+    wx.wxMilliSleep(100)  -- Settle time
+    
+    -- Check result
+    local varMap = {
+        [1] = PV.RESULT_X_PLUS,
+        [2] = PV.RESULT_X_MINUS,
+        [3] = PV.RESULT_Y_PLUS,
+        [4] = PV.RESULT_Y_MINUS,
+        [5] = PV.RESULT_Z_MINUS,
+        [6] = PV.RESULT_Z_PLUS
+    }
+    
+    local resultVar = varMap[direction]
+    local position = SystemLib.PoundVarGet(inst, resultVar)
+    
+    -- Disable sentinel
+    ToolLib.DisableSentinel(inst)
+    
+    -- Check for miss
+    if not position or math.abs(position - SENTINEL) < 0.0001 then
+        SystemLib.Log(inst, label .. " miss - no contact", "WARNING")
+        return false, nil
+    end
+    
+    SystemLib.Log(inst, string.format("%s hit at %.4f", label, position), "INFO")
+    return true, position
+end
+
+--[[ ToolLib.ProbeTowards
+Probe towards a point with retract on hit
+Params:
+  inst: Mach4 instance
+  x, y, z: Target position (nil to skip axis)
+  feed: Feed rate
+  retract: Distance to retract after hit
+Returns:
+  hit: true if probe triggered
+--]]
+function ToolLib.ProbeTowards(inst, x, y, z, feed, retract)
+    -- Build G31 command
+    local axes = {}
+    if x then table.insert(axes, string.format("X%.4f", x)) end
+    if y then table.insert(axes, string.format("Y%.4f", y)) end
+    if z then table.insert(axes, string.format("Z%.4f", z)) end
+    
+    if #axes == 0 then
+        SystemLib.Log(inst, "No target specified for probe", "ERROR")
+        return false
+    end
+    
+    local gcode = string.format("G31 %s F%.1f", table.concat(axes, " "), feed)
+    mc.mcCntlGcodeExecuteWait(inst, gcode)
+    
+    -- Check if triggered
+    local hit = SystemLib.SignalGetState(inst, mc.ISIG_PROBE1) == 1
+    
+    if hit and retract and retract > 0 then
+        -- Retract
+        mc.mcCntlGcodeExecuteWait(inst, "G91")
+        if x then mc.mcCntlGcodeExecuteWait(inst, string.format("G1 X%.4f F%.1f", -retract, feed)) end
+        if y then mc.mcCntlGcodeExecuteWait(inst, string.format("G1 Y%.4f F%.1f", -retract, feed)) end
+        if z then mc.mcCntlGcodeExecuteWait(inst, string.format("G1 Z%.4f F%.1f", retract, feed)) end
+        mc.mcCntlGcodeExecuteWait(inst, "G90")
+    end
+    
+    return hit
+end
+
+--[[ ToolLib.SetWorkOffset
+Set work offset datum from probe result
+Params:
+  inst: Mach4 instance
+  x, y, z: Coordinates to set (nil to skip)
+  offsetNum: 54-59 for G54-G59 (nil for current)
+Returns:
+  success: true if set
+--]]
+function ToolLib.SetWorkOffset(inst, x, y, z, offsetNum)
+    -- Get current offset if not specified
+    if not offsetNum then
+        offsetNum = SystemLib.PoundVarGet(inst, 4014) or 54
+    end
+    
+    -- Validate offset number
+    if offsetNum < 54 or offsetNum > 59 then
+        SystemLib.Log(inst, "Invalid work offset: G" .. offsetNum, "ERROR")
+        return nil
+    end
+    
+    -- Get pound var base for this offset
+    local varBase = 5221 + ((offsetNum - 54) * 20)
+    
+    -- Get current position
+    local pos = SystemLib.CapturePosition(inst)
+    
+    -- Set each axis if provided
+    local updated = {}
+    if x ~= nil then
+        local machX = x + (pos.machine.x - pos.work.x)
+        SystemLib.PoundVarSet(inst, varBase, machX)
+        table.insert(updated, "X")
+    end
+    
+    if y ~= nil then
+        local machY = y + (pos.machine.y - pos.work.y)
+        SystemLib.PoundVarSet(inst, varBase + 1, machY)
+        table.insert(updated, "Y")
+    end
+    
+    if z ~= nil then
+        local machZ = z + (pos.machine.z - pos.work.z)
+        SystemLib.PoundVarSet(inst, varBase + 2, machZ)
+        table.insert(updated, "Z")
+    end
+    
+    if #updated > 0 then
+        SystemLib.Log(inst, string.format("G%d datum set: %s", offsetNum, table.concat(updated, ", ")), "INFO")
+    end
+    
+    return true
+end
+
+--[[ ToolLib.CompensateForTip
+Compensate position for probe tip radius
+Params:
+  inst: Mach4 instance
+  position: Measured position
+  direction: 1=+X, 2=-X, 3=+Y, 4=-Y, 5=-Z, 6=+Z
+Returns:
+  compensated: Adjusted position
+--]]
+function ToolLib.CompensateForTip(inst, position, direction)
+    local params = ToolLib.GetProbeParams(inst)
+    if not params then return position end
+    
+    local radius = params.probeRadius
+    
+    -- Compensation based on approach direction
+    local compensation = {
+        [1] = -radius,  -- +X: subtract
+        [2] = radius,   -- -X: add
+        [3] = -radius,  -- +Y: subtract
+        [4] = radius,   -- -Y: add
+        [5] = radius,   -- -Z: add
+        [6] = -radius   -- +Z: subtract
+    }
+    
+    return position + (compensation[direction] or 0)
+end
+
+--[[ ToolLib.ProbeSingleAxis
+Simple single-axis probe
+Params:
+  inst: Mach4 instance
+  axis: "X", "Y", or "Z"
+  direction: 1 for positive, -1 for negative
+  distance: Max probe distance
+Returns:
+  hit: true if contact
+  position: Contact position
+--]]
+function ToolLib.ProbeSingleAxis(inst, axis, direction, distance)
+    -- Map to M311 direction codes
+    local dirMap = {
+        X = {[1] = 1, [-1] = 2},
+        Y = {[1] = 3, [-1] = 4},
+        Z = {[1] = 6, [-1] = 5}
+    }
+    
+    local m311dir = dirMap[axis] and dirMap[axis][direction]
+    if not m311dir then
+        SystemLib.Log(inst, "Invalid probe axis/direction", "ERROR")
+        return false, nil
+    end
+    
+    return ToolLib.ExecuteProbe(inst, m311dir, axis .. " probe")
+end
+
+--[[ ToolLib.IsProbeActive
+Check if probe tool is active and deployed
+Params:
+  inst: Mach4 instance
+Returns:
+  active: true if T90 active and OUTPUT7 on
+--]]
+function ToolLib.IsProbeActive(inst)
+    return mc.mcToolGetCurrent(inst) == 90 and 
+           SystemLib.SignalGetState(inst, mc.OSIG_OUTPUT7) == 1
+end
+
+--[[ ToolLib.IsLaserActive
+Check if laser tool is active and deployed
+Params:
+  inst: Mach4 instance
+Returns:
+  active: true if T91 active and OUTPUT1 on
+--]]
+function ToolLib.IsLaserActive(inst)
+    return mc.mcToolGetCurrent(inst) == 91 and 
+           SystemLib.SignalGetState(inst, mc.OSIG_OUTPUT1) == 1
+end
+
+--[[ ToolLib.GetVirtualState
+Get current virtual tool state
+Params:
+  inst: Mach4 instance
+Returns:
+  table: {tool, xDelta, yDelta}
+--]]
+function ToolLib.GetVirtualState(inst)
+    return {
+        tool = tonumber(SystemLib.PoundVarGet(inst, PV.VIRTUAL_TOOL)) or 0,
+        xDelta = SystemLib.PoundVarGet(inst, PV.X_DELTA) or 0,
+        yDelta = SystemLib.PoundVarGet(inst, PV.Y_DELTA) or 0,
+    }
+end
+
+--[[ ToolLib.ProbeCleanup
+Universal probe cleanup function
+Params:
+  inst: Mach4 instance
+  success: Whether probe was successful
+  state: Optional saved state to restore {poundVars={}, position={}}
+  errorMsg: Optional error message to display
+Returns:
+  none
+--]]
+function ToolLib.ProbeCleanup(inst, success, state, errorMsg)
+    -- Step 1: Check probe state but DO NOT MOVE if stuck
+    local probeStuck = SystemLib.SignalGetState(inst, mc.ISIG_PROBE1) == 1
+    if probeStuck then
+        SystemLib.Log(inst, "WARNING: Probe is triggered - manual intervention required", "WARNING")
+        -- DO NOT ATTEMPT ANY MOVEMENT
+    end
+    
+    -- Step 2: Always clear sentinel mode flag
+    SystemLib.PoundVarSet(inst, 388, 0)
+    
+    -- Step 3: Clear runtime probe variables
+    local runtimeVars = {389, 390, 391, 392, 393, 394, 395, 396, 397}
+    for _, var in ipairs(runtimeVars) do
+        SystemLib.PoundVarSet(inst, var, -1e308)
+    end
+    
+    -- Step 4: Restore saved pound variables if provided
+    if state and state.poundVars then
+        for var, value in pairs(state.poundVars) do
+            if type(value) == "number" and value > -1e300 then
+                SystemLib.PoundVarSet(inst, var, value)
+            end
+        end
+    end
+    
+    -- Step 5: Clear probe latch (safe even if stuck)
+    pcall(mc.mcCntlGcodeExecuteWait, inst, "G31.2")
+    
+    -- Step 6: Report status
+    if not success then
+        if errorMsg then
+            SystemLib.Log(inst, "Probe failed: " .. errorMsg, "ERROR")
+        else
+            SystemLib.Log(inst, "Probe sequence failed - see previous error", "ERROR")
+        end
+        
+        -- Show error dialog if not stuck (stuck probe already warned)
+        if not probeStuck and errorMsg then
+            SystemLib.MsgError(errorMsg, "Probe Error")
+        end
+    end
+    
+    -- Step 7: Give interpreter time to settle
+    wx.wxMilliSleep(100)
+end
+
+--[[ ToolLib.ProbeValidation
+Comprehensive pre-probe validation
+Params:
+  inst: Mach4 instance
+  requireZ: Whether Z probe capability is required
+  checkRotation: Whether to check for G68 rotation (default true)
+Returns:
+  params: Validated probe parameters or nil on error
+  state: Saved state for cleanup
+--]]
+function ToolLib.ProbeValidation(inst, requireZ, checkRotation)
+    checkRotation = checkRotation ~= false  -- Default true
+    
+    -- Check homing
+    local homed, unhomedAxes = SystemLib.CheckHoming(inst, false)
+    if not homed then
+        local msg = "Machine not homed!\n\nUnhomed axes: " .. table.concat(unhomedAxes, ", ") ..
+                    "\n\nPlease home the machine before probing."
+        SystemLib.MsgError(msg, "Homing Required")
+        return nil
+    end
+    
+    -- Check and warn about G68 rotation
+    if checkRotation then
+        local g68Active, angle = SystemLib.G68Active(inst)
+        if g68Active then
+            if not SystemLib.MsgConfirm(
+                "WARNING: Coordinate rotation (G68) is active.\n\n" ..
+                "The probe will use machine coordinates and ignore rotation.\n" ..
+                "This is intentional for safety.\n\n" ..
+                "Continue probing?",
+                "Rotation Active") then
+                return nil
+            end
+        end
+    end
+    
+    -- Check if probe is stuck
+    if SystemLib.SignalGetState(inst, mc.ISIG_PROBE1) == 1 then
+        -- Try to clear
+        mc.mcCntlGcodeExecuteWait(inst, "G31.2")
+        wx.wxMilliSleep(100)
+        
+        if SystemLib.SignalGetState(inst, mc.ISIG_PROBE1) == 1 then
+            SystemLib.MsgError(
+                "Probe is stuck triggered!\n\n" ..
+                "Possible causes:\n" ..
+                "• Probe tip is touching something\n" ..
+                "• Probe cable fault or short circuit\n" ..
+                "• Probe needs to be reset\n\n" ..
+                "Clear the probe and retry.",
+                "Probe Stuck")
+            return nil
+        end
+    end
+    
+    -- Get and validate probe parameters
+    local params = ToolLib.GetProbeParams(inst)
+    if not params then
+        SystemLib.MsgError(
+            "Probe parameters not initialized!\n\n" ..
+            "Please set pound variables:\n" ..
+            "#300 = Probe tip diameter\n" ..
+            "#301 = X offset from spindle to probe\n" ..
+            "#302 = Y offset from spindle to probe\n" ..
+            "#303 = Fast probe feedrate\n" ..
+            "#304 = Slow probe feedrate\n" ..
+            "#305 = Maximum probe travel distance",
+            "Configuration Error")
+        return nil
+    end
+    
+    -- Save current state for potential restoration
+    local state = {
+        poundVars = {
+            [305] = SystemLib.PoundVarGet(inst, 305),  -- Max travel
+            [388] = SystemLib.PoundVarGet(inst, 388),  -- Sentinel flag
+        },
+        position = SystemLib.CapturePosition(inst),
+        g68Active = SystemLib.G68Active(inst)
+    }
+    
+    -- Store G68 if active for later restoration
+    if state.g68Active then
+        SystemLib.G68Store(inst)
+    end
+    
+    SystemLib.Log(inst, "Probe validation complete", "DEBUG")
+    return params, state
+end
+
+--[[ ToolLib.CheckSymmetry
+Check and compensate for perpendicularity/symmetry issues
+Params:
+  inst: Mach4 instance
+  measurements: {xPlus, xMinus, yPlus, yMinus} edge positions
+  threshold: Ratio threshold for re-probing (default 0.95)
+  probeDepth: Z depth for re-probe
+Returns:
+  corrected: Corrected measurements or nil on error
+  needed: Whether correction was performed
+--]]
+function ToolLib.CheckSymmetry(inst, measurements, threshold, probeDepth)
+    threshold = threshold or 0.95
+    
+    -- Calculate diameters
+    local diamX = math.abs(measurements.xPlus - measurements.xMinus)
+    local diamY = math.abs(measurements.yPlus - measurements.yMinus)
+    
+    -- Check if X diameter is significantly smaller than Y
+    if diamX >= diamY * threshold then
+        -- No correction needed
+        return measurements, false
+    end
+    
+    SystemLib.Log(inst, string.format(
+        "Symmetry check: X=%.4f < Y=%.4f*%.2f, re-probing X from Y center", 
+        diamX, diamY, threshold), "INFO")
+    
+    -- Calculate centers
+    local centerX = (measurements.xPlus + measurements.xMinus) / 2
+    local centerY = (measurements.yPlus + measurements.yMinus) / 2
+    
+    -- Move to Y center for better X measurement
+    mc.mcCntlGcodeExecuteWait(inst, string.format("G0 Y%.4f", centerY))
+    
+    -- Get current Z for probe plane
+    local currentZ = mc.mcAxisGetPos(inst, mc.Z_AXIS)
+    local probeZ = currentZ - (probeDepth or 0.1)
+    
+    -- Re-probe +X from Y center
+    mc.mcCntlGcodeExecuteWait(inst, string.format("G0 X%.4f", centerX - diamX/2 - 0.1))
+    mc.mcCntlGcodeExecuteWait(inst, string.format("G0 Z%.4f", probeZ))
+    
+    local hit, newXPlus = ToolLib.ExecuteProbe(inst, 1, "+X recheck")
+    if not hit then
+        SystemLib.Log(inst, "Failed to re-probe +X for symmetry check", "WARNING")
+        return measurements, false
+    end
+    
+    -- Re-probe -X from Y center
+    mc.mcCntlGcodeExecuteWait(inst, string.format("G0 Z%.4f", currentZ))
+    mc.mcCntlGcodeExecuteWait(inst, string.format("G0 X%.4f", centerX + diamX/2 + 0.1))
+    mc.mcCntlGcodeExecuteWait(inst, string.format("G0 Z%.4f", probeZ))
+    
+    hit, newXMinus = ToolLib.ExecuteProbe(inst, 2, "-X recheck")
+    if not hit then
+        SystemLib.Log(inst, "Failed to re-probe -X for symmetry check", "WARNING")
+        return measurements, false
+    end
+    
+    -- Return to safe Z
+    mc.mcCntlGcodeExecuteWait(inst, string.format("G0 Z%.4f", currentZ))
+    
+    -- Update measurements with corrected X values
+    local corrected = {
+        xPlus = newXPlus or measurements.xPlus,
+        xMinus = newXMinus or measurements.xMinus,
+        yPlus = measurements.yPlus,
+        yMinus = measurements.yMinus
+    }
+    
+    local newDiamX = math.abs(corrected.xPlus - corrected.xMinus)
+    SystemLib.Log(inst, string.format(
+        "Symmetry correction complete: X diameter %.4f -> %.4f", 
+        diamX, newDiamX), "INFO")
+    
+    return corrected, true
+end
+
+--[[ ToolLib.SafeTravelWithRetry
+Probe with intelligent retry on collision
+Params:
+  inst: Mach4 instance
+  config: {
+    direction: 1=+X, 2=-X, 3=+Y, 4=-Y, 5=-Z, 6=+Z
+    startRadius: Initial probe distance
+    maxRadius: Maximum probe distance
+    safePlane: Z height for XY movements
+    probePlane: Z height for probing
+    maxAttempts: Maximum retry attempts (default 10)
+    retryIncrement: Distance to extend on retry (default 1.0 or 90% of max travel)
+  }
+Returns:
+  success: Whether probe succeeded
+  position: Contact position
+  finalRadius: Successful probe radius
+--]]
+function ToolLib.SafeTravelWithRetry(inst, config)
+    -- Validate config
+    if not config.direction or not config.startRadius or not config.maxRadius then
+        SystemLib.Log(inst, "SafeTravelWithRetry: Invalid configuration", "ERROR")
+        return false, nil, nil
+    end
+    
+    config.maxAttempts = config.maxAttempts or 10
+    
+    -- Calculate smart retry increment
+    local maxTravel = SystemLib.PoundVarGet(inst, 305) or 1.0
+    if not config.retryIncrement then
+        if maxTravel >= 1.0 then
+            config.retryIncrement = 1.0  -- Standard 1" intervals
+        else
+            config.retryIncrement = maxTravel * 0.9  -- 90% of probe capability
+        end
+    end
+    
+    -- Map direction to axis and sign
+    local dirMap = {
+        [1] = {axis = mc.X_AXIS, x = 1, y = 0, name = "+X"},
+        [2] = {axis = mc.X_AXIS, x = -1, y = 0, name = "-X"},
+        [3] = {axis = mc.Y_AXIS, x = 0, y = 1, name = "+Y"},
+        [4] = {axis = mc.Y_AXIS, x = 0, y = -1, name = "-Y"},
+        [5] = {axis = mc.Z_AXIS, x = 0, y = 0, z = -1, name = "-Z"},
+        [6] = {axis = mc.Z_AXIS, x = 0, y = 0, z = 1, name = "+Z"}
+    }
+    
+    local dir = dirMap[config.direction]
+    if not dir then
+        SystemLib.Log(inst, "Invalid probe direction: " .. config.direction, "ERROR")
+        return false, nil, nil
+    end
+    
+    -- Get starting position
+    local startX = mc.mcAxisGetPos(inst, mc.X_AXIS)
+    local startY = mc.mcAxisGetPos(inst, mc.Y_AXIS)
+    local startZ = mc.mcAxisGetPos(inst, mc.Z_AXIS)
+    
+    local currentRadius = config.startRadius
+    local attemptNum = 0
+    
+    while attemptNum < config.maxAttempts and currentRadius <= config.maxRadius do
+        attemptNum = attemptNum + 1
+        
+        -- Check soft limits
+        local currentMachPos = mc.mcAxisGetMachinePos(inst, dir.axis)
+        local dirSign = dir.x + dir.y + (dir.z or 0)
+        local maxSafe = SystemLib.GetMaxTravel(inst, dir.axis, dirSign, 0.01)
+        
+        if currentRadius > maxSafe then
+            SystemLib.Log(inst, string.format(
+                "%s probe limited by soft limits at %.3f", 
+                dir.name, maxSafe), "WARNING")
+            
+            if attemptNum == 1 then
+                -- Can't even reach minimum
+                return false, nil, nil
+            else
+                -- Use previous successful position
+                break
+            end
+        end
+        
+        -- For XY probing with Z moves
+        if config.safePlane and config.probePlane then
+            -- Move to radius position at safe plane
+            local targetX = startX + (dir.x * currentRadius)
+            local targetY = startY + (dir.y * currentRadius)
+            
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G0 Z%.4f", config.safePlane))
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G0 X%.4f Y%.4f", targetX, targetY))
+            
+            -- Drop to probe plane with collision detection
+            mc.mcCntlGcodeExecuteWait(inst, string.format("G31.1 Z%.4f F%.1f", 
+                config.probePlane, SystemLib.PoundVarGet(inst, 303) or 30))
+            
+            -- Check if we hit something during Z drop
+            local actualZ = mc.mcAxisGetPos(inst, mc.Z_AXIS)
+            if math.abs(actualZ - config.probePlane) > 0.001 then
+                -- Collision - retreat and try further out
+                SystemLib.Log(inst, string.format(
+                    "%s collision at radius %.3f, extending", 
+                    dir.name, currentRadius), "INFO")
+                
+                mc.mcCntlGcodeExecuteWait(inst, string.format("G0 Z%.4f", config.safePlane))
+                
+                -- Calculate next radius
+                local remaining = config.maxRadius - currentRadius
+                local increment = math.min(config.retryIncrement, remaining)
+                
+                if increment < 0.001 then
+                    -- Can't extend further
+                    SystemLib.Log(inst, "Cannot extend probe further", "WARNING")
+                    return false, nil, nil
+                end
+                
+                currentRadius = currentRadius + increment
+            else
+                -- Z drop successful, execute probe
+                local hit, position = ToolLib.ExecuteProbe(inst, config.direction, dir.name)
+                
+                -- Return to safe Z
+                mc.mcCntlGcodeExecuteWait(inst, string.format("G0 Z%.4f", config.safePlane))
+                
+                if hit then
+                    return true, position, currentRadius
+                else
+                    -- Probe didn't hit - may need to extend
+                    SystemLib.Log(inst, string.format(
+                        "%s probe miss at radius %.3f", 
+                        dir.name, currentRadius), "INFO")
+                    
+                    currentRadius = currentRadius + config.retryIncrement
+                end
+            end
+        else
+            -- Simple probe without Z movement (like Z probe itself)
+            local hit, position = ToolLib.ExecuteProbe(inst, config.direction, dir.name)
+            
+            if hit then
+                return true, position, currentRadius
+            else
+                SystemLib.Log(inst, string.format(
+                    "%s probe miss, extending", dir.name), "INFO")
+                currentRadius = currentRadius + config.retryIncrement
+            end
+        end
+    end
+    
+    SystemLib.Log(inst, string.format(
+        "%s probe failed after %d attempts", 
+        dir.name, attemptNum), "ERROR")
+    
+    return false, nil, nil
+end
+
+--[[ EnsureActive
+Idempotently ensure a given tool is active (physical or virtual).
+Params:
+  inst (number)    - Mach4 instance
+  toolNo (number)  - desired tool (>=90 treated as virtual)
+  opts (table|nil):
+    requireIdle -> boolean (default true)
+Returns:
+  ok (bool), err (string|nil), prev (number)  -- prev is physical if toolNo<90, else prev virtual
+]]
+function ToolLib.EnsureActive(inst, toolNo, opts)
+    opts = opts or {}
+    local requireIdle = (opts.requireIdle ~= false)
+
+    if requireIdle and mc.mcCntlGetState(inst) ~= mc.MC_STATE_IDLE then
+        local err = "Controller not idle."
+        SystemLib.Log(inst, err, "WARNING")
+        return false, err, nil
+    end
+
+    if toolNo >= 90 then
+        local prevVirt = tonumber(SystemLib.PoundVarGet(inst, PV.VIRTUAL_TOOL)) or 0
+        if prevVirt == toolNo then
+            return true, nil, prevVirt
+        end
+        local ok = ToolLib.DeployVirtual(inst, toolNo)
+        if not ok then
+            local err = "Failed to deploy virtual tool T" .. tostring(toolNo)
+            SystemLib.Log(inst, err, "ERROR")
+            return false, err, prevVirt
+        end
+        SystemLib.Log(inst, "Virtual tool active: T" .. tostring(toolNo), "INFO")
+        return true, nil, prevVirt
+    else
+        local prevPhys = mc.mcToolGetCurrent(inst)
+        if prevPhys == toolNo then
+            return true, nil, prevPhys
+        end
+        local ok = ToolLib.SetCurrent(inst, toolNo)
+        if not ok then
+            local err = "Failed to set physical tool T" .. tostring(toolNo)
+            SystemLib.Log(inst, err, "ERROR")
+            return false, err, prevPhys
+        end
+        return true, nil, prevPhys
+    end
+end
+
+--[[ VirtualGuard
+Describe current virtual-tool context.
+Returns:
+  active (bool), code (string|nil) -- e.g., "laser","probe"
+Notes:
+  Uses existing ToolLib helpers if available; falls back to PV if defined.
+]]
+function ToolLib.VirtualGuard(inst)
+    if ToolLib.IsLaserActive and ToolLib.IsLaserActive(inst) then
+        return true, "laser"
+    end
+    if ToolLib.IsProbeActive and ToolLib.IsProbeActive(inst) then
+        return true, "probe"
+    end
+    if PV and PV.VIRTUAL_TOOL then
+        local v = tonumber(SystemLib.PoundVarGet(inst, PV.VIRTUAL_TOOL)) or 0
+        if v >= 90 then return true, "virtual" end
+    end
+    return false, nil
+end
+
+--[[ SyncHOffset
+Idempotent G49/G43/Hn application with guards.
+Params:
+  inst (number), toolNo (number), opts {require_idle=true, check_rotation=true, timeout_ms=8000}
+Returns:
+  ok (bool), err (string|nil)
+]]
+function ToolLib.SyncHOffset(inst, toolNo, opts)
+    opts = opts or {}
+    if opts.require_idle ~= false and mc.mcCntlGetState(inst) ~= mc.MC_STATE_IDLE then
+        return false, "Controller not idle"
+    end
+    if opts.check_rotation ~= false then
+        local active = SystemLib.G68.IsActive(inst)
+        if active then return false, "Rotation active (G68); clear before H-offset" end
+    end
+    local t = tonumber(toolNo) or mc.mcToolGetCurrent(inst)
+    local seq = string.format("G49\nG43 H%d", t)
+    local ok, err = SystemLib.MDIExec(inst, seq, {wait_idle=true, timeout_ms=opts.timeout_ms or 8000})
+    if not ok then return false, err end
+    return true
+end
+
+-- Ensure subtable
+ToolLib.PromptRequest = ToolLib.PromptRequest or { __q = {} }
+
+--[[ PromptRequest
+Tiny queue for PLC↔UI prompts.
+Push(kind, payload) -> none
+Pop() -> kind(string|nil), payload(any|nil)
+]]
+function ToolLib.PromptRequest.Push(kind, payload)
+    table.insert(ToolLib.PromptRequest.__q, {k=kind, p=payload})
+end
+function ToolLib.PromptRequest.Pop()
+    if #ToolLib.PromptRequest.__q == 0 then return nil, nil end
+    local item = table.remove(ToolLib.PromptRequest.__q, 1)
+    return item.k, item.p
+end
+
+--[[ RequestVirtual
+Deploy or retract a virtual tool via one entrypoint.
+Params:
+  inst (number)
+  spec (table):
+    action       -> "deploy"|"retract"  (required)
+    toolNo       -> number (90..99 for deploy; ignored for retract)
+    requireIdle  -> boolean (default true)
+    checkConfig  -> boolean (default true)   -- verify offsets exist
+    timeout_ms   -> number (default 8000)
+Returns:
+  ok (bool), err (string|nil)
+Notes:
+  - Wraps existing ToolLib.DeployVirtual / RetractVirtual.
+  - Uses ToolLib.IsVirtual() and existing PVs (e.g., #406).
+]]
+function ToolLib.RequestVirtual(inst, spec)
+    spec = spec or {}
+    local action = tostring(spec.action or "")
+    local requireIdle = (spec.requireIdle ~= false)
+
+    if requireIdle and mc.mcCntlGetState(inst) ~= mc.MC_STATE_IDLE then
+        return false, "Controller not idle"
+    end
+
+    if action == "retract" then
+        local ok = ToolLib.RetractVirtual(inst)
+        return ok and true or false, ok and nil or "Retract failed"
+    elseif action == "deploy" then
+        local t = tonumber(spec.toolNo)
+        if not t or not ToolLib.IsVirtual(t) then
+            return false, "Invalid virtual tool number"
+        end
+        if spec.checkConfig ~= false then
+            -- quick presence check for configured offsets (any one pair)
+            local xOff, yOff = nil, nil
+            if t == 90 then
+                xOff = SystemLib.PoundVarGet(inst, 301); yOff = SystemLib.PoundVarGet(inst, 302) -- probe
+            elseif t == 91 then
+                xOff = SystemLib.PoundVarGet(inst, 318); yOff = SystemLib.PoundVarGet(inst, 319) -- laser
+            end
+            if (xOff == nil or yOff == nil) then
+                return false, "Tool offsets not configured"
+            end
+        end
+        local ok = ToolLib.DeployVirtual(inst, t)
+        return ok and true or false, ok and nil or "Deploy failed"
+    else
+        return false, "Unknown action: "..action
+    end
+end
+
+--[[ MoveToPocket
+Execute approach/seat moves for a changer pocket (machine coords).
+Params:
+  inst (number)
+  pose (table): { x=?, y=?, zSeat=?, zApproach=? } -- G53 positions
+  opts (table|nil):
+    safeZ   -> number|nil   -- retract to this machine Z first (recommended)
+    feed    -> number|nil   -- XY feed (unused if using G0), kept for future
+    plunge  -> number|nil   -- Z seat feed (default uses G1 with this feed)
+    retract -> number|nil   -- Z retract feed (if used via SafeZ)
+    dryRun  -> boolean
+Returns: ok(bool), err(string|nil)
+]]
+function ToolLib.M6.MoveToPocket(inst, pose, opts)
+    opts = opts or {}
+    local x, y, zSeat, zAp = pose.x, pose.y, pose.zSeat, pose.zApproach
+    if (not x) or (not y) or (not zSeat) then return false, "MoveToPocket: missing x/y/zSeat" end
+    local lines = {}
+
+    -- Optional global safe retract
+    if opts.safeZ then table.insert(lines, _safeZ(inst, opts.safeZ, opts.retract)) end
+
+    -- XY approach (machine)
+    table.insert(lines, _line("G90 G53 G0 X%.4f Y%.4f", x, y))
+
+    -- Z to approach (machine, rapid)
+    if zAp then table.insert(lines, _line("G90 G53 G0 Z%.4f", zAp)) end
+
+    -- Z seat (controlled feed if provided)
+    if opts.plunge and opts.plunge > 0 then
+        table.insert(lines, _line("G90 G53 G1 Z%.4f F%.3f", zSeat, opts.plunge))
+    else
+        table.insert(lines, _line("G90 G53 G0 Z%.4f", zSeat))
+    end
+
+    local prog = table.concat(lines)
+    if opts.dryRun then return true, nil end
+    return _mdi(inst, prog, true, 15000)
+end
+
+--[[ Clamp
+Actuate tool clamp and wait for confirmation input.
+Params:
+  inst (number)
+  state (string): "lock"|"unlock"
+  opts (table):
+    out       -> "OSIG_*" or id (required)
+    in        -> "ISIG_*" or id (optional but recommended)
+    lock      -> 0|1 (output value for lock)      (default 1)
+    unlock    -> 0|1 (output value for unlock)    (default 0)
+    expect    -> 0|1 (input expected after action)(optional)
+    timeout_ms-> integer (default 2000)
+    dryRun    -> boolean
+Returns: ok(bool), err(string|nil)
+]]
+function ToolLib.M6.Clamp(inst, state, opts)
+    opts = opts or {}
+    local out = opts.out
+    if not out then return false, "Clamp: out not specified" end
+    local lockVal   = (opts.lock ~= nil) and (opts.lock ~= 0) or true
+    local unlockVal = (opts.unlock ~= nil) and (opts.unlock ~= 0) or false
+    local want = (state == "lock") and lockVal or ((state == "unlock") and unlockVal or nil)
+    if want == nil then return false, "Clamp: state must be 'lock' or 'unlock'" end
+
+    if not opts.dryRun then _sig_write(inst, out, want) end
+    if opts.in and (opts.expect ~= nil) and not opts.dryRun then
+        local t0 = wx.wxGetUTCTimeMillis():ToNumber()
+        local tmo = tonumber(opts.timeout_ms or 2000)
+        while true do
+            local got = _sig_read(inst, opts.in)
+            if got == (opts.expect and 1 or 0) then return true, nil end
+            if (wx.wxGetUTCTimeMillis():ToNumber() - t0) > tmo then
+                return false, "Clamp: timeout waiting for input"
+            end
+            _sleep_ms(20)
+        end
+    end
+    return true, nil
+end
+
+--[[ VerifyPresent
+Verify tool-present sensor equals expected state (with debounce).
+Params:
+  inst (number)
+  expect (0|1)
+  opts (table|nil):
+    in          -> "ISIG_*" or id (required)
+    debounce_ms -> integer (default 50)
+    timeout_ms  -> integer (default 800)
+    dryRun      -> boolean
+Returns: ok(bool), err(string|nil)
+]]
+function ToolLib.M6.VerifyPresent(inst, expect, opts)
+    opts = opts or {}
+    if not opts.in then return false, "VerifyPresent: input not specified" end
+    if opts.dryRun then return true, nil end
+    local t0 = wx.wxGetUTCTimeMillis():ToNumber()
+    local tmo = tonumber(opts.timeout_ms or 800)
+    local deb = tonumber(opts.debounce_ms or 50)
+    local stableFor = 0
+    local last = nil
+
+    while true do
+        local now = _sig_read(inst, opts.in)
+        if now == (expect and 1 or 0) then
+            if last == now then
+                stableFor = stableFor + 10
+                if stableFor >= deb then return true, nil end
+            else
+                stableFor = 0
+            end
+            last = now
+        else
+            stableFor, last = 0, now
+        end
+        if (wx.wxGetUTCTimeMillis():ToNumber() - t0) > tmo then
+            return false, "VerifyPresent: timeout"
+        end
+        _sleep_ms(10)
+    end
+end
+
+--[[ Pickup
+Perform full pickup at pocket 'slot' (slot is opaque; you pass pose in opts).
+Params:
+  inst (number), slot (any) -- informational only
+  opts (table):
+    toolNo     -> number (physical tool)
+    pose       -> { x=?, y=?, zSeat=?, zApproach=? }   -- machine coords
+    clamp      -> { out="OSIG_*", in="ISIG_*", lock=1, unlock=0 }
+    present    -> { in="ISIG_TOOL_PRESENT", expect=1 }
+    moves      -> { feed=120, plunge=60, retract=600, safeZ=? }
+    applyH     -> boolean (default false)   -- call ToolLib.SyncHOffset at end
+    setCurrentTool -> boolean (default true)
+    hooks      -> { before=function()end, after=function()end }
+    dryRun     -> boolean
+    timeout_ms -> integer (for MDIExec)
+Returns: ok(bool), err(string|nil), info(table)
+]]
+function ToolLib.M6.Pickup(inst, slot, opts)
+    opts = opts or {}
+    local info = { reachedSeat=false, verified=false }
+    if opts.hooks and opts.hooks.before then pcall(opts.hooks.before) end
+
+    -- Optional spindle stop (if bound)
+    if SystemLib and SystemLib.Spindle and SystemLib.Spindle.StopAndWait then
+        SystemLib.Spindle.StopAndWait(inst, { dwell_s = 0 })
+    end
+
+    -- Moves
+    local ok, err = ToolLib.M6.MoveToPocket(inst, opts.pose or {}, {
+        safeZ   = opts.moves and opts.moves.safeZ or nil,
+        plunge  = opts.moves and opts.moves.plunge or nil,
+        retract = opts.moves and opts.moves.retract or nil,
+        dryRun  = opts.dryRun
+    })
+    if not ok then return false, "Pickup move: "..tostring(err) end
+    info.reachedSeat = true
+
+    -- Clamp lock
+    ok, err = ToolLib.M6.Clamp(inst, "lock", opts.clamp or {})
+    if not ok then return false, "Pickup clamp: "..tostring(err) end
+
+    -- Verify present
+    ok, err = ToolLib.M6.VerifyPresent(inst, (opts.present and (opts.present.expect or 1)) or 1, opts.present or {})
+    if not ok then return false, "Pickup verify: "..tostring(err) end
+    info.verified = true
+
+    -- Retract to safe Z
+    if (opts.moves and opts.moves.safeZ) and not opts.dryRun then
+        local line = _safeZ(inst, opts.moves.safeZ, opts.moves.retract)
+        local eok, eerr = _mdi(inst, line, true, opts.timeout_ms or 8000)
+        if not eok then return false, "Pickup retract: "..tostring(eerr) end
+    end
+
+    -- Set current tool and apply H
+    if opts.setCurrentTool ~= false and opts.toolNo then
+        pcall(mc.mcToolSetCurrent, inst, tonumber(opts.toolNo))
+    end
+    if opts.applyH and opts.toolNo and ToolLib.SyncHOffset then
+        local hok, herr = ToolLib.SyncHOffset(inst, tonumber(opts.toolNo), { require_idle = true, check_rotation = true })
+        if not hok then return false, "Pickup H: "..tostring(herr) end
+    end
+
+    if opts.hooks and opts.hooks.after then pcall(opts.hooks.after, info) end
+    return true, nil, info
+end
+
+--[[ Dropoff
+Perform full dropoff at pocket 'slot'.
+Params:
+  inst (number), slot (any)
+  opts (table):
+    pose       -> { x=?, y=?, zSeat=?, zApproach=? }
+    clamp      -> { out="OSIG_*", in="ISIG_*", lock=1, unlock=0 }
+    present    -> { in="ISIG_TOOL_PRESENT", expect=0 }
+    moves      -> { feed=120, plunge=60, retract=600, safeZ=? }
+    clearH     -> boolean (default true)  -- send G49 after drop
+    clearCurrentTool -> boolean (default false)
+    hooks      -> { before=function()end, after=function()end }
+    dryRun     -> boolean
+    timeout_ms -> integer
+Returns: ok(bool), err(string|nil), info(table)
+]]
+function ToolLib.M6.Dropoff(inst, slot, opts)
+    opts = opts or {}
+    local info = { leftTool=false, verified=false }
+    if opts.hooks and opts.hooks.before then pcall(opts.hooks.before) end
+
+    -- Moves
+    local ok, err = ToolLib.M6.MoveToPocket(inst, opts.pose or {}, {
+        safeZ   = opts.moves and opts.moves.safeZ or nil,
+        plunge  = opts.moves and opts.moves.plunge or nil,
+        retract = opts.moves and opts.moves.retract or nil,
+        dryRun  = opts.dryRun
+    })
+    if not ok then return false, "Dropoff move: "..tostring(err) end
+
+    -- Clamp unlock
+    ok, err = ToolLib.M6.Clamp(inst, "unlock", opts.clamp or {})
+    if not ok then return false, "Dropoff clamp: "..tostring(err) end
+
+    -- Verify absent
+    ok, err = ToolLib.M6.VerifyPresent(inst, (opts.present and (opts.present.expect or 0)) or 0, opts.present or {})
+    if not ok then return false, "Dropoff verify: "..tostring(err) end
+    info.verified, info.leftTool = true, true
+
+    -- Retract to safe Z
+    if (opts.moves and opts.moves.safeZ) and not opts.dryRun then
+        local line = _safeZ(inst, opts.moves.safeZ, opts.moves.retract)
+        local eok, eerr = _mdi(inst, line, true, opts.timeout_ms or 8000)
+        if not eok then return false, "Dropoff retract: "..tostring(eerr) end
+    end
+
+    -- Clear H if requested
+    if opts.clearH ~= false and not opts.dryRun then
+        local eok, eerr = _mdi(inst, "G49\n", true, opts.timeout_ms or 8000)
+        if not eok then return false, "Dropoff clearH: "..tostring(eerr) end
+    end
+
+    if opts.clearCurrentTool then pcall(mc.mcToolSetCurrent, inst, 0) end
+
+    if opts.hooks and opts.hooks.after then pcall(opts.hooks.after, info) end
+    return true, nil, info
+end
+
+--[[ ProbeLength
+Run a 2-touch Z probing cycle at a pad and report contact Zs (machine coords).
+Params:
+  inst (number), toolNo (number)
+  opts (table):
+    pad     -> { x=?, y=?, zClear=?, zSearchMin=? }   -- G53 machine coords
+    feeds   -> { search=50, verify=15, retract=300 }
+    backoff -> number (mm above first strike before verify touch, default 2.0)
+    requireNoRotation -> boolean (default true) -- error if rotation active
+    dryRun  -> boolean
+    timeout_ms -> integer
+Returns: ok(bool), err(string|nil), data(table)
+  data = { strike1Z=?, strike2Z=?, repeatability=?, contactZ=? }
+Notes:
+  - Does NOT write tool table. It measures contact Zs; your M6 decides how to compute H.
+  - Uses G53/G90 moves; G31 for probing; reads probe pos on Z axis (axis index 2).
+]]
+function ToolLib.M6.ProbeLength(inst, toolNo, opts)
+    opts = opts or {}
+    local pad = opts.pad or {}
+    local feeds = opts.feeds or {}
+    local zClear = pad.zClear
+    local zMin   = pad.zSearchMin
+    local backoff = tonumber(opts.backoff or 2.0)
+    if not (pad.x and pad.y and zClear and zMin) then
+        return false, "ProbeLength: pad requires x,y,zClear,zSearchMin"
+    end
+
+    -- Rotation guard
+    if (opts.requireNoRotation ~= false) and SystemLib and SystemLib.G68 and SystemLib.G68.IsActive then
+        local active = SystemLib.G68.IsActive(inst)
+        if active then return false, "ProbeLength: rotation active (G68); clear before probing" end
+    end
+
+    -- Stop spindle (optional helper)
+    if SystemLib and SystemLib.Spindle and SystemLib.Spindle.StopAndWait then
+        SystemLib.Spindle.StopAndWait(inst, { dwell_s = 0 })
+    end
+
+    -- Modal snapshot (optional)
+    local snap = nil
+    if SystemLib and SystemLib.Modals and SystemLib.Modals.Capture then
+        snap = SystemLib.Modals.Capture(inst)
+    end
+
+    if opts.dryRun then
+        return true, nil, { strike1Z = zClear - 0.1, strike2Z = zClear - 0.12, repeatability = 0.02, contactZ = zClear - 0.12 }
+    end
+
+    -- Move to pad XY and clear Z
+    local prog = {}
+    table.insert(prog, _line("G90 G53 G0 X%.4f Y%.4f", pad.x, pad.y))
+    table.insert(prog, _line("G90 G53 G0 Z%.4f", zClear))
+    local ok, err = _mdi(inst, table.concat(prog), true, opts.timeout_ms or 12000)
+    if not ok then return false, "ProbeLength move: "..tostring(err) end
+
+    -- First probe (search)
+    local g31a = _line("G90 G53 G31 Z%.4f F%.3f", zMin, feeds.search or 50)
+    ok, err = _mdi(inst, g31a, true, opts.timeout_ms or 12000)
+    if not ok then return false, "ProbeLength G31 search: "..tostring(err) end
+    local strike1 = mc.mcAxisGetProbePos(inst, 2) or nil
+    if not strike1 then return false, "ProbeLength: no probe strike (1)" end
+
+    -- Retract backoff
+    local zUp = strike1 + backoff
+    ok, err = _mdi(inst, _line("G90 G53 G0 Z%.4f", zUp), true, opts.timeout_ms or 12000)
+    if not ok then return false, "ProbeLength retract: "..tostring(err) end
+
+    -- Second probe (verify)
+    local g31b = _line("G90 G53 G31 Z%.4f F%.3f", zMin, feeds.verify or (feeds.search or 50) * 0.3)
+    ok, err = _mdi(inst, g31b, true, opts.timeout_ms or 12000)
+    if not ok then return false, "ProbeLength G31 verify: "..tostring(err) end
+    local strike2 = mc.mcAxisGetProbePos(inst, 2) or nil
+    if not strike2 then return false, "ProbeLength: no probe strike (2)" end
+
+    -- Retract to clear
+    ok, err = _mdi(inst, _line("G90 G53 G0 Z%.4f", zClear), true, opts.timeout_ms or 12000)
+    if not ok then return false, "ProbeLength clear: "..tostring(err) end
+
+    -- Restore modals
+    if snap and SystemLib and SystemLib.Modals and SystemLib.Modals.Restore then
+        pcall(SystemLib.Modals.Restore, inst, snap)
+    end
+
+    local rep = math.abs((strike2 or 0) - (strike1 or 0))
+    local data = { strike1Z = strike1, strike2Z = strike2, repeatability = rep, contactZ = strike2 }
+    return true, nil, data
+end
+
+--[[ GetPose
+Resolves rack/pocket pose for a physical tool from the tool table.
+Returns: ok(bool), pose|nil, err|nil
+pose = { x=number, y=number, zSeat=number, zApproach=nil }
+]]
+function ToolLib.M6.GetPocketPose(inst, toolNo)
+  if not toolNo or toolNo < 1 or toolNo >= 90 then
+    return false, nil, "GetPocketPose: expected physical tool (1..89)"
+  end
+  local x = mc.mcToolGetDataExDbl(inst, toolNo, "XToolChange") or 0
+  local y = mc.mcToolGetDataExDbl(inst, toolNo, "YToolChange") or 0
+  local z = mc.mcToolGetDataExDbl(inst, toolNo, "ZToolChange")
+
+  if (math.abs(x) < 1e-9 and math.abs(y) < 1e-9) then
+    return false, nil, string.format("GetPocketPose: T%d rack XY not configured", toolNo)
+  end
+  if z == nil then
+    return false, nil, string.format("GetPocketPose: T%d ZToolChange not configured", toolNo)
+  end
+
+  return true, { x = x, y = y, zSeat = z, zApproach = nil }, nil
+end
+
+--[[ Pullout
+Performs a linear pullout along Y in machine coordinates after pickup/lock.
+Returns: ok(bool), err|nil
+]]
+function ToolLib.M6.Pullout(inst, pose, pullout, feed)
+  if not pose or pose.y == nil then
+    return false, "Pullout: pose.y is required"
+  end
+  local dist = tonumber(pullout or 0)
+  if dist <= 0 then return true end -- nothing to do
+  local tgtY = pose.y - dist
+  local line = string.format("G90 G53 G1 Y%.4f F%.3f\n", tgtY, tonumber(feed or 100))
+  return SystemLib.MDIExec(inst, line, { wait_idle = true, timeout_ms = 8000 })
+end
+
+--[[ M6.Cleanup
+
+Idempotent cleanup for M6 orchestration.
+This function centralizes all execution related to M6 cleanup so macros
+remain logic-only. It should be pasted into ToolLib near other ToolLib.M6.* helpers.
+
+Behavior:
+  - Clears UI-suppress and M6-running poundvars (#498, #499)
+  - Attempts a non-fatal safe retract to the configured tool-change Z (PV 308)
+  - Calls ToolLib.recover(inst) if present (best-effort)
+  - Logs a debug message
+
+Returns:
+  - true on completion (always returns true; non-fatal)
+]]
+function ToolLib.M6.Cleanup(inst)
+  -- require SystemLib via pcall to avoid hard failure during early init
+  local ok_sys, SystemLib = pcall(require, "SystemLib")
+  if not ok_sys or not SystemLib then
+    -- best-effort: clear flags using mc API if available
+    pcall(function() mc.mcCntlSetLastError(inst, "ToolLib.M6.Cleanup: SystemLib missing") end)
+    return true
+  end
+
+  -- Clear flags (idempotent)
+  pcall(SystemLib.PoundVarSet, inst, 498, 0)
+  pcall(SystemLib.PoundVarSet, inst, 499, 0)
+
+  -- Safe retract to tool-change Z (non-fatal)
+  local ok_z, z = pcall(SystemLib.PoundVarGet, inst, 308)
+  z = tonumber(z) or 0
+  if z ~= 0 then
+    pcall(function()
+      SystemLib.MDIExec(inst, string.format("G53 G0 Z%.4f", z), { wait_idle = true, timeout_ms = 8000 })
+    end)
+  end
+
+  -- Call library recover if present
+  if ToolLib and ToolLib.recover then
+    pcall(ToolLib.recover, inst)
+  end
+
+  pcall(SystemLib.Log, inst, "ToolLib.M6.Cleanup executed", "DEBUG")
+  return true
+end
+
+
+return ToolLib

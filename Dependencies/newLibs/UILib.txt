@@ -1,0 +1,1631 @@
+-- UILib.lua v2.0
+-- UI components and controls for Mach4 dialogs
+-- Provides consistent UI patterns and reusable controls
+
+local UILib = {}
+
+-- Load SystemLib for core utilities
+local SystemLib = require("SystemLib")
+
+--[[ UILib.DialogGeometrySave
+Save dialog position and size to profile
+Params:
+  inst: Mach4 instance
+  name: Dialog identifier
+  x, y: Position
+  w, h: Size
+Returns:
+  success: true if saved
+--]]
+function UILib.DialogGeometrySave(inst, name, x, y, w, h)
+    local section = "DialogGeometry"
+    SystemLib.ProfileWrite(inst, section, name.."_x", x)
+    SystemLib.ProfileWrite(inst, section, name.."_y", y)
+    SystemLib.ProfileWrite(inst, section, name.."_w", w)
+    SystemLib.ProfileWrite(inst, section, name.."_h", h)
+    return true
+end
+
+--[[ UILib.DialogGeometryLoad
+Load dialog position and size with screen validation
+Params:
+  inst: Mach4 instance
+  name: Dialog identifier
+  defaultW, defaultH: Default size if not saved
+Returns:
+  x, y, w, h: Validated position and size
+--]]
+function UILib.DialogGeometryLoad(inst, name, defaultW, defaultH)
+    local section = "DialogGeometry"
+    
+    -- Get screen dimensions for validation
+    local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
+    local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
+    
+    -- Load saved values
+    local x = tonumber(SystemLib.ProfileRead(inst, section, name.."_x", "-1")) or -1
+    local y = tonumber(SystemLib.ProfileRead(inst, section, name.."_y", "-1")) or -1
+    local w = tonumber(SystemLib.ProfileRead(inst, section, name.."_w", tostring(defaultW))) or defaultW
+    local h = tonumber(SystemLib.ProfileRead(inst, section, name.."_h", tostring(defaultH))) or defaultH
+    
+    -- Validate position is on screen
+    if x < 0 or y < 0 or x > sw - 100 or y > sh - 100 then
+        -- Center if invalid
+        x = math.floor((sw - w) / 2)
+        y = math.floor((sh - h) / 2)
+    end
+    
+    -- Ensure minimum size
+    w = math.max(w, 200)
+    h = math.max(h, 150)
+    
+    -- Ensure fits on screen
+    w = math.min(w, sw - 50)
+    h = math.min(h, sh - 50)
+    
+    return x, y, w, h
+end
+
+--[[ UILib.CreateDialog
+Create a dialog with saved geometry
+Params:
+  parent: Parent window or nil
+  title: Dialog title
+  name: Dialog identifier for geometry saving
+  defaultW, defaultH: Default size
+  style: Dialog style flags (optional)
+Returns:
+  dialog: Created dialog
+--]]
+function UILib.CreateDialog(parent, title, name, defaultW, defaultH, style)
+    local inst = mc.mcGetInstance()
+    
+    -- Load saved geometry
+    local x, y, w, h = UILib.DialogGeometryLoad(inst, name, defaultW, defaultH)
+    
+    -- Default style with resize border
+    style = style or (wx.wxDEFAULT_DIALOG_STYLE + wx.wxRESIZE_BORDER)
+    
+    -- Create dialog
+    local dialog = wx.wxDialog(parent, wx.wxID_ANY, title,
+                               wx.wxPoint(x, y), wx.wxSize(w, h), style)
+    
+    -- Store name for save on close
+    dialog.GeometryName = name
+    
+    -- Save geometry on close
+    dialog:Connect(wx.wxEVT_CLOSE_WINDOW, function(event)
+        local pos = dialog:GetPosition()
+        local size = dialog:GetSize()
+        UILib.DialogGeometrySave(inst, dialog.GeometryName,
+                                    pos:GetX(), pos:GetY(),
+                                    size:GetWidth(), size:GetHeight())
+        event:Skip()
+    end)
+    
+    return dialog
+end
+
+--[[ UILib.CreateDialogWithPanel
+Create dialog with panel and main sizer
+Params:
+  parent: Parent window
+  title: Dialog title
+  name: Dialog identifier
+  defaultW, defaultH: Default size
+Returns:
+  dialog: Created dialog
+  panel: Main panel
+  sizer: Main vertical sizer
+--]]
+function UILib.CreateDialogWithPanel(parent, title, name, defaultW, defaultH)
+    local dialog = UILib.CreateDialog(parent, title, name, defaultW, defaultH)
+    local panel = wx.wxPanel(dialog, wx.wxID_ANY)
+    local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    dialog:SetMinSize(wx.wxSize(200, 150))
+    
+    return dialog, panel, mainSizer
+end
+
+--[[ UILib.CreateNumberInput
+Create labeled number input field
+Params:
+  panel: Parent panel
+  label: Label text
+  value: Initial value
+  width: Field width (optional)
+Returns:
+  sizer: Horizontal sizer containing controls
+  input: Text control reference
+  labelCtrl: Label control reference
+--]]
+function UILib.CreateNumberInput(panel, label, value, width)
+    local sizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    
+    local labelCtrl = wx.wxStaticText(panel, wx.wxID_ANY, label)
+    sizer:Add(labelCtrl, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+    
+    local input = wx.wxTextCtrl(panel, wx.wxID_ANY, tostring(value))
+    if width then
+        input:SetMinSize(wx.wxSize(width, -1))
+    end
+    sizer:Add(input, 1, wx.wxALIGN_CENTER_VERTICAL)
+    
+    -- Add helper method
+    function input:GetNumber(defaultValue)
+        local val = tonumber(self:GetValue())
+        return val or defaultValue or 0
+    end
+    
+    return sizer, input, labelCtrl
+end
+
+--[[ UILib.CreateChoice
+Create dropdown choice control
+Params:
+  panel: Parent panel
+  label: Label text (optional)
+  choices: Array of choice strings
+  selection: Initial selection index (0-based)
+Returns:
+  sizer: Horizontal sizer
+  choice: Choice control
+--]]
+function UILib.CreateChoice(panel, label, choices, selection)
+    local sizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    
+    if label and label ~= "" then
+        local labelCtrl = wx.wxStaticText(panel, wx.wxID_ANY, label)
+        sizer:Add(labelCtrl, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+    end
+    
+    local choice = wx.wxChoice(panel, wx.wxID_ANY,
+                               wx.wxDefaultPosition, wx.wxDefaultSize, choices)
+    choice:SetSelection(selection or 0)
+    sizer:Add(choice, 1, wx.wxALIGN_CENTER_VERTICAL)
+    
+    return sizer, choice
+end
+
+--[[ UILib.CreateRadioBox
+Create radio button group
+Params:
+  panel: Parent panel
+  label: Group label
+  choices: Array of choice strings
+  selection: Initial selection (0-based)
+  columns: Number of columns (default 1)
+Returns:
+  radioBox: Radio box control
+--]]
+function UILib.CreateRadioBox(panel, label, choices, selection, columns)
+    columns = columns or 1
+    local radioBox = wx.wxRadioBox(panel, wx.wxID_ANY, label,
+                                   wx.wxDefaultPosition, wx.wxDefaultSize,
+                                   choices, columns, wx.wxRA_SPECIFY_COLS)
+    radioBox:SetSelection(selection or 0)
+    return radioBox
+end
+
+--[[ UILib.CreateSliderCombo
+Create synchronized slider with text input
+Params:
+  panel: Parent panel
+  label: Label text (optional)
+  minVal: Minimum value
+  maxVal: Maximum value
+  value: Initial value
+  step: Step increment (optional)
+Returns:
+  sizer: Vertical sizer containing controls
+  slider: Slider control
+  textCtrl: Text input control
+--]]
+function UILib.CreateSliderCombo(panel, label, minVal, maxVal, value, step)
+    local sizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    -- Add label if provided
+    if label and label ~= "" then
+        local labelCtrl = wx.wxStaticText(panel, wx.wxID_ANY, label)
+        sizer:Add(labelCtrl, 0, wx.wxBOTTOM, 3)
+    end
+    
+    -- Create horizontal sizer for slider and text
+    local hSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    
+    -- Create slider
+    local slider = wx.wxSlider(panel, wx.wxID_ANY, value, minVal, maxVal,
+                               wx.wxDefaultPosition, wx.wxSize(200, -1))
+    
+    -- Create text input
+    local textCtrl = wx.wxTextCtrl(panel, wx.wxID_ANY, tostring(value),
+                                   wx.wxDefaultPosition, wx.wxSize(60, -1))
+    
+    hSizer:Add(slider, 1, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+    hSizer:Add(textCtrl, 0, wx.wxALIGN_CENTER_VERTICAL)
+    
+    sizer:Add(hSizer, 0, wx.wxEXPAND)
+    
+    -- Synchronize slider and text
+    slider:Connect(wx.wxEVT_SLIDER, function(event)
+        textCtrl:SetValue(tostring(slider:GetValue()))
+        event:Skip()
+    end)
+    
+    textCtrl:Connect(wx.wxEVT_TEXT, function(event)
+        local val = tonumber(textCtrl:GetValue())
+        if val and val >= minVal and val <= maxVal then
+            slider:SetValue(math.floor(val + 0.5))  -- Round to nearest
+        end
+        event:Skip()
+    end)
+    
+    -- Add helper method to get value
+    function slider:GetSyncedValue()
+        return tonumber(textCtrl:GetValue()) or slider:GetValue()
+    end
+    
+    return sizer, slider, textCtrl
+end
+
+--[[ UILib.ShowCustomConfirm
+Displays a versatile modal dialog for user confirmation, input, or notification.
+This function is designed to handle a wide range of UI interaction patterns through
+a single, declarative specification table.
+
+Params:
+  spec (table) - A table specifying the dialog's content and behavior.
+    - title (string): The text for the dialog's title bar. (Default: "Confirm")
+    - message (string): The main text to display. Supports newlines.
+    - icon (string): "info", "warning", "error", "question". (Default: "question")
+    - geometryName (string): Optional name to save/load dialog position.
+    - buttons (table): An array of button definitions. Each is a table:
+        {id="ok", label="Proceed", style="default"|"destructive", isDefault=true}
+        - 'id' is the value returned when the button is clicked.
+        - 'style' can be 'destructive' to color the button red as a warning.
+    - input (table): Optional text input field.
+        {label="Type 'DELETE' to confirm:", match="DELETE", isPassword=false}
+        - 'match' will disable the default button until the input text matches exactly.
+    - checkbox (table): Optional checkbox.
+        {label="Do not show this again", checked=false}
+Returns:
+  (table|nil) - A table with the results, or nil if the dialog was closed/escaped.
+    Example: {buttonId="ok", checkbox=true, inputText="some value"}
+--]]
+function UILib.ShowCustomConfirm(spec)
+    spec = spec or {}
+    local title = spec.title or "Confirm"
+    local message = spec.message or "Are you sure?"
+    local geometryName = spec.geometryName or "CustomConfirmDialog"
+    
+    -- Create dialog with geometry management
+    local dialog = UILib.CreateDialog(UILib.GetSafeParent(), title, geometryName, 450, 200, wx.wxDEFAULT_DIALOG_STYLE)
+    local panel = wx.wxPanel(dialog, wx.wxID_ANY)
+    local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    -- Main content sizer (icon + message)
+    local contentSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    
+    -- 1. Icon
+    local iconMap = {
+        info = wx.wxICON_INFORMATION,
+        warning = wx.wxICON_WARNING,
+        error = wx.wxICON_ERROR,
+        question = wx.wxICON_QUESTION,
+    }
+    local wxIcon = iconMap[spec.icon] or wx.wxICON_QUESTION
+    local stockBitmap = wx.wxArtProvider.GetBitmap(wx.wxART_INFORMATION, wx.wxART_MESSAGE_BOX, wx.wxSize(32, 32)) -- Fallback
+    if wxIcon == wx.wxICON_INFORMATION then stockBitmap = wx.wxArtProvider.GetBitmap(wx.wxART_INFORMATION, wx.wxART_MESSAGE_BOX, wx.wxSize(32, 32)) end
+    if wxIcon == wx.wxICON_WARNING then stockBitmap = wx.wxArtProvider.GetBitmap(wx.wxART_WARNING, wx.wxART_MESSAGE_BOX, wx.wxSize(32, 32)) end
+    if wxIcon == wx.wxICON_ERROR then stockBitmap = wx.wxArtProvider.GetBitmap(wx.wxART_ERROR, wx.wxART_MESSAGE_BOX, wx.wxSize(32, 32)) end
+    if wxIcon == wx.wxICON_QUESTION then stockBitmap = wx.wxArtProvider.GetBitmap(wx.wxART_QUESTION, wx.wxART_MESSAGE_BOX, wx.wxSize(32, 32)) end
+    
+    local iconCtrl = wx.wxStaticBitmap(panel, wx.wxID_ANY, stockBitmap)
+    contentSizer:Add(iconCtrl, 0, wx.wxALL + wx.wxALIGN_TOP, 15)
+
+    -- 2. Message
+    local msgText = wx.wxStaticText(panel, wx.wxID_ANY, message)
+    msgText:Wrap(350)
+    contentSizer:Add(msgText, 1, wx.wxALL + wx.wxALIGN_CENTER_VERTICAL, 15)
+    mainSizer:Add(contentSizer, 0, wx.wxEXPAND)
+
+    -- 3. Optional Input Field
+    local inputCtrl
+    if spec.input then
+        local inputSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+        local inputLabel = wx.wxStaticText(panel, wx.wxID_ANY, spec.input.label or "Input:")
+        inputSizer:Add(inputLabel, 0, wx.wxLEFT + wx.wxRIGHT, 15)
+        local style = spec.input.isPassword and wx.wxTE_PASSWORD or wx.wxTE_PROCESS_ENTER
+        inputCtrl = wx.wxTextCtrl(panel, wx.wxID_ANY, "", wx.wxDefaultPosition, wx.wxDefaultSize, style)
+        inputSizer:Add(inputCtrl, 0, wx.wxEXPAND + wx.wxALL, 15)
+        mainSizer:Add(inputSizer, 0, wx.wxEXPAND)
+    end
+
+    -- 4. Optional Checkbox
+    local checkboxCtrl
+    if spec.checkbox then
+        checkboxCtrl = UILib.CreateCheckBox(panel, spec.checkbox.label or "Option", spec.checkbox.checked or false)
+        mainSizer:Add(checkboxCtrl, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, 15)
+    end
+
+    mainSizer:AddStretchSpacer()
+    mainSizer:Add(wx.wxStaticLine(panel, wx.wxID_ANY), 0, wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT, 10)
+
+    -- 5. Buttons
+    local btnSizer = wx.wxStdDialogButtonSizer()
+    local result = { buttonId = nil } -- Holds the final result
+    local defaultButtonCtrl
+    
+    for _, btnSpec in ipairs(spec.buttons or {{id="ok", label="OK", isDefault=true}}) do
+        local btn = wx.wxButton(panel, wx.wxID_ANY, btnSpec.label)
+        btn:Connect(wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
+            result.buttonId = btnSpec.id
+            dialog:EndModal(wx.wxID_OK)
+        end)
+
+        if btnSpec.style == "destructive" then
+            btn:SetBackgroundColour(wx.wxColour(200, 0, 0))
+            btn:SetForegroundColour(wx.wxWHITE)
+        end
+        
+        if btnSpec.isDefault then
+            btn:SetDefault()
+            defaultButtonCtrl = btn
+        end
+        btnSizer:AddButton(btn)
+    end
+    btnSizer:Realize()
+    mainSizer:Add(btnSizer, 0, wx.wxEXPAND + wx.wxALL, 10)
+
+    -- Input validation logic
+    if spec.input and spec.input.match and defaultButtonCtrl then
+        local function validateInput()
+            local text = inputCtrl:GetValue()
+            local isMatch = (text == spec.input.match)
+            defaultButtonCtrl:Enable(isMatch)
+        end
+        inputCtrl:Connect(wx.wxEVT_TEXT, validateInput)
+        validateInput() -- Initial check
+    end
+
+    panel:SetSizer(mainSizer)
+    dialog:Fit()
+    dialog:Centre()
+
+    -- Final result gathering
+    if dialog:ShowModal() == wx.wxID_OK then
+        if checkboxCtrl then result.checkbox = checkboxCtrl:GetValue() end
+        if inputCtrl then result.inputText = inputCtrl:GetValue() end
+    else
+        result = nil -- Dialog was closed or escaped
+    end
+    
+    dialog:Destroy()
+    return result
+end
+
+--[[ UILib.CreateFilePicker
+Create file picker control
+Params:
+  panel: Parent panel
+  label: Label text (optional)
+  path: Initial path (optional)
+  wildcard: File filter (default "*.*")
+  style: Picker style (optional)
+Returns:
+  sizer: Horizontal sizer
+  picker: File picker control
+--]]
+function UILib.CreateFilePicker(panel, label, path, wildcard, style)
+    local sizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    
+    if label and label ~= "" then
+        local labelCtrl = wx.wxStaticText(panel, wx.wxID_ANY, label)
+        sizer:Add(labelCtrl, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxRIGHT, 5)
+    end
+    
+    style = style or (wx.wxFLP_USE_TEXTCTRL + wx.wxFLP_OPEN)
+    
+    local picker = wx.wxFilePickerCtrl(panel, wx.wxID_ANY, path or "",
+                                       "Select File", wildcard or "*.*",
+                                       wx.wxDefaultPosition, wx.wxDefaultSize,
+                                       style)
+    sizer:Add(picker, 1, wx.wxALIGN_CENTER_VERTICAL)
+    
+    return sizer, picker
+end
+
+--[[ UILib.CreateCheckBox
+Create checkbox control
+Params:
+  panel: Parent panel
+  label: Checkbox label
+  checked: Initial state
+Returns:
+  checkBox: Checkbox control
+--]]
+function UILib.CreateCheckBox(panel, label, checked)
+    local checkBox = wx.wxCheckBox(panel, wx.wxID_ANY, label)
+    checkBox:SetValue(checked or false)
+    return checkBox
+end
+
+--[[ UILib.CreateButtonSizer
+Create standard OK/Cancel button sizer
+Params:
+  panel: Parent panel
+  okText: OK button text (default "OK")
+  cancelText: Cancel button text (default "Cancel")
+Returns:
+  sizer: Button sizer
+  okBtn: OK button reference
+  cancelBtn: Cancel button reference
+--]]
+function UILib.CreateButtonSizer(panel, okText, cancelText)
+    local buttonSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    local okBtn = wx.wxButton(panel, wx.wxID_OK, okText or "OK")
+    local cancelBtn = wx.wxButton(panel, wx.wxID_CANCEL, cancelText or "Cancel")
+    
+    okBtn:SetMinSize(wx.wxSize(90, 30))
+    cancelBtn:SetMinSize(wx.wxSize(90, 30))
+    
+    buttonSizer:Add(okBtn, 0, wx.wxRIGHT, 5)
+    buttonSizer:Add(cancelBtn, 0)
+    
+    return buttonSizer, okBtn, cancelBtn
+end
+
+--[[ UILib.CreateProbeDirectionSelector
+Create cross-pattern probe direction selector
+Params:
+  panel: Parent panel
+  selectedDir: Initial selection (1=+X, 2=-X, 3=+Y, 4=-Y)
+Returns:
+  box: Static box sizer containing controls
+  getSelected: Function returning selected direction
+  buttons: Table of button references
+--]]
+function UILib.CreateProbeDirectionSelector(panel, selectedDir)
+    local box = wx.wxStaticBoxSizer(wx.wxVERTICAL, panel, "Probe Direction")
+    local grid = wx.wxGridSizer(3, 3, 5, 5)
+    
+    local btnSize = wx.wxSize(50, 30)
+    local buttons = {}
+    local selected = selectedDir or 1
+    
+    -- Row 1: empty, +Y, empty
+    grid:Add(0, 0, 0, wx.wxEXPAND)
+    
+    buttons[3] = wx.wxToggleButton(panel, wx.wxNewId(), "+Y")
+    buttons[3]:SetMinSize(btnSize)
+    grid:Add(buttons[3], 0, wx.wxEXPAND)
+    
+    grid:Add(0, 0, 0, wx.wxEXPAND)
+    
+    -- Row 2: -X, empty, +X
+    buttons[2] = wx.wxToggleButton(panel, wx.wxNewId(), "-X")
+    buttons[2]:SetMinSize(btnSize)
+    grid:Add(buttons[2], 0, wx.wxEXPAND)
+    
+    grid:Add(0, 0, 0, wx.wxEXPAND)
+    
+    buttons[1] = wx.wxToggleButton(panel, wx.wxNewId(), "+X")
+    buttons[1]:SetMinSize(btnSize)
+    grid:Add(buttons[1], 0, wx.wxEXPAND)
+    
+    -- Row 3: empty, -Y, empty
+    grid:Add(0, 0, 0, wx.wxEXPAND)
+    
+    buttons[4] = wx.wxToggleButton(panel, wx.wxNewId(), "-Y")
+    buttons[4]:SetMinSize(btnSize)
+    grid:Add(buttons[4], 0, wx.wxEXPAND)
+    
+    grid:Add(0, 0, 0, wx.wxEXPAND)
+    
+    -- Update button colors
+    local function updateButtons()
+        for i = 1, 4 do
+            if i == selected then
+                buttons[i]:SetValue(true)
+                buttons[i]:SetBackgroundColour(wx.wxColour(135, 180, 225))
+            else
+                buttons[i]:SetValue(false)
+                buttons[i]:SetBackgroundColour(wx.wxSystemSettings.GetColour(wx.wxSYS_COLOUR_BTNFACE))
+            end
+            buttons[i]:Refresh()
+        end
+    end
+    
+    -- Connect events
+    for i = 1, 4 do
+        buttons[i]:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TOGGLEBUTTON_CLICKED,
+            function(event)
+                selected = i
+                updateButtons()
+                event:Skip()
+            end)
+    end
+    
+    updateButtons()
+    box:Add(grid, 0, wx.wxALL + wx.wxALIGN_CENTER_HORIZONTAL, 10)
+    
+    return box, function() return selected end, buttons
+end
+
+--[[ UILib.CreateProbeDepthInput
+Create probe depth input with validation
+Params:
+  panel: Parent panel
+  label: Label text
+  value: Initial value
+  min: Minimum value
+  max: Maximum value
+  tooltip: Tooltip text (optional)
+Returns:
+  sizer: Vertical sizer
+  input: Input control
+  getValue: Function returning validated value
+--]]
+function UILib.CreateProbeDepthInput(panel, label, value, min, max, tooltip)
+    local sizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    local lbl = wx.wxStaticText(panel, wx.wxID_ANY, label or "Probe Depth:")
+    sizer:Add(lbl, 0, wx.wxBOTTOM, 3)
+    
+    local input = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format("%.4f", value or 0.1))
+    input:SetMinSize(wx.wxSize(100, -1))
+    
+    if tooltip then
+        input:SetToolTip(tooltip)
+        lbl:SetToolTip(tooltip)
+    end
+    
+    local feedback = wx.wxStaticText(panel, wx.wxID_ANY, "")
+    feedback:SetFont(wx.wxFont(8, wx.wxFONTFAMILY_DEFAULT,
+                               wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
+    
+    -- Real-time validation
+    input:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_UPDATED, function(event)
+        local val = tonumber(input:GetValue())
+        
+        if not val then
+            feedback:SetLabel("Invalid number")
+            feedback:SetForegroundColour(wx.wxColour(255, 0, 0))
+        elseif val < min then
+            feedback:SetLabel(string.format("Minimum: %.3f", min))
+            feedback:SetForegroundColour(wx.wxColour(255, 128, 0))
+        elseif val > max then
+            feedback:SetLabel(string.format("Maximum: %.3f", max))
+            feedback:SetForegroundColour(wx.wxColour(255, 128, 0))
+        else
+            feedback:SetLabel("")
+        end
+        
+        panel:Layout()
+        event:Skip()
+    end)
+    
+    sizer:Add(input, 0, wx.wxEXPAND)
+    sizer:Add(feedback, 0, wx.wxTOP, 2)
+    
+    -- Accessor function with clamping
+    local function getValue()
+        local val = tonumber(input:GetValue()) or value or 0
+        return math.max(min, math.min(max, val))
+    end
+    
+    return sizer, input, getValue
+end
+
+--[[ UILib.CreateSectionHeader
+Create section header with optional description
+Params:
+  panel: Parent panel
+  title: Section title
+  description: Optional description text
+Returns:
+  sizer: Vertical sizer containing header
+--]]
+function UILib.CreateSectionHeader(panel, title, description)
+    local sizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    -- Add separator if not first section
+    if panel.SectionCount and panel.SectionCount > 0 then
+        sizer:Add(wx.wxStaticLine(panel, wx.wxID_ANY), 0,
+                  wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT + wx.wxTOP, 15)
+    end
+    
+    panel.SectionCount = (panel.SectionCount or 0) + 1
+    
+    -- Title
+    local headerText = wx.wxStaticText(panel, wx.wxID_ANY, title)
+    headerText:SetFont(wx.wxFont(11, wx.wxFONTFAMILY_DEFAULT,
+                                wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_BOLD))
+    sizer:Add(headerText, 0, wx.wxALL, 10)
+    
+    -- Description
+    if description then
+        local descText = wx.wxStaticText(panel, wx.wxID_ANY, description)
+        descText:SetForegroundColour(wx.wxColour(80, 80, 80))
+        descText:Wrap(450)
+        sizer:Add(descText, 0, wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, 10)
+    end
+    
+    return sizer
+end
+
+--[[ UILib.CreateProgress
+Create progress dialog
+Params:
+  title: Dialog title
+  message: Initial message
+  maximum: Maximum value (default 100)
+  parent: Parent window (optional)
+Returns:
+  dialog: Progress dialog with helper methods
+--]]
+function UILib.CreateProgress(title, message, maximum, parent)
+    local dialog = wx.wxProgressDialog(title, message, maximum or 100, parent,
+                                       wx.wxPD_APP_MODAL + wx.wxPD_AUTO_HIDE +
+                                       wx.wxPD_CAN_ABORT + wx.wxPD_ELAPSED_TIME)
+    
+    -- Add helper methods
+    function dialog:UpdateProgress(value, newMessage)
+        return self:Update(value, newMessage or message)
+    end
+    
+    function dialog:SetIndeterminate()
+        self:Pulse()
+    end
+    
+    return dialog
+end
+
+--[[ UILib.GetSafeParent
+Get safe parent window for dialogs
+Params:
+  none
+Returns:
+  parent: Valid parent window or wx.NULL
+--]]
+function UILib.GetSafeParent()
+    local app = wx.wxGetApp()
+    if app then
+        local ok, top = pcall(function() return app:GetTopWindow() end)
+        if ok and top then
+            return top
+        end
+    end
+    return wx.NULL
+end
+
+--[[ UILib.GetCenteredPosition
+Get centered position for dialog
+Params:
+  width: Dialog width
+  height: Dialog height
+Returns:
+  point: Centered position
+--]]
+function UILib.GetCenteredPosition(width, height)
+    local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
+    local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
+    
+    local x = math.floor((sw - width) / 2)
+    local y = math.floor((sh - height) / 2)
+    
+    return wx.wxPoint(x, y)
+end
+
+--[[ UILib.CreateProbeDialog
+Create standard probe operation dialog
+Params:
+  title: Dialog title
+  hasDirection: Include direction selector
+  hasDepth: Include depth input
+  hasAction: Include action radio (datum/print)
+Returns:
+  dialog: Created dialog
+  controls: Table of control references
+--]]
+function UILib.CreateProbeDialog(title, hasDirection, hasDepth, hasAction)
+    local inst = mc.mcGetInstance()
+    local controls = {}
+    
+    -- Create dialog
+    local dlg = UILib.CreateDialog(UILib.GetSafeParent(), title, title:gsub(" ", ""), 350, 300)
+    local panel = wx.wxPanel(dlg, wx.wxID_ANY)
+    local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    -- Add direction selector if requested
+    if hasDirection then
+        local dirBox, getDir, btns = UILib.CreateProbeDirectionSelector(panel, 1)
+        mainSizer:Add(dirBox, 0, wx.wxEXPAND + wx.wxALL, 10)
+        controls.getDirection = getDir
+        controls.dirButtons = btns
+    end
+    
+    -- Add depth input if requested
+    if hasDepth then
+        local params = ToolLib.GetProbeParams(inst)
+        local maxTravel = params and params.maxTravel or 2.0
+        
+        local depthSizer, depthInput, getValue = UILib.CreateProbeDepthInput(
+            panel, "Probe Depth:", maxTravel/2, 0.01, maxTravel,
+            "Maximum probe travel distance")
+        mainSizer:Add(depthSizer, 0, wx.wxEXPAND + wx.wxALL, 10)
+        controls.getDepth = getValue
+        controls.depthInput = depthInput
+    end
+    
+    -- Add action radio if requested
+    if hasAction then
+        local actionRadio = UILib.CreateRadioBox(panel, "Action", 
+                                                 {"Set Datum", "Print Coordinates"}, 0, 2)
+        mainSizer:Add(actionRadio, 0, wx.wxEXPAND + wx.wxALL, 10)
+        controls.actionRadio = actionRadio
+    end
+    
+    -- Add buttons
+    local btnSizer, okBtn, cancelBtn = UILib.CreateButtonSizer(panel)
+    mainSizer:Add(btnSizer, 0, wx.wxALIGN_CENTER + wx.wxALL, 10)
+    controls.okBtn = okBtn
+    controls.cancelBtn = cancelBtn
+    
+    panel:SetSizer(mainSizer)
+    dlg:Fit()
+    dlg:Centre()
+    
+    return dlg, controls
+end
+
+--[[ UILib.ParameterInputs
+Create a dynamic form with validation, dependencies, and varied input types.
+Params:
+  panel: Parent panel
+  parameters: Array of parameter definitions
+    Each parameter: {
+      name = "minRadius",
+      label = "Min Radius:",
+      value = 0.5,
+      type = "float",
+      min = 0.001, max = 10.0,
+      tooltip = "Starting radius",
+      enabled = true,
+      width = 100,
+      precision = 4,
+      units = "in",
+      choices = {"Choice A", "B"},
+      dependsOn = "useFeature",
+      dependsValue = true,
+      onChange = function(val, controls) end
+    }
+Returns:
+  sizer: Vertical sizer containing all inputs
+  controls: Table of control references by name
+  getValue: Function to get value by name
+  setValue: Function to set value by name
+  validate: Function to validate all inputs
+  setEnabled: Function to enable/disable a parameter by name
+--]]
+function UILib.ParameterInputs(panel, parameters)
+    local sizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    local controls = {}
+    local feedbackLabels = {}
+    
+    -- Grid for consistent layout
+    local gridSizer = wx.wxFlexGridSizer(#parameters, 3, 5, 10)  -- rows, cols, vgap, hgap
+    gridSizer:AddGrowableCol(1)  -- Make input column growable
+    
+    for _, param in ipairs(parameters) do
+        param.type = param.type or "float"
+        param.precision = param.precision or 4
+        param.enabled = param.enabled ~= false  -- Default true
+        param.width = param.width or 100
+        
+        if param.type == "bool" or param.type == "choice" then
+            local ctrl, container
+            if param.type == "bool" then
+                ctrl = UILib.CreateCheckBox(panel, param.label or param.name, param.value or false)
+                container = ctrl
+            else
+                local sizer, choice = UILib.CreateChoice(panel, "", param.choices or {}, param.value or 0)
+                ctrl = choice
+                container = sizer
+            end
+
+            ctrl:Enable(param.enabled)
+            if param.tooltip then ctrl:SetToolTip(param.tooltip) end
+
+            controls[param.name] = { control = ctrl, param = param }
+            
+            local lbl = wx.wxStaticText(panel, wx.wxID_ANY, (param.type == "choice") and (param.label or param.name) or "")
+            gridSizer:Add(lbl, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxALIGN_RIGHT)
+            gridSizer:Add(container, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxEXPAND)
+            gridSizer:Add(0, 0)
+
+            local evt = (param.type == "bool") and wx.wxEVT_COMMAND_CHECKBOX_CLICKED or wx.wxEVT_COMMAND_CHOICE_SELECTED
+            ctrl:Connect(wx.wxID_ANY, evt, function(event)
+                if param.onChange then
+                    pcall(param.onChange, getValue(param.name), controls)
+                end
+                event:Skip()
+            end)
+        else
+            -- Use UILib number input for consistency
+            local inputSizer, input, label = UILib.CreateNumberInput(
+                panel, 
+                param.label or param.name, 
+                param.value or 0, 
+                param.width
+            )
+            
+            -- Enable/disable
+            input:Enable(param.enabled)
+            if not param.enabled then
+                label:SetForegroundColour(wx.wxColour(128, 128, 128))
+            end
+            
+            -- Tooltip
+            if param.tooltip then
+                input:SetToolTip(param.tooltip)
+                label:SetToolTip(param.tooltip)
+            end
+            
+            controls[param.name] = {
+                control = input,
+                label = label,
+                param = param
+            }
+            
+            -- Extract controls from sizer for grid placement
+            gridSizer:Add(label, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxALIGN_RIGHT)
+            
+            -- Input with units
+            local inputContainer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+            inputContainer:Add(input, 1, wx.wxEXPAND)
+            
+            if param.units then
+                local unitsLabel = wx.wxStaticText(panel, wx.wxID_ANY, param.units)
+                unitsLabel:SetForegroundColour(wx.wxColour(100, 100, 100))
+                inputContainer:Add(unitsLabel, 0, wx.wxALIGN_CENTER_VERTICAL + wx.wxLEFT, 5)
+            end
+            
+            gridSizer:Add(inputContainer, 1, wx.wxEXPAND)
+            
+            -- Feedback label
+            local feedback = wx.wxStaticText(panel, wx.wxID_ANY, "")
+            feedback:SetFont(wx.wxFont(8, wx.wxFONTFAMILY_DEFAULT,
+                                       wx.wxFONTSTYLE_ITALIC, wx.wxFONTWEIGHT_NORMAL))
+            feedbackLabels[param.name] = feedback
+            gridSizer:Add(feedback, 0, wx.wxALIGN_CENTER_VERTICAL)
+            
+            -- Real-time validation
+            input:Connect(wx.wxID_ANY, wx.wxEVT_COMMAND_TEXT_UPDATED, function(event)
+                local value = input:GetNumber()
+                
+                -- Clear feedback first
+                feedback:SetLabel("")
+                
+                if not value then
+                    feedback:SetLabel("Invalid number")
+                    feedback:SetForegroundColour(wx.wxColour(255, 0, 0))
+                elseif param.min and value < param.min then
+                    feedback:SetLabel(string.format("Min: %g", param.min))
+                    feedback:SetForegroundColour(wx.wxColour(255, 128, 0))
+                elseif param.max and value > param.max then
+                    feedback:SetLabel(string.format("Max: %g", param.max))
+                    feedback:SetForegroundColour(wx.wxColour(255, 128, 0))
+                elseif param.type == "int" and value ~= math.floor(value) then
+                    feedback:SetLabel("Must be integer")
+                    feedback:SetForegroundColour(wx.wxColour(255, 128, 0))
+                else
+                    -- Valid - call onChange if provided
+                    if param.onChange then
+                        param.onChange(value)
+                    end
+                end
+                
+                panel:Layout()
+                event:Skip()
+            end)
+        end
+    end
+    
+    sizer:Add(gridSizer, 0, wx.wxEXPAND)
+    
+    -- Accessor functions
+    local function getValue(name)
+        local ctrl = controls[name]
+        if not ctrl then return nil end
+        
+        if ctrl.param.type == "bool" then
+            return ctrl.control:GetValue()
+        elseif ctrl.param.type == "choice" then
+            return ctrl.control:GetSelection()
+        else
+            local val = ctrl.control:GetNumber()
+            if ctrl.param.type == "int" and val then
+                val = math.floor(val)
+            end
+            return val
+        end
+    end
+    
+    local function setValue(name, value)
+        local ctrl = controls[name]
+        if not ctrl then return false end
+        
+        if ctrl.param.type == "bool" then
+            ctrl.control:SetValue(value and true or false)
+        elseif ctrl.param.type == "choice" then
+            ctrl.control:SetSelection(tonumber(value) or 0)
+        else
+            ctrl.control:SetValue(string.format("%." .. ctrl.param.precision .. "f", value or 0))
+        end
+        
+        -- Trigger onChange
+        if ctrl.param.onChange then
+            ctrl.param.onChange(value)
+        end
+        
+        return true
+    end
+    
+    local function validate()
+        local allValid = true
+        local errors = {}
+        
+        for name, ctrl in pairs(controls) do
+            if ctrl.param.type ~= "bool" then
+                local val = getValue(name)
+                if not val then
+                    allValid = false
+                    table.insert(errors, ctrl.param.label .. " is invalid")
+                elseif ctrl.param.min and val < ctrl.param.min then
+                    allValid = false
+                    table.insert(errors, string.format("%s must be >= %g", 
+                                                      ctrl.param.label or ctrl.param.name, ctrl.param.min))
+                elseif ctrl.param.max and val > ctrl.param.max then
+                    allValid = false
+                    table.insert(errors, string.format("%s must be <= %g", 
+                                                      ctrl.param.label or ctrl.param.name, ctrl.param.max))
+                end
+            end
+        end
+        
+        return allValid, errors
+    end
+    
+    -- Function to enable/disable a parameter
+    local function setEnabled(name, enabled)
+        local ctrl = controls[name]
+        if ctrl then
+            ctrl.control:Enable(enabled)
+            if ctrl.label then
+                ctrl.label:SetForegroundColour(enabled and wx.wxBLACK or wx.wxColour(128, 128, 128))
+            end
+        end
+    end
+    
+    -- Process dependencies
+    for _, param in ipairs(parameters) do
+        if param.dependsOn then
+            local sourceName = param.dependsOn
+            local targetName = param.name
+            local dependsValue = (param.dependsValue ~= false)
+            
+            local function updateDependency()
+                local sourceValue = getValue(sourceName)
+                local shouldBeEnabled = (sourceValue == dependsValue)
+                setEnabled(targetName, shouldBeEnabled)
+            end
+
+            for _, p in ipairs(parameters) do
+                if p.name == sourceName then
+                    local originalOnChange = p.onChange
+                    p.onChange = function(val, ctrls)
+                        if originalOnChange then originalOnChange(val, ctrls) end
+                        updateDependency()
+                    end
+                    break
+                end
+            end
+            updateDependency()
+        end
+    end
+    
+    -- Add setEnabled to returned functions
+    return sizer, controls, getValue, setValue, validate, setEnabled
+end
+
+--[[ UILib.ShowToolSelectionDialog
+Show tool selection dialog
+Params:
+  tools: Array of tool descriptions
+  currentTool: Currently selected tool
+  title: Dialog title (optional)
+Returns:
+  selected: Selected tool index or nil if cancelled
+--]]
+function UILib.ShowToolSelectionDialog(tools, currentTool, title)
+    if not tools or #tools == 0 then
+        SystemLib.MsgError("No tools configured", "Tool Selection")
+        return nil
+    end
+    
+    title = title or "Select Tool"
+    
+    local dlg = UILib.CreateDialog(UILib.GetSafeParent(), title, "ToolSelect", 400, 200)
+    local panel = wx.wxPanel(dlg, wx.wxID_ANY)
+    local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    
+    -- Instructions
+    local instructions = wx.wxStaticText(panel, wx.wxID_ANY,
+        "Select the tool currently loaded in the spindle:")
+    mainSizer:Add(instructions, 0, wx.wxALL, 10)
+    
+    -- Tool dropdown
+    local choiceSizer, toolChoice = UILib.CreateChoice(panel, "Tool:", tools, currentTool or 0)
+    mainSizer:Add(choiceSizer, 0, wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT + wx.wxBOTTOM, 10)
+    
+    -- Buttons
+    local btnSizer, okBtn, cancelBtn = UILib.CreateButtonSizer(panel)
+    mainSizer:Add(btnSizer, 0, wx.wxALIGN_CENTER + wx.wxALL, 10)
+    
+    panel:SetSizer(mainSizer)
+    dlg:Fit()
+    dlg:Centre()
+    
+    local result = dlg:ShowModal()
+    local selected = nil
+    
+    if result == wx.wxID_OK then
+        selected = toolChoice:GetSelection()
+    end
+    
+    dlg:Destroy()
+    return selected
+end
+
+--[[ BindEnterEscape
+Bind Enter→OK and Esc→Cancel on a dialog with optional guard.
+Params:
+  dlg (wxDialog)     - dialog instance
+  okId (number|nil)  - OK control id (default wx.wxID_OK)
+  cancelId (number)  - CANCEL control id (default wx.wxID_CANCEL)
+  guardFn (func|nil) - if provided, called on Enter; returning false blocks OK
+Returns: none
+]]
+function UILib.BindEnterEscape(dlg, okId, cancelId, guardFn)
+    okId     = okId or wx.wxID_OK
+    cancelId = cancelId or wx.wxID_CANCEL
+
+    dlg:Connect(wx.wxEVT_CHAR_HOOK, function(event)
+        local key = event:GetKeyCode()
+        if key == wx.WXK_RETURN then
+            if guardFn == nil or guardFn() ~= false then
+                dlg:EndModal(okId)
+            else
+                -- Guard blocked; swallow key
+            end
+        elseif key == wx.WXK_ESCAPE then
+            dlg:EndModal(cancelId)
+        else
+            event:Skip()
+        end
+    end)
+end
+
+--[[ BindToggle
+Enable/disable target controls based on a predicate of a source control.
+Params:
+  sourceCtrl (wxWindow)
+  predicate  (function) -> bool  -- called to determine enabled state
+  targets    (table|wxWindow)    -- control or array of controls to toggle
+  opts (table|nil):
+    enableWhenTrue -> boolean (default true)  -- invert logic if false
+    onChange       -> function(enabled)       -- optional callback
+Returns: none
+Notes:
+  - Wires several common events (checkbox, radio, text, choice) and applies immediately.
+  - Pass a custom event list via opts.events if you need more (array of wx event ids).
+]]
+function UILib.BindToggle(sourceCtrl, predicate, targets, opts)
+    opts = opts or {}
+    local enableWhenTrue = (opts.enableWhenTrue ~= false)
+    local list = {}
+    if type(targets) == "table" then list = targets else list = {targets} end
+
+    local function apply()
+        local ok = false
+        local status, res = pcall(predicate)
+        if status then ok = (res and true or false) else ok = false end
+        local enabled = enableWhenTrue and ok or (not ok)
+        for _, t in ipairs(list) do
+            if t and t.Enable then t:Enable(enabled) end
+        end
+        if opts.onChange then pcall(opts.onChange, enabled) end
+    end
+
+    -- Common events that reflect state changes
+    local events = opts.events or {
+        wx.wxEVT_COMMAND_CHECKBOX_CLICKED,
+        wx.wxEVT_COMMAND_RADIOBUTTON_SELECTED,
+        wx.wxEVT_COMMAND_TEXT_UPDATED,
+        wx.wxEVT_COMMAND_CHOICE_SELECTED,
+    }
+    for _, ev in ipairs(events) do
+        pcall(function()
+            sourceCtrl:Connect(ev, function(_) apply() end)
+        end)
+    end
+
+    -- Also refresh during idle to catch programmatic changes
+    pcall(function()
+        local top = sourceCtrl:GetParent() or sourceCtrl
+        top:Connect(wx.wxEVT_IDLE, function(_) apply() end)
+    end)
+
+    -- Initial application
+    apply()
+end
+
+--[[ BindNumberRange
+Live numeric validation for a wxTextCtrl with min/max and integer mode.
+Params:
+  textCtrl (wxTextCtrl)
+  opts (table):
+    min         -> number|nil
+    max         -> number|nil
+    integer     -> boolean (default false)
+    allowBlank  -> boolean (default false)  -- if false, empty string is invalid
+    clampOnExit -> boolean (default true)   -- clamp to [min,max] on KILL_FOCUS
+    name        -> string (for error text; optional)
+    onValid     -> function(num) (optional)
+    onInvalid   -> function(msg) (optional)
+Returns:
+  validate (function) -> ok(bool), num(number|nil), err(string|nil)
+Notes:
+  - Background turns light red when invalid; restored when valid.
+  - Uses SystemLib.ValidateNumber for numeric/min/max checks.
+]]
+function UILib.BindNumberRange(textCtrl, opts)
+    opts = opts or {}
+    local minV = opts.min
+    local maxV = opts.max
+    local integer = (opts.integer == true)
+    local allowBlank = (opts.allowBlank == true)
+    local clampOnExit = (opts.clampOnExit ~= false)
+    local name = opts.name or "Value"
+
+    local defaultBg = textCtrl:GetBackgroundColour()
+    local badBg = wx.wxColour(255, 220, 220)
+
+    local function setValid(ok)
+        if ok then
+            textCtrl:SetBackgroundColour(defaultBg)
+        else
+            textCtrl:SetBackgroundColour(badBg)
+        end
+        textCtrl:Refresh()
+    end
+
+    local function validate()
+        local s = tostring(textCtrl:GetValue() or "")
+        if s == "" then
+            if allowBlank then
+                setValid(true)
+                if opts.onValid then pcall(opts.onValid, nil) end
+                return true, nil, nil
+            else
+                setValid(false)
+                local msg = name .. " is required"
+                if opts.onInvalid then pcall(opts.onInvalid, msg) end
+                return false, nil, msg
+            end
+        end
+
+        local ok, num, err = SystemLib.ValidateNumber(s, minV, maxV, name)
+        if not ok then
+            setValid(false)
+            if opts.onInvalid then pcall(opts.onInvalid, err) end
+            return false, nil, err
+        end
+
+        if integer and (math.floor(num) ~= num) then
+            local msg = name .. " must be an integer"
+            setValid(false)
+            if opts.onInvalid then pcall(opts.onInvalid, msg) end
+            return false, nil, msg
+        end
+
+        setValid(true)
+        if opts.onValid then pcall(opts.onValid, num) end
+        return true, num, nil
+    end
+
+    -- Live validation on text change
+    textCtrl:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, function(_) validate() end)
+
+    -- Optional clamp on focus loss
+    if clampOnExit and (minV ~= nil or maxV ~= nil) then
+        textCtrl:Connect(wx.wxEVT_KILL_FOCUS, function(_)
+            local ok, num = validate()
+            if ok and num ~= nil then
+                if minV ~= nil and num < minV then num = minV end
+                if maxV ~= nil and num > maxV then num = maxV end
+                if integer then num = math.floor(num + 0.0) end
+                textCtrl:SetValue(tostring(num))
+                setValid(true)
+            end
+        end)
+    end
+
+    -- Initial validate
+    validate()
+    return validate
+end
+
+--[[ SyncLabel
+Bind a label to a source function with optional rate limit.
+Params:
+  ctrl (string), source (function)->string|number, opts {interval_ms=200, fmt=string|nil}
+]]
+UILib.__lastTick = UILib.__lastTick or {}
+function UILib.SyncLabel(ctrl, source, opts)
+    opts = opts or {}
+    local now = wx.wxGetUTCTimeMillis():ToNumber()
+    local last = UILib.__lastTick[ctrl] or 0
+    local interval = opts.interval_ms or 200
+    if now - last < interval then return end
+    UILib.__lastTick[ctrl] = now
+    local ok, val = pcall(source)
+    if not ok then return end
+    if opts.fmt and type(val) == "number" then
+        val = string.format(opts.fmt, val)
+    end
+    local newVal = tostring(val or "")
+    local curVal = scr.GetProperty(ctrl, "Label")
+    if curVal ~= newVal then
+        scr.SetProperty(ctrl, "Label", newVal)
+    end
+end
+
+--[[ SyncLED
+Set an LED on/off and optional colors from a predicate.
+Params:
+  ctrl (string), pred (function)->bool, opts {trueColor="#00FF00", falseColor="#404040", setColor=true}
+]]
+function UILib.SyncLED(ctrl, pred, opts)
+    opts = opts or {}
+    local ok, on = pcall(pred)
+    if not ok then return end
+    local v = on and "1" or "0"
+    local cur = scr.GetProperty(ctrl, "Value")
+    if cur ~= v then
+        scr.SetProperty(ctrl, "Value", v)
+        if opts.setColor then
+            local tc = opts.trueColor or "#00FF00"
+            local fc = opts.falseColor or "#404040"
+            scr.SetProperty(ctrl, "Fg Color", on and tc or fc)
+        end
+    end
+end
+
+--[[ SyncDROFromPV
+Mirror a pound variable to a DRO control.
+Params:
+  ctrl (string), pv (number), opts {fmt="%.3f", property="Value", scale=1.0}
+]]
+function UILib.SyncDROFromPV(ctrl, pv, opts)
+    UILib.__lastTick = UILib.__lastTick or {}
+    local now = wx.wxGetUTCTimeMillis():ToNumber()
+    local key = "__dro_" .. tostring(ctrl)
+    local last = UILib.__lastTick[key] or 0
+    local interval = (opts and opts.interval_ms) or 0
+    if interval > 0 and (now - last < interval) then return end
+    UILib.__lastTick[key] = now
+    
+    opts = opts or {}
+    local prop = opts.property or "Value"
+    local scale = opts.scale or 1.0
+    local v = mc.mcCntlGetPoundVar(mc.mcGetInstance(), pv) or 0
+    local n = (tonumber(v) or 0) * scale
+    local s = opts.fmt and string.format(opts.fmt, n) or tostring(n)
+    scr.SetProperty(ctrl, prop, s)
+end
+
+--[[ BindIdle
+Attach a lightweight wxEVT_IDLE handler with built-in throttling.
+Usage:
+  UILib.BindIdle(panel, function()
+    UILib.SyncLabel(\"droX\", function() return mc.mcAxisGetPos(mc.mcGetInstance(), 0) end, {fmt=\"%.3f\"})
+  end, {interval_ms=100})
+]]
+function UILib.BindIdle(panel, fn, opts)
+  opts = opts or {}
+  local interval = opts.interval_ms or 100
+  local last = 0
+  panel:Connect(wx.wxID_ANY, wx.wxEVT_IDLE, function(evt)
+    local now = wx.wxGetUTCTimeMillis():ToNumber()
+    if now - last >= interval then
+      local ok, err = pcall(fn)
+      if not ok then
+        mc.mcCntlSetLastError(mc.mcGetInstance(), "Idle handler error: "..tostring(err))
+      end
+      last = now
+    end
+    evt:Skip()
+  end)
+end
+
+--[[ Grid.Create
+Create a wxGrid with headers and read/write helpers.
+Params:
+  parent, headers { \"Name\",\"Value\",... }, rows (number), opts? {readOnlyCols={1=true}, widths={120,120}}
+Returns:
+  grid (wxGrid), api {GetRow=function(r)->{...}, SetRow=function(r, vals), OnCellChange=function(fn)}
+]]
+function UILib.GridCreate(parent, headers, rows, opts)
+  opts = opts or {}
+  local grid = wx.wxGrid(parent, wx.wxID_ANY)
+  grid:CreateGrid(rows or 0, #headers)
+  for c,h in ipairs(headers) do
+    grid:SetColLabelValue(c-1, tostring(h))
+    if opts.widths and opts.widths[c] then grid:SetColSize(c-1, opts.widths[c]) end
+    if opts.readOnlyCols and opts.readOnlyCols[c] then grid:SetReadOnly(-1, c-1, true) end
+  end
+
+  local api = {}
+  function api.GetRow(r)
+    local t = {}
+    for c=0, grid:GetNumberCols()-1 do t[#t+1] = grid:GetCellValue(r, c) end
+    return t
+  end
+  function api.SetRow(r, vals)
+    for c=0, math.min(#vals, grid:GetNumberCols())-1 do grid:SetCellValue(r, c, tostring(vals[c+1] or "")) end
+  end
+  function api.OnCellChange(fn)
+    grid:Connect(wx.wxEVT_GRID_CELL_CHANGE, function(e)
+      local ok, err = pcall(fn, e:GetRow(), e:GetCol(), grid:GetCellValue(e:GetRow(), e:GetCol()))
+      if not ok then mc.mcCntlSetLastError(mc.mcGetInstance(), "Grid handler: "..tostring(err)) end
+      e:Skip()
+    end)
+  end
+  return grid, api
+end
+
+--[[ FormBuilder
+Programmatically build labeled inputs & choices quickly.
+Usage:
+  local fb = UILib.FormBuilder(panel, parentSizer)
+  local x  = fb:Number("Hole Center X", 0.0, {fmt="%.4f"})
+  local sel= fb:Choice("Cycle", {"G81 Single pass","G83 Peck","G73 High speed"})
+  local values = fb:Values()  -- {["Hole Center X"]=0.0000, ["Cycle"]=0}
+]]
+function UILib.FormBuilder(panel, parentSizer)
+  local self = { panel = panel, values = {} }
+  local grid = wx.wxFlexGridSizer(2, 10, 8) grid:AddGrowableCol(1, 1)
+  parentSizer:Add(grid, 0, wx.wxEXPAND + wx.wxALL, 8)
+
+  function self:Number(label, initial, opts)
+    opts = opts or {}
+    local lbl = wx.wxStaticText(panel, wx.wxID_ANY, label)
+    local txt = wx.wxTextCtrl(panel, wx.wxID_ANY, string.format(opts.fmt or "%.3f", tonumber(initial or 0)))
+    txt:SetMinSize(wx.wxSize(110, -1))
+    grid:Add(lbl, 0, wx.wxALIGN_CENTER_VERTICAL)
+    grid:Add(txt, 1, wx.wxEXPAND)
+    self.values[label] = tonumber(initial or 0)
+    txt:Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, function(_)
+      self.values[label] = tonumber(txt:GetValue()) or self.values[label]
+    end)
+    return txt
+  end
+
+  function self:Choice(label, items, initialIndex)
+    local lbl = wx.wxStaticText(panel, wx.wxID_ANY, label)
+    local ch  = wx.wxChoice(panel, wx.wxID_ANY, wx.wxDefaultPosition, wx.wxDefaultSize, items or {})
+    ch:SetSelection(tonumber(initialIndex or 0))
+    grid:Add(lbl, 0, wx.wxALIGN_CENTER_VERTICAL)
+    grid:Add(ch, 1, wx.wxEXPAND)
+    self.values[label] = ch:GetSelection()
+    ch:Connect(wx.wxEVT_COMMAND_CHOICE_SELECTED, function(_) self.values[label] = ch:GetSelection() end)
+    return ch
+  end
+
+  function self:Values() return self.values end
+  return self
+end
+
+--[[ UILib.FindControlsByPattern
+Finds all screen controls that match a base name and common variations
+(e.g., "btnHome", "btnHome_1", "btnHome_copy"). This is essential for
+controlling duplicated UI elements from a single script.
+
+Params:
+  baseName (string) - The base name of the control to search for.
+Returns:
+  (table) - An array of strings containing the names of all found controls.
+--]]
+function UILib.FindControlsByPattern(baseName)
+    local controls = {}
+    
+    -- Check for the existence of a control by querying a common, non-erroring property.
+    -- "Visible" is a good candidate.
+    local function controlExists(name)
+        return scr.GetProperty(name, "Visible") ~= nil
+    end
+
+    if controlExists(baseName) then
+        table.insert(controls, baseName)
+    end
+    
+    -- A comprehensive list of common suffixes from UI designers and auto-duplication
+    local suffixes = {"_1", "_2", "_3", "_4", "_5", "_copy", "_Copy", "(1)", "(2)", "(3)"}
+    for i = 1, 10 do
+        table.insert(suffixes, "_" .. i)
+    end
+    
+    for _, suffix in ipairs(suffixes) do
+        local name = baseName .. suffix
+        if controlExists(name) then
+            table.insert(controls, name)
+        end
+    end
+    
+    return controls
+end
+
+
+--[[ UILib.SyncToggleButton
+Synchronizes a UI button's appearance (color, label, state) to reflect a
+boolean machine state. Simplifies PLC and ScreenLoad scripts by abstracting
+UI updates.
+
+Params:
+  buttonName (string) - The name of the button control on the screen.
+  isActive (boolean) - The current state to represent (true for active, false for inactive).
+  activeOpts (table) - A table of properties to apply when isActive is true.
+                       Example: {bgColor="#00FF00", label="ENABLED", state="1"}
+  inactiveOpts (table) - A table of properties to apply when isActive is false.
+                         Example: {bgColor="#FF0000", label="DISABLED", state="0"}
+Returns:
+  none
+--]]
+function UILib.SyncToggleButton(buttonName, isActive, activeOpts, inactiveOpts)
+    local opts = isActive and activeOpts or inactiveOpts
+    if not opts then return end
+    
+    -- Use a protected call (pcall) to prevent errors if the button or property doesn't exist.
+    -- This makes the function robust even if UI elements are removed or renamed.
+    pcall(function()
+        if opts.bgColor then scr.SetProperty(buttonName, "Bg Color", opts.bgColor) end
+        if opts.fgColor then scr.SetProperty(buttonName, "Fg Color", opts.fgColor) end
+        if opts.label then scr.SetProperty(buttonName, "Label", opts.label) end
+        if opts.state then scr.SetProperty(buttonName, "Button State", opts.state) end
+    end)
+end
+
+--[[ UILib.CreateDeviceToggle
+Creates a device toggle UI (wxToggleButton + optional AUTO checkbox) bound to AuxLib.
+
+Params:
+  panel       (wxWindow)  parent panel
+  deviceName  (string)    AuxLib device key (e.g. "dust_main")
+  opts        (table|nil)
+    .label       (string)  base label for the button (default: deviceName)
+    .showAuto    (bool)    include AUTO checkbox (default: true)
+    .refreshMs   (int)     poll interval while dialog is shown (default: 300)
+    .onText      (string)  suffix when ON  (default: "ON")
+    .offText     (string)  suffix when OFF (default: "OFF")
+    .tooltip     (string)  optional tooltip text
+    .disableWhen (function(snapshot)->bool) disable controls if returns true
+
+Returns:
+  sizer, controls
+    controls = {
+      toggle   = wxToggleButton,
+      auto     = wxCheckBox|nil,
+      Update   = function() ... end,    -- manual refresh
+      Destroy  = function() ... end     -- stop timer, cleanup
+    }
+
+Usage:
+  local sizer, ctrl = UILib.CreateDeviceToggle(panel, "dust_main", {label="Dust"})
+  parentSizer:Add(sizer, 0, wx.wxALL+wx.wxEXPAND, 4)
+]]
+function UILib.CreateDeviceToggle(panel, deviceName, opts)
+    opts = opts or {}
+    local label     = opts.label or deviceName
+    local showAuto  = (opts.showAuto ~= false)
+    local refreshMs = opts.refreshMs or 300
+    local onText    = opts.onText or "ON"
+    local offText   = opts.offText or "OFF"
+
+    local AuxLib = AuxLib or require("AuxLib")
+    local inst = mc.mcGetInstance()
+
+    -- UI
+    local hs = wx.wxBoxSizer(wx.wxHORIZONTAL)
+
+    local btn = wx.wxToggleButton(panel, wx.wxID_ANY, label.." : "..offText)
+    btn:SetMinSize(wx.wxSize(120, 28))
+    if opts.tooltip then btn:SetToolTip(opts.tooltip) end
+    hs:Add(btn, 0, wx.wxRIGHT, 6)
+
+    local autoChk = nil
+    if showAuto then
+        autoChk = wx.wxCheckBox(panel, wx.wxID_ANY, "AUTO")
+        hs:Add(autoChk, 0, wx.wxALIGN_CENTER_VERTICAL)
+    end
+
+    -- State sync
+    local alive = true
+    local timer = wx.wxTimer(panel)
+
+    local function snapshot()
+        local s = AuxLib.State(inst, deviceName)
+        -- s: {on=0/1, auto=0/1, target=0/1, manualMode=bool, spindle=0/1, inCycle=0/1, m6=bool, virt=bool, rotation=bool}
+        return s
+    end
+
+    local function applyUI(s)
+        if not s then return end
+        -- button label & toggle state
+        local isOn = (s.on == 1)
+        btn:SetValue(isOn)
+        btn:SetLabel(("%s : %s"):format(label, isOn and onText or offText))
+
+        -- optional AUTO
+        if autoChk then
+            local isAuto = (s.auto == 1)
+            autoChk:SetValue(isAuto)
+        end
+
+        -- optional disable predicate
+        if type(opts.disableWhen) == "function" then
+            local dis = not not opts.disableWhen(s)
+            btn:Enable(not dis)
+            if autoChk then autoChk:Enable(not dis) end
+        end
+    end
+
+    local function Update()
+        applyUI(snapshot())
+    end
+
+    panel:Connect(wx.wxEVT_TIMER, function(e)
+        if e:GetEventObject():GetId() ~= timer:GetId() then return end
+        if alive then Update() else timer:Stop() end
+    end)
+
+    -- Click handlers
+    btn:Connect(wx.wxEVT_COMMAND_TOGGLEBUTTON_CLICKED, function()
+        -- Manual toggle (AuxLib handles auto->manual gating internally)
+        AuxLib.Request(inst, {device = deviceName, action = "manual.toggle"})
+        Update()
+    end)
+
+    if autoChk then
+        autoChk:Connect(wx.wxEVT_COMMAND_CHECKBOX_CLICKED, function()
+            AuxLib.Request(inst, {device = deviceName, action = "auto.toggle"})
+            Update()
+        end)
+    end
+
+    -- Start periodic refresh while dialog is alive
+    timer:Start(refreshMs)
+    Update()
+
+    local function Destroy()
+        alive = false
+        if timer:IsRunning() then timer:Stop() end
+    end
+
+    local controls = { toggle = btn, auto = autoChk, Update = Update, Destroy = Destroy }
+    return hs, controls
+end
+
+return UILib

@@ -332,6 +332,7 @@ function SystemLib.G68Active(inst)
     return (modal == 68), angle
 end
 
+SystemLib.G68 = SystemLib.G68 or {}
 
 --[[ G68.SaveState
 Store current G68 state to pound variables for later restoration.

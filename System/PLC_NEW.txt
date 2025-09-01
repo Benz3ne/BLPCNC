@@ -1,0 +1,308 @@
+local inst = mc.mcGetInstance()
+local rc = 0;
+testcount = testcount + 1
+machState, rc = mc.mcCntlGetState(inst);
+local inCycle = mc.mcCntlIsInCycle(inst);
+
+
+(function()
+  local mc = mc
+  local inst = mc.mcGetInstance()
+
+  -- Safe/lib-friendly loader (works whether libs are required here or injected by ScreenLoad)
+  local function tryRequire(name)
+    local ok, mod = pcall(require, name)
+    if ok and mod then return mod end
+    return _G[name]
+  end
+
+  -- Single PLC runtime table (kept small)
+  _G.__plc = _G.__plc or { handles = {}, spin = {}, air = {deb=0,last=-1}, tool = {last17=-1}, enableSeen = 0 }
+  local P = _G.__plc
+
+  -- Libraries (prefer ScreenLoad-injected singletons)
+  P.SystemLib = tryRequire("SystemLib") or P.SystemLib
+  P.ToolLib   = tryRequire("ToolLib")   or P.ToolLib
+  P.AuxLib    = tryRequire("AuxLib")    or P.AuxLib
+
+  -- Signal handle cache helper
+  function P.h(sig)
+    local h = P.handles[sig]
+    if not h or h == 0 then h = mc.mcSignalGetHandle(inst, sig); P.handles[sig] = h end
+    return h
+  end
+
+  -- Pound var helpers (use SystemLib if present)
+  function P.pvGet(id)
+    local SL = P.SystemLib
+    if SL and SL.PoundVarGet then return tonumber(SL.PoundVarGet(inst, id)) or 0 end
+    return tonumber(mc.mcCntlGetPoundVar(inst, id)) or 0
+  end
+  function P.pvSet(id, v)
+    local SL = P.SystemLib
+    if SL and SL.PoundVarSet then return SL.PoundVarSet(inst, id, v) end
+    return mc.mcCntlSetPoundVar(inst, id, v)
+  end
+
+  -- Common signal handles (read-only here; outputs are written by libs)
+  P.hInLowAir  = P.hInLowAir  or P.h(mc.ISIG_INPUT6)   -- Low air pressure switch (1 = LOW)
+  P.hToolSense = P.hToolSense or P.h(mc.ISIG_INPUT17)  -- Tool-present sensor (1 = present)
+  P.hEn        = P.hEn        or P.h(mc.OSIG_MACHINE_ENABLED)
+  P.hSpindleOn = P.hSpindleOn or P.h(mc.OSIG_SPINDLEON)
+end)()
+
+
+-------------------------------------------------------
+--  Set plate align (G68) Led
+-------------------------------------------------------
+local curLedState = math.tointeger(scr.GetProperty("ledPlateAlign", "Value"))
+local curAlignState = math.tointeger((mc.mcCntlGetPoundVar(inst, 4016) - 69))
+curAlignState = math.abs(curAlignState)
+if (curLedState ~= curAlignState) then
+	scr.SetProperty("ledPlateAlign", "Value", tostring(curAlignState))
+end
+-------------------------------------------------------
+--  Coroutine resume
+-------------------------------------------------------
+if (wait ~= nil) and (machState == 0) then --wait exist and state == idle
+	local state = coroutine.status(wait)
+    if state == "suspended" then --wait is suspended
+        coroutine.resume(wait)
+    end
+end
+-------------------------------------------------------
+--  Cycle time label update
+-------------------------------------------------------
+--Requires a static text box named "CycleTime" on the screen
+if (machEnabled == 1) then
+	local cycletime = mc.mcCntlGetRunTime(inst, time)
+	scr.SetProperty("CycleTime", "Label", SecondsToTime(cycletime))
+end
+-------------------------------------------------------
+--  Set Height Offset Led
+-------------------------------------------------------
+local HOState = mc.mcCntlGetPoundVar(inst, 4008)
+if (HOState == 49) then
+    scr.SetProperty("ledHOffset", "Value", "0")
+else
+    scr.SetProperty("ledHOffset", "Value", "1")
+end
+-------------------------------------------------------
+--  Set Spindle Ratio DRO
+-------------------------------------------------------
+local spinmotormax, rangemax, ratio
+spinmotormax, rc = scr.GetProperty('droSpinMotorMax', 'Value')
+spinmotormax = tonumber(spinmotormax) or 1   
+rangemax, rc = scr.GetProperty('droRangeMax', 'Value')
+rangemax = tonumber(rangemax) or 1
+ratio = (rangemax / spinmotormax)    
+scr.SetProperty('droRatio', 'Value', tostring(ratio))
+
+-------------------------------------------------------
+--  Set Feedback Ratio DRO Updated 5-30-16
+-------------------------------------------------------
+local range, rc = mc.mcSpindleGetCurrentRange(inst)
+local fbratio, rc = mc.mcSpindleGetFeedbackRatio(inst, range)
+scr.SetProperty('droFeedbackRatio', 'Value', tostring(fbratio))
+
+-------------------------------------------------------
+--  PLC First Run
+-------------------------------------------------------
+if (testcount == 1) then --Set Keyboard input startup state
+    local iReg = mc.mcIoGetHandle (inst, "Keyboard/Enable")
+    mc.mcIoSetState(iReg, 1) --Set register to 1 to ensure KeyboardInputsToggle function will do a disable.
+    KeyboardInputsToggle()
+    DecToFrac(0)
+    DecToFrac(1)
+    DecToFrac(2)
+	---------------------------------------------------------------
+	-- Set Persistent DROs.
+	---------------------------------------------------------------
+
+    DROTable = {
+	[1034] = "droEdgeFinder",
+    [1035] = "droGageBlock",
+    [1036] = "droGageBlockT"
+    }
+	
+	-- ******************************************************************************************* --
+	-- The following is a loop. As a rule of thumb loops should be avoided in the PLC Script.  --
+	-- However, this loop only runs during the first run of the PLC script so it is acceptable.--
+	-- ******************************************************************************************* --                                                     
+
+    for name,number in pairs (DROTable) do -- for each paired name (key) and number (value) in the DRO table
+        local droName = (DROTable[name]) -- make the variable named droName equal the name from the table above
+        --wx.wxMessageBox (droName)
+        local val = mc.mcProfileGetString(inst, "PersistentDROs", (droName), "NotFound") -- Get the Value from the profile ini
+        if(val ~= "NotFound")then -- If the value is not equal to NotFound
+            scr.SetProperty((droName), "Value", val) -- Set the dros value to the value from the profile ini
+        end -- End the If statement
+    end -- End the For loop
+end
+-------------------------------------------------------
+
+
+-- PLC END: per-tick orchestration
+(function()
+  local mc = mc
+  local inst = mc.mcGetInstance()
+  local P = assert(_G.__plc, "PLC init missing — paste Block A near top of PLC")
+  local ToolLib, AuxLib = P.ToolLib, P.AuxLib
+
+  -- 1) Delegate core automation to libraries (single source of truth)
+  if ToolLib and ToolLib.Update then pcall(ToolLib.Update, inst) end
+  if AuxLib then
+    local updater = AuxLib.Update or AuxLib.update
+    if updater then pcall(updater, inst) end
+  end
+
+  -- 2) Low-air monitoring (3-cycle debounce → hold/stop/disable + UI flag)
+  do
+    local low = (mc.mcSignalGetState(P.hInLowAir) == 1)
+    if low then P.air.deb = (P.air.deb or 0) + 1 else P.air.deb = 0 end
+
+    if P.air.deb == 3 and P.air.last ~= 1 then
+      -- Transition to LOW: stop safely and disable
+      local st = mc.mcCntlGetState(inst)
+      if st == mc.MC_STATE_FRUN or st == mc.MC_STATE_MRUN then
+        mc.mcCntlFeedHold(inst); mc.mcCntlCycleStop(inst)
+      end
+      if mc.mcSignalGetState(P.hSpindleOn) == 1 then mc.mcSpindleSetDirection(inst, 0) end
+      mc.mcCntlEnable(inst, 0)
+
+      _G.lowAirDisabled      = true
+      _G.needLowAirDialog    = true
+      _G.lowAirDialogType    = "error"
+      _G.lowAirDialogMessage = "Air pressure is LOW. Machine has been disabled."
+    elseif (not low) and P.air.last == 1 then
+      -- Recovery from LOW
+      _G.lowAirDisabled      = false
+      _G.needLowAirDialog    = true
+      _G.lowAirDialogType    = "info"
+      _G.lowAirDialogMessage = "Air pressure restored. Re-enable the machine to continue."
+    end
+    P.air.last = low and 1 or 0
+  end
+
+  -- 3) Spindle spin-up delay (armed by M6 via #495, seconds in #496)
+  do
+    if P.pvGet(495) ~= 0 then
+      if mc.mcSignalGetState(P.hSpindleOn) == 1 then
+        if not P.spin.t0 then mc.mcCntlFeedHold(inst); P.spin.t0 = os.clock() end
+        local need = tonumber(P.pvGet(496)) or 3
+        if P.spin.t0 and (os.clock() - P.spin.t0) >= need then
+          P.pvSet(495, 0); P.spin.t0 = nil; mc.mcCntlCycleStart(inst)
+        end
+      else
+        P.spin.t0 = nil
+      end
+    else
+      P.spin.t0 = nil
+    end
+  end
+
+  -- 4) Tool-present sensor (INPUT17) → auto T0 on removal when safe
+  do
+    local present = (mc.mcSignalGetState(P.hToolSense) == 1)
+    if P.tool.last17 < 0 then P.tool.last17 = present and 1 or 0 end
+    if P.tool.last17 == 1 and (not present) then
+      local inCycle = (mc.mcCntlIsInCycle(inst) == 1)
+      local state   = mc.mcCntlGetState(inst)
+      local m6      = (P.pvGet(499) ~= 0)
+      if (not inCycle) and state == mc.MC_STATE_IDLE and not m6 then
+        mc.mcToolSetCurrent(inst, 0)
+        -- UI preview update is ScreenLoad’s job
+      end
+    end
+    P.tool.last17 = present and 1 or 0
+  end
+
+  -- 5) Tool/H-offset sync request (ScreenLoad performs the G49/G43 safely)
+  do
+    local curTool = mc.mcToolGetCurrent(inst) or 0
+    local activeH = tonumber(P.pvGet(4120)) or 0
+    local idle    = (mc.mcCntlGetState(inst) == mc.MC_STATE_IDLE)
+    P.tool._t = P.tool._t or curTool
+    P.tool._h = P.tool._h or activeH
+    if idle and (curTool ~= P.tool._t or activeH ~= P.tool._h) then
+      _G.requestHApply = (curTool > 0 and curTool < 90) and curTool or 0
+      _G.ScreenLoadWatchesHApply = true
+      P.tool._t = curTool; P.tool._h = activeH
+    end
+  end
+
+  -- 6) Startup tool prompt flag on first enable with T0 + tool present
+  do
+    local en = mc.mcSignalGetState(P.hEn)
+    if en == 1 and P.enableSeen == 0 then
+      P.enableSeen = 1
+      local t0     = (mc.mcToolGetCurrent(inst) or 0) == 0
+      local hasTool= (mc.mcSignalGetState(P.hToolSense) == 1)
+      local sup    = (P.pvGet(498) == 1)   -- optional suppress PV
+      if hasTool and t0 and not sup then
+        _G.needToolPrompt        = true
+        _G.toolPromptIsStartup   = true
+        _G.toolPromptRequestTime = os.clock()
+      end
+    elseif en == 0 then
+      P.enableSeen = 0
+    end
+  end
+end)()
+
+-- BLP per-tick lib updates --
+do
+  local inst = mc.mcGetInstance()
+  local TL = (_G.__plc and _G.__plc.ToolLib) or _G.ToolLib
+  local AL = (_G.__plc and _G.__plc.AuxLib)  or _G.AuxLib
+  if TL and TL.Update then pcall(TL.Update, inst) end
+  if AL and (AL.Update or AL.update) then pcall(AL.Update or AL.update, inst) end
+end
+
+-- Low air pressure monitor (INPUT6=1 means LOW)
+do
+  _G.plcExt = _G.plcExt or { air = {deb=0,last=-1,disabled=false} }
+  local R = _G.plcExt
+  local low = mc.mcSignalGetState(mc.mcSignalGetHandle(mc.mcGetInstance(), mc.ISIG_INPUT6)) == 1
+  if low then R.air.deb = R.air.deb + 1 else R.air.deb = 0 end
+  if R.air.deb >= 3 and R.air.last ~= 1 then
+    local inst = mc.mcGetInstance()
+    mc.mcCntlFeedHold(inst); mc.mcCntlCycleStop(inst); mc.mcCntlEnable(inst, 0)
+    R.air.disabled = true
+    _G.needLowAirDialog    = true
+    _G.lowAirDialogType    = "error"
+    _G.lowAirDialogMessage = "Low air pressure detected. Machine disabled for safety.\n\n1) Check compressor\n2) Check for leaks\n3) Restore pressure above minimum\n4) Re-enable machine"
+  elseif (not low) and R.air.last == 1 then
+    R.air.disabled = false
+    _G.needLowAirDialog    = true
+    _G.lowAirDialogType    = "info"
+    _G.lowAirDialogMessage = "Air pressure restored. Verify safety and re-enable the machine."
+  end
+  R.air.last = low and 1 or 0
+end
+
+-- Startup tool prompt: when machine first becomes enabled and T0 with tool-present
+do
+  _G.__enableSeen = _G.__enableSeen or 0
+  local inst = mc.mcGetInstance()
+  local en = mc.mcSignalGetState(mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED))
+  if en == 1 and _G.__enableSeen == 0 then
+    _G.__enableSeen = 1
+    local curr = mc.mcToolGetCurrent(inst) or 0
+    local tPresent = mc.mcSignalGetState(mc.mcSignalGetHandle(inst, mc.ISIG_INPUT17))
+    local inMdi = (mc.mcCntlGetPoundVar(inst, 498) == 1)
+    if (tPresent == 1) and (curr == 0) and (not inMdi) then
+      _G.needToolPrompt        = true
+      _G.toolPromptIsStartup   = true
+      _G.toolPromptRequestTime = os.clock()
+    end
+  elseif en == 0 then
+    _G.__enableSeen = 0
+  end
+end
+
+
+
+--This is the last thing we do.  So keep it at the end of the script!
+machStateOld = machState;
+machWasEnabled = machEnabled;

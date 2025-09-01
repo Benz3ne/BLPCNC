@@ -41,6 +41,30 @@ if AuxLib and AuxLib.BindInterlocks then
   })
 end  -- AuxLib.BindInterlocks docs
 
+-- === AuxLib: device registration ===
+-- NOTE: Adjust pv=... numbers if your PV map differs.
+if AuxLib and AuxLib.Register then
+  -- Dust collector: AUTO follows spindle/inCycle, clears at M30, clears manual on spindle start
+  AuxLib.Register("dust", {
+    outputs = { main = "OSIG_OUTPUT4" },
+    pv      = { auto = 400, target = 404, override = 405 }, -- adjust if needed
+    auto    = function(ctx) return (ctx.spindle == 1 or ctx.inCycle == 1) and 1 or 0 end,
+    events  = { offOnM30 = true, clearManualOnSpindleRise = true },
+  })
+
+  -- Dust boot: force UP during M6 or when a virtual tool is active
+  AuxLib.Register("boot", {
+    outputs = { main = "OSIG_OUTPUT3" },
+    pv      = { auto = 402, target = 403 },                  -- adjust if needed
+    safety  = function(ctx) if ctx.m6 == 1 or ctx.virt == 1 then return 0 end end,
+  })
+
+  -- Zone vacs (example split front/rear)
+  AuxLib.Register("vacRear",  { outputs = { main = "OSIG_OUTPUT5" }, pv = { auto = 401, target = 411 } })
+  AuxLib.Register("vacFront", { outputs = { main = "OSIG_OUTPUT6" }, pv = { auto = 401, target = 412 } })
+end
+
+
 ---------------------------------------------------------------
 -- Signal Library
 ---------------------------------------------------------------
@@ -407,7 +431,7 @@ return PoundVarX, PoundVarY, PoundVarZ, FixNum, CurrentFixture
 --return information from the fixture offset function
 -------------------------------------------------------------------------------------------------------------------
 --PoundVar(Axis) returns the pound variable for the current fixture for that axis (not the pound variables value).
---CurretnFixture returned as a string (examples G54, G59, G54.1 P12).
+--CurrentFixture returned as a string (examples G54, G59, G54.1 P12).
 --FixNum returns a simple number (1-106) for current fixture (examples G54 = 1, G59 = 6, G54.1 P1 = 7, etc).
 -------------------------------------------------------------------------------------------------------------------
 end
@@ -434,6 +458,8 @@ function ButtonEnable() --This function enables or disables buttons associated w
     
 end
 ButtonEnable()
+
+
 
 
 -- ===== UI helpers (optional: call from button scripts) =====
@@ -486,6 +512,7 @@ _panel:Connect(wx.wxEVT_TIMER, function(_)
     _G.needToolPrompt = false
     if _G.ShowToolSelectionDialog then _G.ShowToolSelectionDialog(_G.toolPromptIsStartup) end
   end
+
   if _G.needLowAirDialog then
     _G.needLowAirDialog = false
     local icon = wx.wxICON_WARNING
@@ -493,7 +520,18 @@ _panel:Connect(wx.wxEVT_TIMER, function(_)
     elseif _G.lowAirDialogType == "info" then icon = wx.wxICON_INFORMATION end
     wx.wxMessageBox(_G.lowAirDialogMessage or "System Alert", "Air Pressure Alert", wx.wxOK + icon)
   end
+
+  -- Apply H offset on request from PLC (non-blocking)
+  if _G.requestHApply ~= nil then
+    local n = tonumber(_G.requestHApply) or 0
+    _G.requestHApply = nil  -- consume request
+    mc.mcCntlMdiExecute(inst, "G49")
+    if n > 0 then mc.mcCntlMdiExecute(inst, ("G43 H%d"):format(n)) end
+  end
+
   UpdateToolPreview()
+
 end)
+
 _timer:Start(150)  -- mirrors your prior non-blocking timer pattern
 

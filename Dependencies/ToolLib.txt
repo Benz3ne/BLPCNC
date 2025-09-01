@@ -1230,6 +1230,8 @@ function ToolLib.RequestVirtual(inst, spec)
     end
 end
 
+ToolLib.M6 = ToolLib.M6 or {}
+
 --[[ MoveToPocket
 Execute approach/seat moves for a changer pocket (machine coords).
 Params:

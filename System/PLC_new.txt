@@ -250,6 +250,17 @@ end
   end
 end)()
 
+-- BLP per-tick lib updates --
+do
+  local inst = mc.mcGetInstance()
+  local TL = (_G.__plc and _G.__plc.ToolLib) or _G.ToolLib
+  local AL = (_G.__plc and _G.__plc.AuxLib)  or _G.AuxLib
+  if TL and TL.Update then pcall(TL.Update, inst) end
+  if AL and (AL.Update or AL.update) then pcall(AL.Update or AL.update, inst) end
+end
+
+
+
 
 --This is the last thing we do.  So keep it at the end of the script!
 machStateOld = machState;

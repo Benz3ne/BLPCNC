@@ -1,0 +1,385 @@
+-- ===== ScreenLoad (external) =====
+local inst = mc.mcGetInstance()
+
+-- --- Paths / require ------------------------------------------------------
+local ROOT = [[C:\Mach4Hobby\Profiles\BLP\Scripts]]
+local DEPS = ROOT .. [[\Dependencies]]
+package.path = DEPS .. [[\?.txt;]] .. DEPS .. [[\?.lua;]] .. package.path
+
+local function safeRequire(name)
+  local ok, mod = pcall(require, name)
+  if not ok then
+    mc.mcCntlSetLastError(inst, ("[Degraded Mode] Missing lib '%s'"):format(name))
+    return nil
+  end
+  return mod
+end
+
+-- Load libs (once) and expose globals for legacy code
+_G.SystemLib = _G.SystemLib or safeRequire("SystemLib")
+_G.ToolLib   = _G.ToolLib   or safeRequire("ToolLib")
+_G.AuxLib    = _G.AuxLib    or safeRequire("AuxLib")
+_G.UILib     = _G.UILib     or safeRequire("UILib")
+
+-- --- Safety patch: convert numeric signal IDs -> handles everywhere -------
+do
+  local SL = _G.SystemLib
+  if SL then
+    local function toHandle(sig)
+      if type(sig) == "number" then
+        local h = (SL.SignalGetHandle and SL.SignalGetHandle(inst, sig)) or mc.mcSignalGetHandle(inst, sig)
+        if h and h > 0 then return h end
+      end
+      return sig
+    end
+    SL.SignalGetState = function(_, signal)
+      local h = toHandle(signal)
+      if not h or h == 0 then return nil end
+      return mc.mcSignalGetState(h)
+    end
+    SL.SignalSetState = function(_, signal, state)
+      local h = toHandle(signal)
+      if not h or h == 0 then return false end
+      mc.mcSignalSetState(h, (state and 1 or 0))
+      return true
+    end
+  end
+end
+
+-- --- AuxLib interlocks (pure Lua; safe anytime) ---------------------------
+if AuxLib and AuxLib.BindInterlocks then
+  AuxLib.BindInterlocks({
+    virtualActive  = function()
+      local pv = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 406)) or mc.mcCntlGetPoundVar(inst, 406)
+      return (tonumber(pv) or 0) >= 90 and 1 or 0
+    end,
+    rotationActive = function()
+      return (SystemLib and SystemLib.G68Active and select(1, SystemLib.G68Active(inst))) and 1 or 0
+    end,
+    m6Active       = function()
+      local pv = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 499)) or mc.mcCntlGetPoundVar(inst, 499)
+      return (tonumber(pv) == 1) and 1 or 0
+    end,
+  })
+end
+
+-- --- Device registration (unchanged) --------------------------------------
+if AuxLib and AuxLib.Register then
+  AuxLib.Register("dust", {
+    outputs = { main = "OSIG_OUTPUT4" },
+    pv      = { auto = 400, target = 404, override = 405 },
+    auto    = function(ctx) return (ctx.spindle == 1 or ctx.inCycle == 1) and 1 or 0 end,
+    events  = { offOnM30 = true, clearManualOnSpindleRise = true },
+  })
+  AuxLib.Register("boot", {
+    outputs = { main = "OSIG_OUTPUT3" },
+    pv      = { auto = 402, target = 403 },
+    safety  = function(ctx) if ctx.m6 == 1 or ctx.virt == 1 then return 0 end end,
+  })
+  AuxLib.Register("vacRear",  { outputs = { main = "OSIG_OUTPUT5" }, pv = { auto = 401, target = 411 } })
+  AuxLib.Register("vacFront", { outputs = { main = "OSIG_OUTPUT6" }, pv = { auto = 401, target = 412 } })
+end
+
+-- --- Signal Library (as-is) ----------------------------------------------
+pageId, screenId, testcount = 0, 0, 0
+machState, machStateOld = 0, -1
+machEnabled, machWasEnabled = 0, 0
+Tframe = nil
+
+SigLib = {
+  [mc.OSIG_MACHINE_ENABLED] = function (state)
+    machEnabled = state
+    ButtonEnable()
+    if state == 0 then
+      if ToolLib and ToolLib.RetractVirtual then pcall(ToolLib.RetractVirtual, inst) end
+      mc.mcCntlSetLastError(inst, "Disable: virtual tools secured")
+    else
+      if _G.PopulateTools then pcall(_G.PopulateTools) end
+    end
+  end,
+
+  [mc.OSIG_SPINDLEON] = function (state)
+    if AuxLib and AuxLib.OnEvent then
+      if state == 1 then AuxLib.OnEvent(inst, "spindle_rise") else AuxLib.OnEvent(inst, "spindle_fall") end
+    end
+  end,
+
+  [mc.ISIG_INPUT0] = function (state) end,
+  [mc.ISIG_INPUT1] = function (state) end,
+
+  [mc.OSIG_JOG_CONT] = function (state)
+    if state == 1 then
+      scr.SetProperty('labJogMode', 'Label', 'Continuous')
+      scr.SetProperty('txtJogInc', 'Bg Color', '#C0C0C0')
+      scr.SetProperty('txtJogInc', 'Fg Color', '#808080')
+    end
+  end,
+
+  [mc.OSIG_JOG_INC] = function (state)
+    if state == 1 then
+      scr.SetProperty('labJogMode', 'Label', 'Incremental')
+      scr.SetProperty('txtJogInc', 'Bg Color', '#FFFFFF')
+      scr.SetProperty('txtJogInc', 'Fg Color', '#000000')
+    end
+  end,
+
+  [mc.OSIG_JOG_MPG] = function (state)
+    if state == 1 then
+      scr.SetProperty('labJogMode', 'Label', '')
+      scr.SetProperty('txtJogInc', 'Bg Color', '#C0C0C0')
+      scr.SetProperty('txtJogInc', 'Fg Color', '#808080')
+    end
+  end,
+}
+
+-- --- MsgLib (as-is placeholder) ------------------------------------------
+MsgLib = {
+  [mc.MSG_REG_CHANGED] = function (param1, param2) end
+}
+
+-- --- Helpers / functions (unchanged except tiny safety tweaks) -----------
+function KeyboardInputsToggle()
+  local iReg  = mc.mcIoGetHandle (inst, "Keyboard/Enable")
+  local iReg2 = mc.mcIoGetHandle (inst, "Keyboard/EnableKeyboardJog")
+  if (iReg ~= nil) and (iReg2 ~= nil) then
+    local val = mc.mcIoGetState(iReg)
+    if (val == 1) then
+      mc.mcIoSetState(iReg, 0); mc.mcIoSetState(iReg2, 0)
+      scr.SetProperty('btnKeyboardJog', 'Bg Color', '')
+      scr.SetProperty('btnKeyboardJog', 'Label', 'Keyboard\nInputs Enable')
+    else
+      mc.mcIoSetState(iReg, 1); mc.mcIoSetState(iReg2, 1)
+      scr.SetProperty('btnKeyboardJog', 'Bg Color', '#00FF00')
+      scr.SetProperty('btnKeyboardJog', 'Label', 'Keyboard\nInputs Disable')
+    end
+  end
+end
+
+function RememberPosition()
+  local pos = mc.mcAxisGetMachinePos(inst, 0); mc.mcProfileWriteString(inst, "RememberPos", "X", tostring(pos))
+  pos = mc.mcAxisGetMachinePos(inst, 1);        mc.mcProfileWriteString(inst, "RememberPos", "Y", tostring(pos))
+  pos = mc.mcAxisGetMachinePos(inst, 2);        mc.mcProfileWriteString(inst, "RememberPos", "Z", tostring(pos))
+end
+
+function ReturnToPosition()
+  local xval = mc.mcProfileGetString(inst, "RememberPos", "X", "NotFound")
+  local yval = mc.mcProfileGetString(inst, "RememberPos", "Y", "NotFound")
+  local zval = mc.mcProfileGetString(inst, "RememberPos", "Z", "NotFound")
+  if xval == "NotFound" then
+    wx.wxMessageBox('Register xval does not exist.\nYou must remember a position before you can return to it.')
+  elseif yval == "NotFound" then
+    wx.wxMessageBox('Register yval does not exist.\nYou must remember a position before you can return to it.')
+  elseif zval == "NotFound" then
+    wx.wxMessageBox('Register zval does not exist.\nYou must remember a position before you can return to it.')
+  else
+    mc.mcCntlMdiExecute(inst, "G00 G53 Z0.0000 \n G00 G53 X" .. xval .. "\n G00 G53 Y" .. yval .. "\n G00 G53 Z" .. zval)
+  end
+end
+
+function SpinCW()
+  local sigh = mc.mcSignalGetHandle(inst, mc.OSIG_SPINDLEON)
+  local sigState = mc.mcSignalGetState(sigh)
+  if (sigState == 1) then mc.mcSpindleSetDirection(inst, 0) else mc.mcSpindleSetDirection(inst, 1) end
+end
+
+function SpinCCW()
+  local sigh = mc.mcSignalGetHandle(inst, mc.OSIG_SPINDLEON)
+  local sigState = mc.mcSignalGetState(sigh)
+  if (sigState == 1) then mc.mcSpindleSetDirection(inst, 0) else mc.mcSpindleSetDirection(inst, -1) end
+end
+
+function OpenDocs()
+  local _, minor = wx.wxGetOsVersion()
+  local dir = mc.mcCntlGetMachDir(inst)
+  local cmd = (minor <= 5) and ("explorer.exe ," .. dir .. "\\Docs\\") or ("explorer.exe /open," .. dir .. "\\Docs\\")
+  os.execute(cmd)
+  scr.RefreshScreen(250)
+end
+
+function CycleStop()
+  mc.mcCntlCycleStop(inst)
+  mc.mcSpindleSetDirection(inst, 0)
+  mc.mcCntlSetLastError(inst, "Cycle Stopped")
+  if wait ~= nil then wait = nil end
+end
+
+function ButtonJogModeToggle()
+  local cont = mc.mcSignalGetHandle(inst, mc.OSIG_JOG_CONT)
+  local inc  = mc.mcSignalGetHandle(inst, mc.OSIG_JOG_INC)
+  local mpg  = mc.mcSignalGetHandle(inst, mc.OSIG_JOG_MPG)
+  local jogcont = mc.mcSignalGetState(cont)
+  if (jogcont == 1) then
+    mc.mcSignalSetState(cont, 0); mc.mcSignalSetState(inc, 1); mc.mcSignalSetState(mpg, 0)
+  else
+    mc.mcSignalSetState(cont, 1); mc.mcSignalSetState(inc, 0); mc.mcSignalSetState(mpg, 0)
+  end
+end
+
+function RefAllHome()
+  mc.mcAxisDerefAll(inst)
+  mc.mcAxisHomeAll(inst)
+  coroutine.yield()
+  wx.wxMessageBox('Referencing is complete')
+end
+
+function GoToWorkZero()
+  mc.mcCntlMdiExecute(inst, "G00 X0 Y0")
+end
+
+function CycleStart()
+  local tab = select(1, scr.GetProperty("MainTabs", "Current Tab"))
+  local tabG_Mdione = select(1, scr.GetProperty("nbGCodeMDI1", "Current Tab"))
+  local tabG_Mditwo = select(1, scr.GetProperty("nbGCodeMDI2", "Current Tab"))
+  local state = mc.mcCntlGetState(inst)
+  if (state == mc.MC_STATE_MRUN_MACROH) then
+    mc.mcCntlCycleStart(inst)
+  elseif ((tonumber(tab) == 0 and tonumber(tabG_Mdione) == 1)) then
+    scr.ExecMdi('mdi1')
+  elseif ((tonumber(tab) == 5 and tonumber(tabG_Mditwo) == 1)) then
+    scr.ExecMdi('mdi2')
+  else
+    mc.mcCntlCycleStart(inst)
+  end
+end
+
+function SecondsToTime(seconds)
+  if seconds == 0 then return "00:00:00.00" end
+  local hours = string.format("%02.f", math.floor(seconds/3600))
+  local mins  = string.format("%02.f", math.floor((seconds/60) - (hours*60)))
+  local secs  = string.format("%04.2f",(seconds - (hours*3600) - (mins*60)))
+  return hours .. ":" .. mins .. ":" .. secs
+end
+
+local contHandle = mc.mcSignalGetHandle(inst, mc.OSIG_JOG_CONT)
+if contHandle and contHandle ~= 0 then
+  mc.mcSignalSetState(contHandle, 1)  -- keep as-is: set jog to Continuous
+end
+
+function DecToFrac(axis)
+  local work = mc.mcAxisGetPos(inst, axis)
+  local lab    = "lblFrac"    .. tostring(axis)
+  local labNum = "lblFracNum" .. tostring(axis)
+  local labDen = "lblFracDen" .. tostring(axis)
+  local sign = " "
+  if work < 0 then sign = "-" end
+  work = math.abs(work)
+  local remainder = math.fmod(work, .0625)
+  if remainder >= .03125 then work = work + remainder else work = work - remainder end
+  local inches = math.floor(work / 1.000)
+  local iremainder = work % 1.000
+  local halves   = math.floor(iremainder / .5000); remainder = iremainder % .5000
+  local quarters = math.floor(remainder / .2500); remainder = remainder % .2500
+  local eights   = math.floor(remainder / .1250); remainder = remainder % .1250
+  local sixteens = math.floor(remainder / .0625)
+
+  local numar, denom = 0, 0
+  if     sixteens > 0 then numar = math.floor(iremainder / .0625); denom = 16
+  elseif eights   > 0 then numar = math.floor(iremainder / .1250); denom = 8
+  elseif quarters > 0 then numar = math.floor(iremainder / .2500); denom = 4
+  elseif halves   > 0 then numar = math.floor(iremainder / .5000); denom = 2 end
+
+  scr.SetProperty(lab,    'Label', sign .. tostring(inches))
+  scr.SetProperty(labNum, 'Label', tostring(numar))
+  scr.SetProperty(labDen, 'Label', "/" .. tostring(denom))
+end
+
+-- Optional Mach “modules” (don’t force re-run every load)
+local function safeMod(name)
+  local ok, mod = pcall(require, name)
+  if not ok then mc.mcCntlSetLastError(inst, ("[Degraded Mode] Missing module '%s'"):format(name)) end
+  return ok and mod or nil
+end
+mm           = mm           or safeMod("mcRegister")
+mcErrorCheck = mcErrorCheck or safeMod("mcErrorCheck")
+mcTrace      = mcTrace      or safeMod("mcTrace")
+
+-- ===== Minimal UI helpers (unchanged behavior) ============================
+_G.UI = _G.UI or {}
+
+function UI.Device(deviceName, action)
+  if AuxLib and AuxLib.Request then AuxLib.Request(inst, { device = tostring(deviceName), action = tostring(action or "manual.toggle") }) end
+end
+
+function UI.Virtual(toolNo)
+  if not ToolLib then return end
+  local n = tonumber(toolNo or 0) or 0
+  if n >= 90 and ToolLib.DeployVirtual then
+    ToolLib.DeployVirtual(inst, n)
+  else
+    if ToolLib.RetractVirtual then ToolLib.RetractVirtual(inst) end
+  end
+end
+
+function UI.ToolChange(toolNo)
+  local n = tonumber(toolNo or 0) or 0
+  if n >= 90 then return UI.Virtual(n) end
+  mc.mcCntlGcodeExecuteWait(inst, ("T%d M6"):format(n))
+end
+
+local function ctrlExists(name, prop) local ok = pcall(scr.GetProperty, name, prop or "Visible"); return ok end
+local function UpdateToolPreview()
+  if not ctrlExists("lblToolPreview", "Label") then return end
+  local t = mc.mcToolGetCurrent(inst) or 0
+  local d = (t > 0) and (mc.mcToolGetDesc(inst, t) or "") or "No Tool"
+  scr.SetProperty("lblToolPreview", "Label", (t>0) and (("T%d - %s"):format(t,d)) or "T0 - No Tool")
+end
+
+if not _G.PopulateTools then
+  function PopulateTools()
+    if not ctrlExists("lstCurrentTool", "Strings") then return end
+    _G.toolNumbers = { 0 }; local items = { "0 - No Tool" }
+    for t = 1, 99 do
+      local d = mc.mcToolGetDesc(inst, t)
+      if d and d ~= "" then items[#items+1] = ("%d - %s"):format(t, d); _G.toolNumbers[#_G.toolNumbers+1] = t end
+    end
+    scr.SetProperty("lstCurrentTool", "Strings", table.concat(items, "|"))
+    local curr = mc.mcToolGetCurrent(inst) or 0; local idx = 0
+    for i, tn in ipairs(_G.toolNumbers) do if tn == curr then idx = i-1 break end end
+    scr.SetProperty("lstCurrentTool", "Value", tostring(idx))
+    UpdateToolPreview()
+  end
+end
+
+-- ===== Defer anything UI/IO-sensitive until frame is alive ===============
+if wx and wx.wxCallAfter then
+  wx.wxCallAfter(function()
+    -- Run ToolLib.Init AFTER UI is up
+    if ToolLib and ToolLib.Init then
+      local ok, err = pcall(ToolLib.Init, inst)
+      if not ok and SystemLib and SystemLib.Log then SystemLib.Log(inst, "ToolLib.Init failed: "..tostring(err), "ERROR") end
+    end
+
+    -- Replace old Screen-Load-time wxPanel/wxTimer with a safe timer
+    _G.__SL_SVC = _G.__SL_SVC or {}
+    local svc = _G.__SL_SVC
+    svc.timer = wx.wxTimer()
+
+    svc.timer:Connect(wx.wxEVT_TIMER, function()
+      if _G.needToolPrompt then
+        _G.needToolPrompt = false
+        if _G.ShowToolSelectionDialog then _G.ShowToolSelectionDialog(_G.toolPromptIsStartup) end
+      end
+
+      if _G.needLowAirDialog then
+        _G.needLowAirDialog = false
+        local icon = wx.wxICON_WARNING
+        if _G.lowAirDialogType == "error" then icon = wx.wxICON_ERROR
+        elseif _G.lowAirDialogType == "info" then icon = wx.wxICON_INFORMATION end
+        wx.wxMessageBox(_G.lowAirDialogMessage or "System Alert", "Air Pressure Alert", wx.wxOK + icon)
+      end
+
+      if _G.requestHApply ~= nil then
+        local n = tonumber(_G.requestHApply) or 0
+        _G.requestHApply = nil
+        mc.mcCntlMdiExecute(inst, "G49")
+        if n > 0 then mc.mcCntlMdiExecute(inst, ("G43 H%d"):format(n)) end
+      end
+
+      pcall(UpdateToolPreview)
+    end)
+
+    svc.timer:Start(150)
+  end)
+end
+
+-- ===== end external ScreenLoad =====

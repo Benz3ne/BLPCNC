@@ -322,6 +322,53 @@ function UI.ToolChange(toolNo)
   mc.mcCntlGcodeExecuteWait(inst, ("T%d M6"):format(n))
 end
 
+function UI.SyncOutputs()
+  local S = AuxLib and AuxLib.State
+  if not S then return end
+
+  local function setp(name, prop, value)
+    pcall(scr.SetProperty, name, prop, value)
+  end
+
+  -- Dust collector (ON/OFF from signals; AUTO from PV #400 if control exists)
+  do
+    local d = S(inst, "dust")
+    if d then
+      setp("btnDustCollect", "Button State", d.on == 1 and "1" or "0")
+      setp("btnDustCollect", "Bg Color",     d.on == 1 and "#00FF00" or "#404040")
+    end
+    local pvAuto = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 400)) or mc.mcCntlGetPoundVar(inst, 400)
+    setp("btnDustAuto", "Button State", (tonumber(pvAuto) == 1) and "1" or "0")
+  end
+
+  -- Dust boot (ON/OFF from signals; AUTO from PV #402 if control exists)
+  do
+    local b = S(inst, "boot")
+    if b then
+      setp("btnDustBoot", "Button State", b.on == 1 and "1" or "0")
+      setp("btnDustBoot", "Bg Color",     b.on == 1 and "#00FF00" or "#404040")
+    end
+    local pvAuto = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 402)) or mc.mcCntlGetPoundVar(inst, 402)
+    setp("btnBootAuto", "Button State", (tonumber(pvAuto) == 1) and "1" or "0")
+  end
+
+  -- Vacuums (ON/OFF from signals; AUTO from PV #401 if control exists)
+  do
+    local vr = S(inst, "vacRear")
+    if vr then
+      setp("btnVacRear", "Button State", vr.on == 1 and "1" or "0")
+      setp("btnVacRear", "Bg Color",     vr.on == 1 and "#00FF00" or "#404040")
+    end
+    local vf = S(inst, "vacFront")
+    if vf then
+      setp("btnVacFront", "Button State", vf.on == 1 and "1" or "0")
+      setp("btnVacFront", "Bg Color",     vf.on == 1 and "#00FF00" or "#404040")
+    end
+    local pvAuto = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 401)) or mc.mcCntlGetPoundVar(inst, 401)
+    setp("btnVacAuto", "Button State", (tonumber(pvAuto) == 1) and "1" or "0")
+  end
+end
+
 local function ctrlExists(name, prop) local ok = pcall(scr.GetProperty, name, prop or "Visible"); return ok end
 local function UpdateToolPreview()
   if not ctrlExists("lblToolPreview", "Label") then return end

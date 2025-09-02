@@ -73,7 +73,16 @@ _G.UILib     = _G.UILib     or safeRequire("UILib")
 if SystemLib and SystemLib.Log then SystemLib.Log(inst, "ScreenLoad libs loaded", "INFO") end
 
 -- Initialize libs that support init/update
-if ToolLib   and ToolLib.Init   then pcall(ToolLib.Init,   inst) end  -- Tool outputs virtual/physical management
+-- defer to after the UI is alive
+if ToolLib and ToolLib.Init and wx and wx.wxCallAfter then
+  wx.wxCallAfter(function()
+    local ok, err = pcall(ToolLib.Init, inst)
+    if not ok and SystemLib and SystemLib.Log then
+      SystemLib.Log(inst, "ToolLib.Init failed: "..tostring(err), "ERROR")
+    end
+  end)
+end
+
 
 -- AuxLib interlocks (so devices can see M6/virtual/rotation in their ctx)
 if AuxLib and AuxLib.BindInterlocks then

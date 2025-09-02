@@ -87,8 +87,7 @@ if not _G.__pv_defaults then
   P.pvSet(403, 0)   -- boot target
   P.pvSet(411, 0)   -- rear vac target
   P.pvSet(412, 0)   -- front vac target
-  -- push the new desired states to outputs once
-  if P.AuxLib and P.AuxLib.Update then P.AuxLib.Update(inst) end
+  -- Do not push outputs immediately; allow ScreenLoad/UI to stabilize
 end
 
   -- Initialize fractional DROs (if those helpers exist)

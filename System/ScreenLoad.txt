@@ -122,7 +122,7 @@ SigLib = {
     else
       if _G.PopulateTools then pcall(_G.PopulateTools) end
       do
-        local vt = tonumber((SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 406)) or mc.mcCntlGetPoundVar(inst, 406)) or 0
+        local vt = num((SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 406)) or mc.mcCntlGetPoundVar(inst, 406))
         if vt >= 90 and ToolLib and ToolLib.RetractVirtual then
           pcall(ToolLib.RetractVirtual, inst)
         end
@@ -334,7 +334,7 @@ end
 
 function UI.Virtual(toolNo)
   if not ToolLib then return end
-  local n = tonumber(toolNo or 0) or 0
+  local n = num(toolNo, 0)
   if n >= 90 and ToolLib.DeployVirtual then
     ToolLib.DeployVirtual(inst, n)
   else
@@ -343,7 +343,7 @@ function UI.Virtual(toolNo)
 end
 
 function UI.ToolChange(toolNo)
-  local n = tonumber(toolNo or 0) or 0
+  local n = num(toolNo, 0)
   if n >= 90 then return UI.Virtual(n) end
   mc.mcCntlGcodeExecuteWait(inst, ("T%d M6"):format(n))
 end
@@ -359,7 +359,7 @@ local function setp_ifdiff(name, prop, value)
 end
 
 -- Optional: small helper to coerce 0/1
-local function b01(x) return (tonumber(x) == 1) and 1 or 0 end
+local function b01(x) return (num(x) == 1) and 1 or 0 end
 
 function UI.SyncOutputs(snapshot)
   local inst = mc.mcGetInstance()
@@ -456,11 +456,11 @@ if wx and wx.wxCallAfter then
 
 -- Seed (opt-in via #497, default on) — gated on HOMED
 local function SeedSoftLimits()
-  local inst = mc.mcGetInstance()
+    local inst = mc.mcGetInstance()
 
-  -- #497: 1 = allow seed, 0 = don't touch
-  local enable = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 497)) or mc.mcCntlGetPoundVar(inst, 497)
-  if tonumber(enable or 1) ~= 1 then return end
+    -- #497: 1 = allow seed, 0 = don't touch
+    local enable = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 497)) or mc.mcCntlGetPoundVar(inst, 497)
+    if num(enable, 1) ~= 1 then return end
 
   -- Only enable after homing
   local homed = true
@@ -511,7 +511,7 @@ end
       end
 
       if _G.requestHApply ~= nil then
-        local n = tonumber(_G.requestHApply) or 0
+        local n = num(_G.requestHApply, 0)
         _G.requestHApply = nil
         mc.mcCntlMdiExecute(inst, "G49")
         if n > 0 then mc.mcCntlMdiExecute(inst, ("G43 H%d"):format(n)) end

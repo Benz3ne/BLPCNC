@@ -1,4 +1,4 @@
-==== REQUIRE TRAP 2025-09-01 19:08:35 ====
+==== REQUIRE TRAP 2025-09-01 19:08:47 ====
 ROOT=C:\Mach4Hobby\Profiles\BLP\Scripts
 DEPS=C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies
 SYS =C:\Mach4Hobby\Profiles\BLP\Scripts\System
@@ -51,43 +51,7 @@ C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\?.lua;C:\Mach4Hobby\Profiles\BLP
 -- require('AuxLib')
    require('AuxLib') -> table keys=[BindInterlocks, OnEvent, Register, Request, State, Update, __dev, __interlocks]
 -- require('UILib')
-!! require('UILib') FAILED: module 'UILib' not found:
-	no field package.preload['UILib']
-	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.txt'
-	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.lua'
-	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.lua'
-	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.txt'
-	no file 'C:\Mach4Hobby\lua\UILib.lua'
-	no file 'C:\Mach4Hobby\lua\UILib\init.lua'
-	no file 'C:\Mach4Hobby\UILib.lua'
-	no file 'C:\Mach4Hobby\UILib\init.lua'
-	no file 'C:\Mach4Hobby\..\share\lua\5.3\UILib.lua'
-	no file 'C:\Mach4Hobby\..\share\lua\5.3\UILib\init.lua'
-	no file '.\UILib.lua'
-	no file '.\UILib\init.lua'
-	no file 'C:/Mach4Hobby/ZeroBraneStudio/lualibs/mobdebug/UILib.lua'
-	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/UILib.lua'
-	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/UILib.luac'
-	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/UILib.mcs'
-	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/UILib.mcc'
-	no file 'C:/Mach4Hobby/Modules/UILib.lua'
-	no file 'C:/Mach4Hobby/Modules/UILib.luac'
-	no file 'C:/Mach4Hobby/Modules/UILib.mcs'
-	no file 'C:/Mach4Hobby/Modules/UILib.mcc'
-	no file 'C:/Mach4Hobby/Pmc/UILib.lua'
-	no file 'C:/Mach4Hobby/Pmc/UILib.luac'
-	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/UILib.lua'
-	no file 'C:/Mach4Hobby/Modules/mcStandard/UILib.lua'
-	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/UILib.mcs'
-	no file 'C:/Mach4Hobby/Modules/mcStandard/UILib.mcs'
-	no file './Pmc/UILib.lua'
-	no file './Pmc/UILib.luac'
-	no file 'C:\Mach4Hobby\UILib.dll'
-	no file 'C:\Mach4Hobby\..\lib\lua\5.3\UILib.dll'
-	no file 'C:\Mach4Hobby\loadall.dll'
-	no file '.\UILib.dll'
-	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/UILib.dll'
-	no file 'C:/Mach4Hobby/Modules/UILib.dll'
+   require('UILib') -> table keys=[BindEnterEscape, BindIdle, BindNumberRange, BindToggle, CreateButtonSizer, CreateCheckBox, CreateChoice, CreateDeviceToggle, CreateDialog, CreateDialogWithPanel, CreateFilePicker, CreateNumberInput, CreateProbeDepthInput, CreateProbeDialog, CreateProbeDirectionSelector, CreateProgress, CreateRadioBox, CreateSectionHeader, CreateSliderCombo, DialogGeometryLoad, ..., FindControlsByPattern, FormBuilder, GetCenteredPosition, GetSafeParent, GridCreate, ParameterInputs, ShowCustomConfirm, ShowToolSelectionDialog, SyncDROFromPV, SyncLED, SyncLabel, SyncToggleButton, __lastTick]
 -- require('SystemLib')
    require('SystemLib') -> table keys=[Await, BuildMove, CNC, CapturePosition, CheckHoming, CheckSoftLimits, Coroutine, Dialogs, Edge, Errors, Files, FormatSeconds, G68, G68Active, GenerateDiagnostics, GetLogBuffer, GetMaxTravel, InCycle, Init, IsDebugMode, ..., MDIExec, MachineEnabled, MachineState, Modals, MsgConfirm, MsgError, MsgInfo, MsgWarning, Pound, PoundVarGet, PoundVarSet, ProfileRead, ProfileWrite, RequireReady, SafeZ, SetDebugMode, SettingsCreate, SignalGetHandle, SignalGetState, SignalSetState, Signals, Spindle, ValidateFeedRate, ValidateNumber, WaitIdleOr, WorkOffset, __dlgDepth, __edge]
 -- require('ToolLib')
@@ -129,43 +93,7 @@ C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\?.lua;C:\Mach4Hobby\Profiles\BLP
 	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/ToolLib.dll'
 	no file 'C:/Mach4Hobby/Modules/ToolLib.dll'
 -- require('UILib')
-!! require('UILib') FAILED: module 'UILib' not found:
-	no field package.preload['UILib']
-	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.txt'
-	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.lua'
-	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.lua'
-	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.txt'
-	no file 'C:\Mach4Hobby\lua\UILib.lua'
-	no file 'C:\Mach4Hobby\lua\UILib\init.lua'
-	no file 'C:\Mach4Hobby\UILib.lua'
-	no file 'C:\Mach4Hobby\UILib\init.lua'
-	no file 'C:\Mach4Hobby\..\share\lua\5.3\UILib.lua'
-	no file 'C:\Mach4Hobby\..\share\lua\5.3\UILib\init.lua'
-	no file '.\UILib.lua'
-	no file '.\UILib\init.lua'
-	no file 'C:/Mach4Hobby/ZeroBraneStudio/lualibs/mobdebug/UILib.lua'
-	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/UILib.lua'
-	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/UILib.luac'
-	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/UILib.mcs'
-	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/UILib.mcc'
-	no file 'C:/Mach4Hobby/Modules/UILib.lua'
-	no file 'C:/Mach4Hobby/Modules/UILib.luac'
-	no file 'C:/Mach4Hobby/Modules/UILib.mcs'
-	no file 'C:/Mach4Hobby/Modules/UILib.mcc'
-	no file 'C:/Mach4Hobby/Pmc/UILib.lua'
-	no file 'C:/Mach4Hobby/Pmc/UILib.luac'
-	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/UILib.lua'
-	no file 'C:/Mach4Hobby/Modules/mcStandard/UILib.lua'
-	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/UILib.mcs'
-	no file 'C:/Mach4Hobby/Modules/mcStandard/UILib.mcs'
-	no file './Pmc/UILib.lua'
-	no file './Pmc/UILib.luac'
-	no file 'C:\Mach4Hobby\UILib.dll'
-	no file 'C:\Mach4Hobby\..\lib\lua\5.3\UILib.dll'
-	no file 'C:\Mach4Hobby\loadall.dll'
-	no file '.\UILib.dll'
-	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/UILib.dll'
-	no file 'C:/Mach4Hobby/Modules/UILib.dll'
+   require('UILib') -> table keys=[BindEnterEscape, BindIdle, BindNumberRange, BindToggle, CreateButtonSizer, CreateCheckBox, CreateChoice, CreateDeviceToggle, CreateDialog, CreateDialogWithPanel, CreateFilePicker, CreateNumberInput, CreateProbeDepthInput, CreateProbeDialog, CreateProbeDirectionSelector, CreateProgress, CreateRadioBox, CreateSectionHeader, CreateSliderCombo, DialogGeometryLoad, ..., FindControlsByPattern, FormBuilder, GetCenteredPosition, GetSafeParent, GridCreate, ParameterInputs, ShowCustomConfirm, ShowToolSelectionDialog, SyncDROFromPV, SyncLED, SyncLabel, SyncToggleButton, __lastTick]
 -- require('mcRegister')
    returning STUB for 'mcRegister'
 -- require('mcErrorCheck')

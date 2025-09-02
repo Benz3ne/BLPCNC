@@ -1,0 +1,50 @@
+-- Machine Park Button Script for Mach4 - Rapids Z to 0, then -X/+Y to 1in from soft limits (machine coords)
+mc.mcCntlSetLastError(mc.mcGetInstance(), "PARK BUTTON CLICKED")
+
+local inst = mc.mcGetInstance()
+
+-- Check control state - must be idle
+local controlState = mc.mcCntlGetState(inst)
+if controlState ~= mc.MC_STATE_IDLE then
+    wx.wxMessageBox("Machine must be idle to park!\n\nCurrent state: " .. tostring(controlState), 
+                    "Machine Not Idle", wx.wxOK + wx.wxICON_ERROR)
+    return
+end
+
+-- Check if machine is homed
+local xHomed = mc.mcAxisIsHomed(inst, mc.X_AXIS)
+local yHomed = mc.mcAxisIsHomed(inst, mc.Y_AXIS) 
+local zHomed = mc.mcAxisIsHomed(inst, mc.Z_AXIS)
+
+if not xHomed or not yHomed or not zHomed then
+    wx.wxMessageBox("Machine must be homed before parking!\n\nPlease home all axes first.", 
+                    "Machine Not Homed", wx.wxOK + wx.wxICON_ERROR)
+    return
+end
+
+-- Get soft limits (from your screenshot: X 0-61.5, Y 0-108.9299, Z -10-0)
+local xMin = mc.mcAxisGetSoftlimitMin(inst, mc.X_AXIS)
+local xMax = mc.mcAxisGetSoftlimitMax(inst, mc.X_AXIS)
+local yMin = mc.mcAxisGetSoftlimitMin(inst, mc.Y_AXIS)
+local yMax = mc.mcAxisGetSoftlimitMax(inst, mc.Y_AXIS)
+local zMin = mc.mcAxisGetSoftlimitMin(inst, mc.Z_AXIS)
+local zMax = mc.mcAxisGetSoftlimitMax(inst, mc.Z_AXIS)
+
+-- Calculate park position: Z to 0 (max, safe), X to min+1 (-direction), Y to max-1 (+direction)
+local parkZ = 0  -- Assuming max Z=0 is safe park height
+local parkX = xMin + 1
+local parkY = yMax - 1
+
+-- Build G-code: Rapid Z up first, then XY park (machine coords for safety)
+local gcode = "G90\n"  -- Absolute mode
+gcode = gcode .. string.format("G53 G0 Z%.4f\n", parkZ)  -- Rapid Z to 0
+gcode = gcode .. string.format("G53 G0 X%.4f Y%.4f\n", parkX, parkY)  -- Then XY park
+
+-- Log for sanity
+mc.mcCntlSetLastError(inst, string.format("Parking to machine X%.4f Y%.4f Z%.4f", parkX, parkY, parkZ))
+
+-- Execute
+local rc = mc.mcCntlGcodeExecuteWait(inst, gcode)
+if rc ~= mc.MERROR_NOERROR then
+    wx.wxMessageBox("Park failed! Error: " .. tostring(rc), "Park Error", wx.wxOK + wx.wxICON_ERROR)
+end

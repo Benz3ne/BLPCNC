@@ -1,0 +1,45 @@
+-- Return to Zero Button Script for Mach4 - Rapids Z to safe max (0), then XY to machine 0
+mc.mcCntlSetLastError(mc.mcGetInstance(), "ZERO BUTTON CLICKED")
+
+local inst = mc.mcGetInstance()
+
+-- Check control state - must be idle
+local controlState = mc.mcCntlGetState(inst)
+if controlState ~= mc.MC_STATE_IDLE then
+    wx.wxMessageBox("Machine must be idle to return to zero!\n\nCurrent state: " .. tostring(controlState), 
+                    "Machine Not Idle", wx.wxOK + wx.wxICON_ERROR)
+    return
+end
+
+-- Check if machine is homed
+local xHomed = mc.mcAxisIsHomed(inst, mc.X_AXIS)
+local yHomed = mc.mcAxisIsHomed(inst, mc.Y_AXIS) 
+local zHomed = mc.mcAxisIsHomed(inst, mc.Z_AXIS)
+
+if not xHomed or not yHomed or not zHomed then
+    wx.wxMessageBox("Machine must be homed before returning to zero!\n\nPlease home all axes first.", 
+                    "Machine Not Homed", wx.wxOK + wx.wxICON_ERROR)
+    return
+end
+
+-- Get soft limits for safe Z (assuming max Z=0 is safe)
+local zMax = mc.mcAxisGetSoftlimitMax(inst, mc.Z_AXIS)
+
+-- Build G-code: Rapid Z to max safe first, then XY to 0 (machine coords)
+local gcode = "G90\n"  -- Absolute mode
+gcode = gcode .. string.format("G53 G0 Z%.4f\n", zMax)  -- Rapid Z to 0 (safe height)
+gcode = gcode .. "G53 G0 X0 Y0\n"  -- Then XY to 0
+
+-- Log for sanity
+mc.mcCntlSetLastError(inst, "Returning to machine X0 Y0 Z0 - Path clear?")
+
+-- Optional confirm dialog - uncomment if you want a safety net
+-- if wx.wxMessageBox("Confirm return to machine zero?\nEnsure path is clear!", "Park Confirm", wx.wxYES_NO + wx.wxICON_WARNING) ~= wx.wxID_YES then
+--     return
+-- end
+
+-- Execute
+local rc = mc.mcCntlGcodeExecuteWait(inst, gcode)
+if rc ~= mc.MERROR_NOERROR then
+    wx.wxMessageBox("Return to zero failed! Error: " .. tostring(rc), "Zero Error", wx.wxOK + wx.wxICON_ERROR)
+end

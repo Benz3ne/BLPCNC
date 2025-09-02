@@ -155,11 +155,17 @@ function PLC_Tick(inst)
     end
   end
 
-  -- === UI sync (gated; repaint only on change) ===
+  -- === UI sync (gated; repaint only on change, includes AUTO PVs) ===
   do
     local P = _G.__plc or {}; _G.__plc = P
     local S = AuxLib and AuxLib.State
     if not S then return end
+
+    -- Cheap PV accessor; defers to SystemLib when available
+    local function pv(n)
+      if SystemLib and SystemLib.PoundVarGet then return SystemLib.PoundVarGet(inst, n) end
+      return mc.mcCntlGetPoundVar(inst, n)
+    end
 
     local function snap()
       local d  = S(inst, "dust")     or {}
@@ -169,8 +175,8 @@ function PLC_Tick(inst)
       local hs = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_SOFTLIMITS)
       local sl = hs and mc.mcSignalGetState(hs) or 0
       return {
-        dust={on=(d.on or 0), auto=(d.auto or 0)},
-        boot={on=(b.on or 0), auto=(b.auto or 0)},
+        dust={on=(d.on or 0),  auto=(d.auto or 0)},
+        boot={on=(b.on or 0),  auto=(b.auto or 0)},
         vacFront={on=(vf.on or 0), auto=(vf.auto or 0)},
         vacRear={on=(vr.on or 0), auto=(vr.auto or 0)},
         softlimits=sl,
@@ -178,7 +184,21 @@ function PLC_Tick(inst)
     end
 
     local st = snap()
-    local sig = table.concat({st.dust.on,st.dust.auto, st.boot.on,st.boot.auto, st.vacFront.on,st.vacFront.auto, st.vacRear.on,st.vacRear.auto, st.softlimits}, ",")
+
+    -- Include PVs so AUTO-only changes trigger repaint immediately
+    local a400 = tonumber(pv(400)) or 0  -- dust AUTO
+    local a401 = tonumber(pv(401)) or 0  -- vacuum AUTO (both)
+    local a402 = tonumber(pv(402)) or 0  -- boot AUTO
+
+    local sig = table.concat({
+      st.dust.on, st.dust.auto,
+      st.boot.on, st.boot.auto,
+      st.vacFront.on, st.vacFront.auto,
+      st.vacRear.on, st.vacRear.auto,
+      st.softlimits,
+      a400, a401, a402
+    }, ",")
+
     if sig ~= P._ui_sig then
       P._ui_sig = sig
       if UI and UI.SyncOutputs then pcall(UI.SyncOutputs, st) end

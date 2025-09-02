@@ -1,3 +1,19 @@
+-- ==== Guard to coexist with shim ====
+local fromShim = (_G.SystemLib or _G.UILib or _G.ToolLib or _G.AuxLib) ~= nil
+
+-- If libs are preloaded by the shim, just adopt them and skip any internal requires.
+if fromShim then
+  SystemLib = _G.SystemLib or SystemLib
+  UILib     = _G.UILib     or UILib
+  ToolLib   = _G.ToolLib   or ToolLib
+  AuxLib    = _G.AuxLib    or AuxLib
+  -- If you previously had lines like `package.loaded.SystemLib=nil` before require, remove/skip them.
+end
+
+-- Optional: alias for old names you no longer ship
+if not _G.DustLib and _G.AuxLib then _G.DustLib = _G.AuxLib end
+-- ==== end guard ====
+
 pageId = 0
 screenId = 0
 testcount = 0

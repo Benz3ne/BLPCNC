@@ -322,62 +322,77 @@ function UI.ToolChange(toolNo)
   mc.mcCntlGcodeExecuteWait(inst, ("T%d M6"):format(n))
 end
 
-function UI.SyncOutputs()
-  local S = AuxLib and AuxLib.State
-  if not S then return end
-
-  local function setp(name, prop, value)
+-- Centralized UI repaint (accepts optional precomputed snapshot)
+UI._last = UI._last or {}
+local function setp_ifdiff(name, prop, value)
+  local key = name .. "\t" .. prop
+  if UI._last[key] ~= value then
+    UI._last[key] = value
     pcall(scr.SetProperty, name, prop, value)
   end
-
-  -- Dust collector (ON/OFF from signals; AUTO from PV #400 if control exists)
-  do
-    local d = S(inst, "dust")
-    if d then
-      setp("btnDustCollect", "Button State", d.on == 1 and "1" or "0")
-      setp("btnDustCollect", "Bg Color",     d.on == 1 and "#00FF00" or "#404040")
-    end
-    local pvAuto = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 400)) or mc.mcCntlGetPoundVar(inst, 400)
-    setp("btnDustAuto", "Button State", (tonumber(pvAuto) == 1) and "1" or "0")
-  end
-
-  -- Dust boot (ON/OFF from signals; AUTO from PV #402 if control exists)
-  do
-    local b = S(inst, "boot")
-    if b then
-      setp("btnDustBoot", "Button State", b.on == 1 and "1" or "0")
-      setp("btnDustBoot", "Bg Color",     b.on == 1 and "#00FF00" or "#404040")
-    end
-    local pvAuto = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 402)) or mc.mcCntlGetPoundVar(inst, 402)
-    setp("btnBootAuto", "Button State", (tonumber(pvAuto) == 1) and "1" or "0")
-  end
-
-  -- Vacuums (ON/OFF from signals; AUTO from PV #401 if control exists)
-  do
-    local vr = S(inst, "vacRear")
-    if vr then
-      setp("btnVacRear", "Button State", vr.on == 1 and "1" or "0")
-      setp("btnVacRear", "Bg Color",     vr.on == 1 and "#00FF00" or "#404040")
-    end
-    local vf = S(inst, "vacFront")
-    if vf then
-      setp("btnVacFront", "Button State", vf.on == 1 and "1" or "0")
-      setp("btnVacFront", "Bg Color",     vf.on == 1 and "#00FF00" or "#404040")
-    end
-    local pvAuto = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 401)) or mc.mcCntlGetPoundVar(inst, 401)
-    setp("btnVacAuto", "Button State", (tonumber(pvAuto) == 1) and "1" or "0")
-  end
-
-  -- Soft limits sync
-  if UI.SyncSoftLimits then pcall(UI.SyncSoftLimits) end
 end
 
-function UI.SyncSoftLimits()
+-- Optional: small helper to coerce 0/1
+local function b01(x) return (tonumber(x) == 1) and 1 or 0 end
+
+function UI.SyncOutputs(snapshot)
   local inst = mc.mcGetInstance()
-  local h = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_SOFTLIMITS)
-  local on = (h and mc.mcSignalGetState(h) == 1)
-  pcall(scr.SetProperty, "btnSoftLimits", "Button State", on and "1" or "0")
-  pcall(scr.SetProperty, "btnSoftLimits", "Bg Color", on and "#00FF00" or "#404040")
+  local S = AuxLib and AuxLib.State
+
+  -- build snapshot if not provided (one set of calls only)
+  local st = snapshot
+  if not st and S then
+    st = {
+      dust     = S(inst, "dust")     or {},
+      boot     = S(inst, "boot")     or {},
+      vacFront = S(inst, "vacFront") or {},
+      vacRear  = S(inst, "vacRear")  or {},
+      softlimits = (function()
+        local h = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_SOFTLIMITS)
+        return h and mc.mcSignalGetState(h) or 0
+      end)(),
+    }
+  end
+  if not st then return end
+
+  -- Dust collector
+  do
+    local on = b01(st.dust.on)
+    setp_ifdiff("btnDustCollect", "Button State", on == 1 and "1" or "0")
+    setp_ifdiff("btnDustCollect", "Bg Color",     on == 1 and "#00FF00" or "#404040")
+    local pvAuto = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 400)) or mc.mcCntlGetPoundVar(inst, 400)
+    setp_ifdiff("btnDustAuto", "Button State", b01(pvAuto) == 1 and "1" or "0")
+  end
+
+  -- Dust boot
+  do
+    local on = b01(st.boot.on)
+    setp_ifdiff("btnDustBoot", "Button State", on == 1 and "1" or "0")
+    setp_ifdiff("btnDustBoot", "Bg Color",     on == 1 and "#00FF00" or "#404040")
+    local pvAuto = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 402)) or mc.mcCntlGetPoundVar(inst, 402)
+    setp_ifdiff("btnBootAuto", "Button State", b01(pvAuto) == 1 and "1" or "0")
+  end
+
+  -- Vacuums
+  do
+    local onR = b01(st.vacRear.on)
+    setp_ifdiff("btnVacRear",  "Button State", onR == 1 and "1" or "0")
+    setp_ifdiff("btnVacRear",  "Bg Color",     onR == 1 and "#00FF00" or "#404040")
+
+    local onF = b01(st.vacFront.on)
+    setp_ifdiff("btnVacFront", "Button State", onF == 1 and "1" or "0")
+    setp_ifdiff("btnVacFront", "Bg Color",     onF == 1 and "#00FF00" or "#404040")
+
+    local pvAuto = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 401)) or mc.mcCntlGetPoundVar(inst, 401)
+    setp_ifdiff("btnVacAuto", "Button State", b01(pvAuto) == 1 and "1" or "0")
+  end
+
+  -- Soft limits
+  do
+    local on = b01(st.softlimits)
+    setp_ifdiff("btnSoftLimits", "Button State", on == 1 and "1" or "0")
+    setp_ifdiff("btnSoftLimits", "Bg Color",     on == 1 and "#00FF00" or "#404040")
+  end
 end
 
 local function ctrlExists(name, prop) local ok = pcall(scr.GetProperty, name, prop or "Visible"); return ok end

@@ -1603,4 +1603,91 @@ function SystemLib.Await(inst, spec, opts)
     end
 end
 
+--[[SystemLib.RunProfileScript
+Run a Lua script from the current Mach4 profile by file *name* or absolute path.
+
+Usage:
+  local ok, pathOrErr = SystemLib.RunProfileScript(inst, "TargetMove.txt")
+  -- or:
+  local ok, pathOrErr = SystemLib.RunProfileScript(inst, "C:\\...\\TargetMove.txt")
+
+Guarantees (single-method policy):
+  - Search uses exactly one method: Windows 'dir /B /S' under the current profile.
+  - Execution uses exactly one method: loadfile() + pcall().
+]]
+function SystemLib.RunProfileScript(inst, filename)
+  inst = inst or mc.mcGetInstance()
+  if type(filename) ~= "string" or filename == "" then
+    local msg = "RunProfileScript: invalid filename"
+    mc.mcCntlSetLastError(inst, msg)
+    return false, msg
+  end
+
+  local function isAbs(p) return p:match("^%a:[/\\]") or p:match("^\\\\") end
+
+  -- Profile root + canonical hint (expected default location)
+  local machDir = mc.mcCntlGetMachDir(inst) or ""
+  local prof    = (mc.mcProfileGetName and mc.mcProfileGetName(inst)) or "Default"
+  local root    = machDir .. "\\Profiles\\" .. prof
+  local canonical = root .. "\\Scripts\\ButtonScripts\\" .. filename
+
+  local function runFile(path)
+    local chunk, loadErr = loadfile(path)
+    if not chunk then
+      local msg = "RunProfileScript load error: " .. tostring(loadErr)
+      mc.mcCntlSetLastError(inst, msg)
+      return false, msg
+    end
+    local ok, execErr = pcall(chunk)
+    if not ok then
+      local msg = "RunProfileScript runtime error: " .. tostring(execErr)
+      mc.mcCntlSetLastError(inst, msg)
+      return false, msg
+    end
+    mc.mcCntlSetLastError(inst, "Executed: " .. path)
+    return true, path
+  end
+
+  -- Absolute path: verify + run (no search)
+  if isAbs(filename) then
+    local f = io.open(filename, "r")
+    if not f then
+      local msg = "File Not Found at " .. filename
+      mc.mcCntlSetLastError(inst, msg)
+      return false, msg
+    end
+    f:close()
+    return runFile(filename)
+  end
+
+  -- Name only → single search method: recursive DIR under current profile
+  local matches = {}
+  do
+    local cmd = ('cmd /C dir /B /S /A:-D "%s\\%s"'):format(root, filename)
+    local p = io.popen(cmd)
+    if p then
+      for line in p:lines() do
+        if line and #line > 0 then table.insert(matches, line) end
+      end
+      p:close()
+    end
+  end
+
+  if #matches == 0 then
+    local msg = "File Not Found at " .. canonical
+    mc.mcCntlSetLastError(inst, msg)
+    return false, msg
+  end
+
+  if #matches > 1 then
+    local parts = { 'Multiple files named "' .. filename .. '" found:' }
+    for i, path in ipairs(matches) do parts[#parts+1] = ("  %d) %s"):format(i, path) end
+    local msg = table.concat(parts, "\n")
+    mc.mcCntlSetLastError(inst, msg)
+    return false, msg
+  end
+
+  return runFile(matches[1])
+end
+
 return SystemLib

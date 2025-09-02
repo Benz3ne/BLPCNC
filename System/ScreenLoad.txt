@@ -481,4 +481,9 @@ if wx and wx.wxCallAfter then
   end)
 end
 
+-- First-paint nudge (purely visual)
+if wx and wx.wxCallAfter and UI and UI.SyncOutputs then
+  wx.wxCallAfter(function() pcall(UI.SyncOutputs) end)
+end
+
 -- ===== end external ScreenLoad =====

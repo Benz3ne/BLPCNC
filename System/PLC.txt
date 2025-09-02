@@ -47,9 +47,9 @@ function PLC_Init(inst)
 
   -- pound-var helpers
   function P.pvGet(id)
-    local SL = P.SystemLib
-    if SL and SL.PoundVarGet then return tonumber(SL.PoundVarGet(inst,id)) or 0 end
-    return tonumber(mc.mcCntlGetPoundVar(inst,id)) or 0
+  local SL = P.SystemLib
+  local v = (SL and SL.PoundVarGet and SL.PoundVarGet(inst, id)) or mc.mcCntlGetPoundVar(inst, id)
+  return (type(v) == "number") and v or (tonumber(v) or 0)
   end
   function P.pvSet(id,v)
     local SL = P.SystemLib
@@ -183,14 +183,12 @@ function PLC_Tick(inst)
     local S = AuxLib and AuxLib.State
     if S then
 
-      -- Cheap PV accessor; return ONLY the first value
-local function pv(n)
-  if SystemLib and SystemLib.PoundVarGet then
-    -- Some implementations return (value, rc); take the first only.
-    return select(1, SystemLib.PoundVarGet(inst, n))
-  end
-  return mc.mcCntlGetPoundVar(inst, n)
-end
+      -- Cheap PV accessor; always return a single NUMBER
+      local function pv(n)
+  local SL = (P and P.SystemLib) or _G.SystemLib
+  local v = (SL and SL.PoundVarGet and SL.PoundVarGet(inst, n)) or mc.mcCntlGetPoundVar(inst, n)
+  return (type(v) == "number") and v or (tonumber(v) or 0)
+      end
 
       local function snap()
         local d  = S(inst, "dust")     or {}
@@ -211,9 +209,9 @@ end
       local st = snap()
 
       -- Include PVs so AUTO-only changes trigger repaint immediately
-      local a400 = tonumber(pv(400)) or 0  -- dust AUTO
-      local a401 = tonumber(pv(401)) or 0  -- vacuum AUTO (both)
-      local a402 = tonumber(pv(402)) or 0  -- boot AUTO
+      local a400 = pv(400)  -- dust AUTO
+      local a401 = pv(401)  -- vacuum AUTO (both)
+      local a402 = pv(402)  -- boot AUTO
 
       local sig = table.concat({
         st.dust.on, st.dust.auto,

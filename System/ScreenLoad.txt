@@ -591,3 +591,33 @@ _panel:Connect(wx.wxEVT_TIMER, function(_)
 end)
 
 _timer:Start(150)  -- mirrors your prior non-blocking timer pattern
+
+
+
+do
+  local SL = _G.SystemLib or require("SystemLib")
+  function SL.SignalGetState(inst, signal)
+    local handle = signal
+    if type(signal) == "number" then
+      local h = SL.SignalGetHandle(inst, signal)
+      if h and h > 0 then handle = h end
+    end
+    if not handle or handle == 0 then
+      mc.mcCntlSetLastError(inst, "ERROR: Invalid signal for GetState"); return nil
+    end
+    return mc.mcSignalGetState(handle)
+  end
+  function SL.SignalSetState(inst, signal, state)
+    local handle = signal
+    if type(signal) == "number" then
+      local h = SL.SignalGetHandle(inst, signal)
+      if h and h > 0 then handle = h end
+    end
+    if not handle or handle == 0 then
+      mc.mcCntlSetLastError(inst, "ERROR: Invalid signal for SetState"); return false
+    end
+    mc.mcSignalSetState(handle, (state and 1 or 0))
+    return true
+  end
+end
+

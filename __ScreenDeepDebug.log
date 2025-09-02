@@ -1,0 +1,23 @@
+==== ULTRA DEBUG 2025-09-01 18:59:15 ====
+ROOT=C:\Mach4Hobby\Profiles\BLP\Scripts
+DEPS=C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies
+SYS =C:\Mach4Hobby\Profiles\BLP\Scripts\System
+SL  =C:\Mach4Hobby\Profiles\BLP\Scripts\System\ScreenLoad.txt
+package.path:
+C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\?.lua;C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\?.txt;C:\Mach4Hobby\lua\?.lua;C:\Mach4Hobby\lua\?\init.lua;C:\Mach4Hobby\?.lua;C:\Mach4Hobby\?\init.lua;C:\Mach4Hobby\..\share\lua\5.3\?.lua;C:\Mach4Hobby\..\share\lua\5.3\?\init.lua;.\?.lua;.\?\init.lua;C:/Mach4Hobby/ZeroBraneStudio/lualibs/mobdebug/?.lua;C:/Mach4Hobby/Profiles/BLP/Modules/?.lua;C:/Mach4Hobby/Profiles/BLP/Modules/?.luac;C:/Mach4Hobby/Profiles/BLP/Modules/?.mcs;C:/Mach4Hobby/Profiles/BLP/Modules/?.mcc;C:/Mach4Hobby/Modules/?.lua;C:/Mach4Hobby/Modules/?.luac;C:/Mach4Hobby/Modules/?.mcs;C:/Mach4Hobby/Modules/?.mcc;C:/Mach4Hobby/Pmc/?.lua;C:/Mach4Hobby/Pmc/?.luac;C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/?.lua;C:/Mach4Hobby/Modules/mcStandard/?.lua;C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/?.mcs;C:/Mach4Hobby/Modules/mcStandard/?.mcs;./Pmc/?.lua;./Pmc/?.luac
+OK syntax: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\SystemLib.txt
+OK syntax: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\ToolLib.txt
+OK syntax: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\AuxLib.txt
+OK syntax: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.txt
+OK require 'SystemLib' -> table (keys sample up to 20):
+  count=49 sample=[Await, CheckHoming, CheckSoftLimits, Dialogs, Errors, FormatSeconds, GenerateDiagnostics, GetLogBuffer, InCycle, IsDebugMode, MDIExec, MachineEnabled, Pound, ProfileRead, SignalGetHandle, SignalGetState, Spindle, WaitIdleOr, WorkOffset, __dlgDepth]
+OK require 'ToolLib' -> table (keys sample up to 20):
+  count=31 sample=[CheckSymmetry, CompensateForTip, DeployVirtual, EnableSentinel, EnsureActive, ExecuteProbe, GetCurrent, GetProbeParams, IsLaserActive, IsProbeActive, IsToolPresent, IsVirtual, M6, ProbeTowards, PromptRequest, RequestVirtual, RetractVirtual, SafeTravelWithRetry, SetWorkOffset, Update]
+OK require 'AuxLib' -> table (keys sample up to 20):
+  count=8 sample=[BindInterlocks, OnEvent, Register, Request, State, Update, __dev, __interlocks]
+OK require 'UILib' -> table (keys sample up to 20):
+  count=34 sample=[BindIdle, BindToggle, CreateButtonSizer, CreateCheckBox, CreateChoice, CreateNumberInput, CreateProbeDepthInput, CreateProbeDialog, CreateProgress, CreateSectionHeader, CreateSliderCombo, DialogGeometryLoad, DialogGeometrySave, FindControlsByPattern, FormBuilder, ShowToolSelectionDialog, SyncDROFromPV, SyncLabel, SyncToggleButton, __lastTick]
+-- Loaded ScreenLoad.txt: 25062 bytes
+-- Static scan: wx.* on lines: 229, 231, 233, 268, 318, 556, 557, 558, 566, 567, 568, 569
+-- Static scan: scr.* on lines: 151, 152, 153, 159, 160, 161, 167, 168, 169, 199, 200, 204, 205, 275, 332, 333, 334, 341, 343, 419, 420, 421, 502, 503, 504, 505, 533, 538, 546, 549
+-- Built chunk function ok

@@ -232,7 +232,8 @@ function PLC_Tick(inst)
   do
     local P = _G.__plc or {}; _G.__plc = P
     P.air = P.air or { last=0, t0=0 }
-    local lowNow = (mc.mcSignalGetState(P.hInLowAir) == 1)
+    local hLow = P.hInLowAir or mc.mcSignalGetHandle(inst, mc.ISIG_INPUT6)
+    local lowNow = (hLow and hLow ~= 0 and mc.mcSignalGetState(hLow) == 1) or false
 
     if lowNow then
       if P.air.t0 == 0 then P.air.t0 = os.clock() end

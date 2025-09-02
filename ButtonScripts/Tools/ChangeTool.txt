@@ -1,0 +1,44 @@
+local inst = mc.mcGetInstance()
+
+-- Check machine state
+local controlState = mc.mcCntlGetState(inst)
+if controlState ~= mc.MC_STATE_IDLE then
+    wx.wxMessageBox("Machine must be idle to change tools!", "Error", wx.wxOK + wx.wxICON_ERROR)
+    return
+end
+
+-- Get selected tool
+local selectedIndex = _G.selectedToolIndex
+if not selectedIndex then
+    wx.wxMessageBox("No tool selected!\n\nSelect a tool from the dropdown first.", "Error", wx.wxOK + wx.wxICON_ERROR)
+    return
+end
+
+if not _G.toolNumbers then
+    wx.wxMessageBox("Tool list not initialized!", "Error", wx.wxOK + wx.wxICON_ERROR)
+    return
+end
+
+local toolNum = _G.toolNumbers[selectedIndex + 1]
+if not toolNum then
+    wx.wxMessageBox("Invalid tool selection!", "Error", wx.wxOK + wx.wxICON_ERROR)
+    return
+end
+
+-- Get description
+local desc = toolNum == 0 and "No Tool" or (mc.mcToolGetDesc(inst, toolNum) or "Unnamed")
+
+-- Execute tool change
+mc.mcCntlSetLastError(inst, "Tool change to T" .. toolNum .. " - " .. desc)
+local rc = mc.mcCntlMdiExecute(inst, "T" .. toolNum .. " M6")
+if rc ~= mc.MERROR_NOERROR then
+    mc.mcCntlSetLastError(inst, "ERROR: Tool change command failed")
+else
+    -- Clear selection - successful execution doesn't mean change is complete
+    _G.selectedToolIndex = nil
+end
+
+-- Clear manual override when toggling automation
+if ClearDustBootOverride then
+    ClearDustBootOverride()
+end

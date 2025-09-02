@@ -1,0 +1,36 @@
+local inst = mc.mcGetInstance()
+
+-- Require minimal libs (silent if present, status if missing)
+local okUI,  UILib  = pcall(require, "UILib")
+if not okUI or not UILib then mc.mcCntlSetLastError(inst, "Missing UILib (SoftLimits)"); return end
+
+-- Helper: true if any enabled axis has soft limits ON
+local function anySoftOn()
+  for axis = 0, 5 do
+    if mc.mcAxisIsEnabled(inst, axis) == 1 then
+      if mc.mcSoftLimitGetState(inst, axis) == 1 then return true end
+    end
+  end
+  return false
+end
+
+local enable = not anySoftOn()
+
+-- If turning OFF, ask for confirmation using UILib
+if not enable then
+  local res = UILib.ShowCustomConfirm({
+    title = "Disable Soft Limits?",
+    icon = "warning",
+    geometryName = "Dlg_SoftLimitsConfirm",
+    message = [[Disabling soft limits removes crash protection.\n\n• Machine will NOT stop at travel limits\n• Mechanical damage is possible\n\nProceed?]],
+    buttons = { {id="yes", label="Disable", style="destructive", isDefault=false}, {id="no", label="Cancel", isDefault=true} },
+  })
+  if not res or res.buttonId ~= "yes" then return end
+end
+
+-- Apply to all enabled axes + reflect the master signal
+for axis = 0, 5 do if mc.mcAxisIsEnabled(inst, axis) == 1 then mc.mcSoftLimitSetState(inst, axis, enable and 1 or 0) end end
+local hsig = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON); if hsig and hsig > 0 then mc.mcSignalSetState(hsig, enable and 1 or 0) end
+
+-- Ask the centralized UI to sync the button from actual signal state
+if _G.UI and _G.UI.SyncSoftLimits then _G.UI.SyncSoftLimits() else mc.mcCntlSetLastError(inst, "UI.SyncSoftLimits not found: UI may lag") end

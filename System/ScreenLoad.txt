@@ -348,7 +348,7 @@ function UI.SyncOutputs(snapshot)
       vacFront = S(inst, "vacFront") or {},
       vacRear  = S(inst, "vacRear")  or {},
       softlimits = (function()
-        local h = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_SOFTLIMITS)
+        local h = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON)
         return h and mc.mcSignalGetState(h) or 0
       end)(),
     }
@@ -428,18 +428,34 @@ if wx and wx.wxCallAfter then
       if not ok and SystemLib and SystemLib.Log then SystemLib.Log(inst, "ToolLib.Init failed: "..tostring(err), "ERROR") end
     end
 
-    -- One-time soft-limits seed (opt-in via #497, default on)
-    local function SeedSoftLimits()
-      local inst = mc.mcGetInstance()
-      local enable = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 497)) or mc.mcCntlGetPoundVar(inst, 497)
-      if tonumber(enable or 1) == 1 then
-        local h = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON)
-        if h and mc.mcSignalGetState(h) ~= 1 then
-          mc.mcCntlSetLastError(inst, "Soft limits: enabling")
-          mc.mcSignalSetState(h, 1)
-        end
-      end
-    end
+-- Seed (opt-in via #497, default on) — gated on HOMED
+local function SeedSoftLimits()
+  local inst = mc.mcGetInstance()
+
+  -- #497: 1 = allow seed, 0 = don't touch
+  local enable = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 497)) or mc.mcCntlGetPoundVar(inst, 497)
+  if tonumber(enable or 1) ~= 1 then return end
+
+  -- Only enable after homing
+  local homed = true
+  if SystemLib and SystemLib.CheckHoming then
+    local ok, allHomed = pcall(SystemLib.CheckHoming, inst, false)
+    homed = (ok and allHomed) and true or false
+  end
+  if not homed then
+    mc.mcCntlSetLastError(inst, "Soft limits: postponed until homed")
+    return
+  end
+
+  -- Enable Soft Limits
+  local h = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON)
+  if h and mc.mcSignalGetState(h) ~= 1 then
+    mc.mcCntlSetLastError(inst, "Soft limits: enabling")
+    mc.mcSignalSetState(h, 1)
+  end
+end
+
+
     if not _G.__SOFTLIMITS_SEEDED then _G.__SOFTLIMITS_SEEDED = true; pcall(SeedSoftLimits) end
 
     _G.__SL_SVC = _G.__SL_SVC or {}

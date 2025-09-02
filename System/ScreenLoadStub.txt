@@ -4,21 +4,17 @@ local SYS  = ROOT .. [[\System]]
 
 local SRC = SYS .. [[\ScreenLoad.txt]]
 
-
 -- One-time cache for this stub
 local SL = rawget(_G, "__SL_STUB") or { log_path = nil }
 _G.__SL_STUB = SL
 
-
 local function now() return os.date("%Y-%m-%d %H:%M:%S") end
-
 
 local function downloads_dir()
 local up = os.getenv("USERPROFILE"); if up and #up > 0 then return (up .. "\\Downloads") end
 local pub = os.getenv("PUBLIC"); if pub and #pub > 0 then return (pub .. "\\Downloads") end
 return ROOT
 end
-
 
 local function ensure_log()
 if SL.log_path then return SL.log_path end
@@ -34,7 +30,6 @@ end
 return SL.log_path
 end
 
-
 local function slog(...)
 local path = ensure_log(); if not path then return end
 local ok, f = pcall(io.open, path, "a"); if not ok or not f then return end
@@ -42,11 +37,9 @@ for i = 1, select("#", ...) do f:write(tostring(select(i, ...))) end
 f:write("\r\n"); f:flush(); f:close()
 end
 
-
 local function errh(e)
 return ("%s\n%s"):format(tostring(e), debug.traceback("", 2))
 end
-
 
 -- Expose a reload helper for a dev button
 function _G.Reload_ScreenLoad()
@@ -61,7 +54,6 @@ slog(("!! %s RUNTIME ERROR:\r\n%s"):format(now(), perr))
 error(perr)
 end
 end
-
 
 -- Initial run (silent on success)
 local ok, perr = pcall(_G.Reload_ScreenLoad)

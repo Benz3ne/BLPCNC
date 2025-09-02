@@ -265,7 +265,7 @@ function PLC_Tick(inst)
     if P.pvGet(495) ~= 0 then
       if mc.mcSignalGetState(P.hSpindleOn) == 1 then
         if not P.spin.t0 then mc.mcCntlFeedHold(inst); P.spin.t0 = os.clock() end
-        local need = tonumber(P.pvGet(496)) or 3
+        local need = P.pvGet(496) or 3
         if P.spin.t0 and (os.clock() - P.spin.t0) >= need then
           P.pvSet(495, 0); P.spin.t0 = nil; mc.mcCntlCycleStart(inst)
         end
@@ -301,7 +301,7 @@ function PLC_Tick(inst)
   do
     local P = _G.__plc
     local curTool = mc.mcToolGetCurrent(inst) or 0
-    local activeH = tonumber(P.pvGet(4120)) or 0
+    local activeH = P.pvGet(4120) or 0
     local idle    = (mc.mcCntlGetState(inst) == mc.MC_STATE_IDLE)
     P.tool._t = P.tool._t or curTool
     P.tool._h = P.tool._h or activeH

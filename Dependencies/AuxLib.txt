@@ -202,6 +202,15 @@ function AuxLib.Request(inst, req)
     else
         return false, "Unknown action: "..action
     end
+    -- Debug: log resulting PVs (auto/target) after request
+    do
+        local autoPV, targetPV = (pv and pv.auto), (pv and pv.target)
+        local autoVal = _pv_get(inst, autoPV)
+        local targVal = _pv_get(inst, targetPV)
+        local msg = string.format("AuxLib.Request %s %s -> auto(#%s)=%s target(#%s)=%s",
+                                  tostring(name), tostring(action), tostring(autoPV), tostring(autoVal), tostring(targetPV), tostring(targVal))
+        if SystemLib and SystemLib.Log then SystemLib.Log(inst, msg, "INFO") else mc.mcCntlSetLastError(inst, msg) end
+    end
     return true
 end
 

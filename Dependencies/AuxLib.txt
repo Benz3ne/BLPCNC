@@ -259,6 +259,7 @@ function AuxLib.Update(inst)
         virt     = _bool(AuxLib.__interlocks.virtualActive()),
         rotation = _bool(AuxLib.__interlocks.rotationActive()),
     }
+    local dbg = (SystemLib and SystemLib.IsDebugMode and SystemLib.IsDebugMode()) and true or false
 
     for name, d in pairs(AuxLib.__dev) do
         local spec = d.spec or {}
@@ -315,6 +316,14 @@ function AuxLib.Update(inst)
 
         -- Default safe value if still nil
         if desired == nil then desired = 0 end
+        if dbg then
+            local autoPV, tgtPV = (pv and pv.auto), (pv and pv.target)
+            local autoEn = _clamp01(_pv_get(inst, autoPV))
+            local tgtVal = _clamp01(_pv_get(inst, tgtPV))
+            local msg = string.format("AuxLib.Update %s: auto#%s=%d target#%s=%d desired=%d",
+                                      tostring(name), tostring(autoPV), autoEn, tostring(tgtPV), tgtVal, desired)
+            if SystemLib and SystemLib.Log then SystemLib.Log(inst, msg, "DEBUG") else mc.mcCntlSetLastError(inst, msg) end
+        end
 
         -- 3) Write outputs if changed (main only; extend for aux keys if desired)
         d.rt.last = d.rt.last or {}
@@ -323,6 +332,10 @@ function AuxLib.Update(inst)
             -- Write every declared output key to desired (common pattern)
             for key, sigName in pairs(spec.outputs or {}) do
                 _sig_write(inst, sigName, desired == 1)
+            end
+            if dbg then
+                local msg = string.format("AuxLib.Write %s -> %d (spindle=%d inCycle=%d)", tostring(name), desired, ctx.spindle or 0, ctx.inCycle or 0)
+                if SystemLib and SystemLib.Log then SystemLib.Log(inst, msg, "DEBUG") else mc.mcCntlSetLastError(inst, msg) end
             end
             d.rt.last.main = (desired == 1)
         end

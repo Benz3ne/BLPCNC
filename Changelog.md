@@ -8,5 +8,9 @@
 - SystemLib (Dependencies): fixed a syntax error in return of `Gcode.BuildLinearMove` (newline literal) causing degraded-mode require failures.
 - PLC: normalized PV reads and removed double `tonumber(...)` conversions earlier to resolve `bad argument #1 to 'tonumber'` errors.
 
-Rationale: Keep libraries as the single source of truth for execution (IO/state). Move policy (when to run devices) and ordering (when defaults apply) into ScreenLoad/PLC. This resolves enable-time activations and UI repaint issues at the source with minimal, targeted changes.
+- AuxLib: added debug logging (gated by SystemLib debug mode #4990):
+  - AuxLib.Request logs device/action and resulting auto/target PVs after a request.
+  - AuxLib.Update logs per-device evaluation (auto/target/desired) and writes when state changes.
+  - Enable via `SystemLib.SetDebugMode(inst, true)` or set `#4990=1`.
 
+Rationale: Keep libraries as the single source of truth for execution (IO/state). Move policy (when to run devices) and ordering (when defaults apply) into ScreenLoad/PLC. This resolves enable-time activations and UI repaint issues at the source with minimal, targeted changes.

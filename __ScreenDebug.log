@@ -1,0 +1,26 @@
+==== Mach4 Screen Debug 2025-09-01 18:53:18 ====
+ROOT=C:\Mach4Hobby\Profiles\BLP\Scripts
+DEPS=C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies
+SYS =C:\Mach4Hobby\Profiles\BLP\Scripts\System
+package.path:
+C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\?.lua;C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\?.txt;C:\Mach4Hobby\lua\?.lua;C:\Mach4Hobby\lua\?\init.lua;C:\Mach4Hobby\?.lua;C:\Mach4Hobby\?\init.lua;C:\Mach4Hobby\..\share\lua\5.3\?.lua;C:\Mach4Hobby\..\share\lua\5.3\?\init.lua;.\?.lua;.\?\init.lua;C:/Mach4Hobby/ZeroBraneStudio/lualibs/mobdebug/?.lua;C:/Mach4Hobby/Profiles/BLP/Modules/?.lua;C:/Mach4Hobby/Profiles/BLP/Modules/?.luac;C:/Mach4Hobby/Profiles/BLP/Modules/?.mcs;C:/Mach4Hobby/Profiles/BLP/Modules/?.mcc;C:/Mach4Hobby/Modules/?.lua;C:/Mach4Hobby/Modules/?.luac;C:/Mach4Hobby/Modules/?.mcs;C:/Mach4Hobby/Modules/?.mcc;C:/Mach4Hobby/Pmc/?.lua;C:/Mach4Hobby/Pmc/?.luac;C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/?.lua;C:/Mach4Hobby/Modules/mcStandard/?.lua;C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/?.mcs;C:/Mach4Hobby/Modules/mcStandard/?.mcs;./Pmc/?.lua;./Pmc/?.luac
+-- compileOnly: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\SystemLib.txt
+OK syntax: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\SystemLib.txt
+-- compileOnly: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\ToolLib.txt
+OK syntax: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\ToolLib.txt
+-- compileOnly: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\AuxLib.txt
+OK syntax: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\AuxLib.txt
+-- compileOnly: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.txt
+OK syntax: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.txt
+-- compileOnly: C:\Mach4Hobby\Profiles\BLP\Scripts\System\ScreenLoad.txt
+OK syntax: C:\Mach4Hobby\Profiles\BLP\Scripts\System\ScreenLoad.txt
+-- require 'SystemLib'
+OK require 'SystemLib' -> table {count=49, sample=[Coroutine, Edge, FormatSeconds, G68Active, GenerateDiagnostics, Init, Log, MachineEnabled, MachineState, Modals, ProfileRead, RequireReady, SafeZ, SetDebugMode, SignalGetHandle, SignalGetState, Spindle, ValidateFeedRate, WaitIdleOr, __dlgDepth]}
+-- require 'ToolLib'
+OK require 'ToolLib' -> table {count=31, sample=[CompensateForTip, DeployVirtual, DisableSentinel, EnsureActive, ExecuteProbe, GetCurrent, GetVirtualState, IsProbeActive, M6, ProbeCleanup, ProbeSingleAxis, ProbeTowards, ProbeValidation, RequestVirtual, RetractVirtual, SafeTravelWithRetry, SetCurrent, SyncHOffset, Update, VirtualGuard]}
+-- require 'AuxLib'
+OK require 'AuxLib' -> table {count=8, sample=[BindInterlocks, OnEvent, Register, Request, State, Update, __dev, __interlocks]}
+-- require 'UILib'
+OK require 'UILib' -> table {count=34, sample=[BindEnterEscape, CreateCheckBox, CreateChoice, CreateDialogWithPanel, CreateProbeDepthInput, CreateProbeDialog, CreateProbeDirectionSelector, CreateRadioBox, CreateSectionHeader, CreateSliderCombo, DialogGeometryLoad, DialogGeometrySave, FormBuilder, GetSafeParent, GridCreate, ShowToolSelectionDialog, SyncDROFromPV, SyncLED, SyncLabel, __lastTick]}
+scr sandbox ENABLED
+-- RUN: C:\Mach4Hobby\Profiles\BLP\Scripts\System\ScreenLoad.txt

@@ -1,60 +1,120 @@
-## Mach4 "Degraded Mode" Library Loading Error Analysis
+﻿## Mach4: Outputs Engage On Enable + UI Unresponsive — Root Cause and Fix
 
-### The Problem
-When exiting the screen editor, you're getting these errors:
-- [Degraded Mode] Missing lib 'SystemLib'
-- [Degraded Mode] Missing lib 'ToolLib'
-- [Degraded Mode] Missing lib 'UILib'
+### What Happens
+- On first enable after load, the dust collector and vacuums energize, and UI buttons seem ineffective.
 
-### What I Found
+### Root Causes (from code review)
+1) PLC defaults force Auto ON and push an immediate Update
+   - `Scripts\System\PLC.txt` (PLC_Init):
+     - Sets PV defaults once per session: `#400=1` (dust Auto ON), `#402=1` (boot Auto ON), `#401=0` (vac Auto OFF)
+     - Forces all manual targets OFF: `#404/#403/#411/#412 = 0`
+     - Immediately calls `AuxLib.Update(inst)` after setting PVs.
+   - Impact: If at that moment Mach reports `spindle==on` or `inCycle==1`, Auto logic will drive outputs ON before the UI stabilizes.
 
-1. **The Libraries Exist**: The library files are present in the correct location:
-   - C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\SystemLib.txt (62KB)
-   - C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\ToolLib.txt (57KB)
-   - C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.txt (56KB)
+2) Dust auto is tied to spindle/inCycle; manual clicks can be overridden by Auto
+   - `Scripts\System\ScreenLoad.txt`: device registration
+     - Dust `auto(ctx)`: `return (ctx.spindle == 1 or ctx.inCycle == 1) and 1 or 0`.
+     - Vacuums have no auto function (manual only); boot has safety gate but no auto.
+   - `Scripts\Dependencies\AuxLib.txt` (Update):
+     - Builds `ctx.spindle` from `OSIG_SPINDLEON` and `ctx.inCycle` from `mcCntlIsInCycle`.
+     - If pv.auto==1 and `auto(ctx)` returns 1, desired state becomes ON and AuxLib writes every device output key to that state.
+     - Manual clicks that don’t disable Auto first are immediately overruled on the next Update tick, which feels like “buttons don’t work”.
 
-2. **The Loading Mechanism**: 
-   - ScreenLoad.txt (line 7) sets up the Lua package path:
-     ```lua
-     package.path = DEPS .. [[\?.txt;]] .. DEPS .. [[\?.lua;]] .. package.path
-     ```
-   - It then tries to load the libraries using:
-     ```lua
-     _G.SystemLib = _G.SystemLib or safeRequire("SystemLib")
-     ```
+3) State may be non-zero just after Enable
+   - If the spindle output line is latched or `mcCntlIsInCycle` briefly returns 1 at/after enable, dust Auto=ON will energize dust on the first `AuxLib.Update`.
+   - PLC’s immediate `AuxLib.Update` in `PLC_Init` amplifies this timing problem.
 
-3. **The Root Cause**: The Lua `require()` function is failing to find the files. This happens because:
-   - When in the screen editor, the Lua environment context may be different
-   - The package.path might not be set correctly in that context
-   - Lua's require() function has specific search patterns and the .txt extension might cause issues
+4) Why vacuums appear ON too
+   - Vac devices are manual-only in the current registration, but if their output lines are latched high when AuxLib starts (or targets were set elsewhere), they can be perceived as ON.
+   - Regardless, the “UI unresponsive” symptom is explained by Auto overriding manual unless the UI action disables Auto.
 
-### Why The Proposed Changes Would Fix It
+### Evidence Pointers
+- PLC defaults and early Update: Scripts\System\PLC.txt (PLC_Init) — block that sets #400/#402/#401 and calls `AuxLib.Update(inst)`.
+- Dust auto: Scripts\System\ScreenLoad.txt — `AuxLib.Register("dust", { auto=function(ctx) return (ctx.spindle==1 or ctx.inCycle==1) and 1 or 0 end, ... })`.
+- Update decision flow: Scripts\Dependencies\AuxLib.txt — in `Update`, precedence: safety -> auto -> manual; then writes outputs.
 
-**Option 1 - Rename to .lua files**: 
-- Lua naturally looks for .lua files when using require()
-- This is the standard convention for Lua modules
-- Would eliminate any ambiguity in the file loading process
+### Fix Plan (precise, minimal, and correct)
+1) Gate all device outputs on machine enable
+   - Change `AuxLib.Update(inst)` to fetch enabled:
+     - `local enabled = (_sig_read(inst, "OSIG_MACHINE_ENABLED") == 1) and 1 or 0`
+   - If `enabled == 0`, force `desired = 0` for every device and skip mirroring to PVs.
+   - Why correct: Prevents any device from energizing while disabled or during transitions; matches operator expectation that nothing actuates until fully enabled.
 
-**Option 2 - Fix the require mechanism**:
-- Would make the loading more robust by using loadfile() instead of require()
-- Could add explicit path checking to diagnose issues
-- Would work regardless of the Lua environment context
+2) Remove the early output push in PLC_Init
+   - In `PLC_Init`, after setting PV defaults, remove `if P.AuxLib and P.AuxLib.Update then P.AuxLib.Update(inst) end`.
+   - Let the next `PLC_Tick` drive Update after the screen and Mach signals have stabilized.
+   - Why correct: Eliminates race/timing issues where stale/latched signals make Auto decide ON right after load.
 
-**Option 3 - Create wrapper files**:
-- Small .lua files that explicitly load the .txt files
-- Maintains backward compatibility
-- Works around the require() limitations
+3) Make dust Auto less trigger-happy and/or off by default
+   - Option A (safer default): Initialize with Auto OFF for dust/boot:
+     - Set `#400=0`, `#402=0` in PLC_Init defaults (leave manual targets 0).
+   - Option B (more robust detection): In dust’s `auto(ctx)`, use spindle direction and require in-cycle:
+     - Replace with `return ((mc.mcSpindleGetDirection(inst) ~= 0) and ctx.inCycle == 1) and 1 or 0`.
+   - Why correct: Reduces false positives from a high `OSIG_SPINDLEON` and avoids energizing on mere spindle spin-up outside a program run.
 
-### The Screen Editor Context Issue
-The error specifically happens when leaving the screen editor because:
-1. The screen editor likely runs in a different Lua state/context
-2. When transitioning out, it tries to reload the screen scripts
-3. The package.path set in the normal context isn't available in the editor context
-4. This causes the require() calls to fail and trigger the degraded mode
+4) Ensure UI actions disable Auto when doing manual control
+   - Your `UI.Device(name, action)` already defaults to `manual.toggle`, and `AuxLib.Request` sets `pv.auto=0` before toggling manual targets — this is correct.
+   - Action: Confirm screen button scripts call the exact device names:
+     - `UI.Device('dust')`, `UI.Device('dust','auto.toggle')`
+     - `UI.Device('boot')`, `UI.Device('boot','auto.toggle')`
+     - `UI.Device('vacFront')`, `UI.Device('vacRear')`, `UI.Device('vac','auto.toggle')`
+   - Why correct: Ensures manual clicks actually clear Auto and take effect.
 
-### Recommendation
-Option 1 (renaming to .lua) is the cleanest solution because:
-- It follows Lua conventions
-- It's a simple change that addresses the root cause
-- It will work consistently across all Mach4 contexts
-- No code changes needed, just file renames
+### Code Changes (concrete)
+A) Scripts\Dependencies\AuxLib.txt — gate by enable inside Update
+- Near the start of `function AuxLib.Update(inst)` after building ctx, add:
+
+```lua
+  local enabled = (_sig_read(inst, "OSIG_MACHINE_ENABLED") == 1) and 1 or 0
+```
+
+- Before computing/manipulating desired per device, short-circuit when disabled:
+
+```lua
+  if enabled == 0 then
+      desired = 0
+  else
+      -- existing safety/auto/manual logic
+  end
+```
+
+- And avoid mirroring pv.target when disabled (skip the “Mirror into pv.target” line in the disabled branch).
+
+B) Scripts\System\PLC.txt — stop early Update in PLC_Init
+- Remove this line in the PV defaults block:
+
+```lua
+  if P.AuxLib and P.AuxLib.Update then P.AuxLib.Update(inst) end
+```
+
+C) Safer default (optional but recommended)
+- In the same PV defaults block in `PLC_Init`, set:
+
+```lua
+  P.pvSet(400, 0)   -- dust auto OFF (was 1)
+  P.pvSet(402, 0)   -- boot auto OFF (was 1)
+  P.pvSet(401, 0)   -- vac auto OFF
+  -- targets remain 0
+```
+
+D) Dust auto refinement (optional alternative to C)
+- In `ScreenLoad.txt` dust registration, change auto to require in-cycle and a real spindle direction:
+
+```lua
+  auto = function(ctx)
+    local dir = mc.mcSpindleGetDirection(inst)
+    return ((dir ~= 0) and ctx.inCycle == 1) and 1 or 0
+  end,
+```
+
+### Why This Fix Is Correct
+- Eliminates enable-time races: Deferring initial writes and gating on `OSIG_MACHINE_ENABLED` prevents spurious activations from transient/latched signals.
+- Honors operator intent: Auto must never silently override manual without explicit Auto ON; disabling Auto on manual actions is maintained and made effective by the enable gate.
+- Tightens auto semantics: Requiring both a live spindle direction and being in-cycle ensures dust only runs when it should, not on editor/idle transitions.
+- Minimal surface area: Changes are small, local, and consistent with your existing patterns (no new globals or flow changes).
+
+### Quick Validation
+- With machine disabled, toggling autos/targets never actuates outputs.
+- Enabling with spindle OFF and not in-cycle leaves devices OFF.
+- Press dust Auto ON, start a program (spindle ON + inCycle): dust turns ON; stop program: dust turns OFF.
+- Manual toggles work immediately (they clear Auto for that device), buttons reflect state changes.

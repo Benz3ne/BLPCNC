@@ -1,0 +1,35 @@
+-- Simple Activate Laser Button - Arms and toggles ESS laser test firing with PWM
+-- Requires T91 (laser tool) to turn ON, but can turn OFF regardless of tool
+
+local inst = mc.mcGetInstance()
+
+local hregEnable = mc.mcRegGetHandle(inst, "ESS/Laser/Test_Mode_Enable")
+local hregActivate = mc.mcRegGetHandle(inst, "ESS/Laser/Test_Mode_Activate")
+local isActive = mc.mcRegGetValue(hregActivate)
+
+if isActive == 1 then
+    -- Turn OFF - always allowed regardless of current tool
+    mc.mcRegSetValue(hregActivate, 0)
+else
+    -- Turn ON - check if laser tool (T91) is deployed
+    local currentTool = mc.mcToolGetCurrent(inst)
+    if currentTool ~= 91 then
+        mc.mcCntlSetLastError(inst, "Deploy laser tool (T91) first before activating laser")
+        return
+    end
+    -- Set up PWM parameters (like your arm button example)
+    local hregPower = mc.mcRegGetHandle(inst, "ESS/Laser/Vector/GCode_PWM_Percentage")
+    mc.mcRegSetValue(hregPower, 3)  -- 3% power
+    
+    local hregFreq = mc.mcRegGetHandle(inst, "ESS/Laser/Vector/PWM_Frequency")
+    mc.mcRegSetValue(hregFreq, 4000)  -- 4000 Hz
+    
+    local hregDelay = mc.mcRegGetHandle(inst, "ESS/Laser/Vector/Gate_Delay")
+    mc.mcRegSetValue(hregDelay, 20)  -- 20% delay
+    
+    local hregDuration = mc.mcRegGetHandle(inst, "ESS/Laser/Vector/Gate_Duration")
+    mc.mcRegSetValue(hregDuration, 80)  -- 80% duration
+    
+    mc.mcRegSetValue(hregEnable, 1)  -- Arm it
+    mc.mcRegSetValue(hregActivate, 1)  -- Fire it
+end

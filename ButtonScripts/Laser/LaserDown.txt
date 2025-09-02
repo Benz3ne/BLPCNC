@@ -1,0 +1,15 @@
+-- LaserDown button clicked script
+local inst = mc.mcGetInstance()
+local currentTool = mc.mcToolGetCurrent(inst)
+
+ mc.mcCntlSetLastError(inst, "Button clicked, currentTool = " ..tostring(currentTool))
+
+if currentTool == 91 then
+    mc.mcCntlMdiExecute(inst, "T0 M6")
+else
+    mc.mcCntlMdiExecute(inst, "T91 M6")
+end
+-- Clear manual override when toggling automation
+if ClearDustBootOverride then
+    ClearDustBootOverride()
+end

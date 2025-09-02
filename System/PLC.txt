@@ -155,8 +155,35 @@ function PLC_Tick(inst)
     end
   end
 
-  -- UI mirror (one call, safe)
-  if _G.UI and _G.UI.SyncOutputs then pcall(_G.UI.SyncOutputs) end
+  -- === UI sync (gated; repaint only on change) ===
+  do
+    local P = _G.__plc or {}; _G.__plc = P
+    local S = AuxLib and AuxLib.State
+    if not S then return end
+
+    local function snap()
+      local d  = S(inst, "dust")     or {}
+      local b  = S(inst, "boot")     or {}
+      local vf = S(inst, "vacFront") or {}
+      local vr = S(inst, "vacRear")  or {}
+      local hs = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_SOFTLIMITS)
+      local sl = hs and mc.mcSignalGetState(hs) or 0
+      return {
+        dust={on=(d.on or 0), auto=(d.auto or 0)},
+        boot={on=(b.on or 0), auto=(b.auto or 0)},
+        vacFront={on=(vf.on or 0), auto=(vf.auto or 0)},
+        vacRear={on=(vr.on or 0), auto=(vr.auto or 0)},
+        softlimits=sl,
+      }
+    end
+
+    local st = snap()
+    local sig = table.concat({st.dust.on,st.dust.auto, st.boot.on,st.boot.auto, st.vacFront.on,st.vacFront.auto, st.vacRear.on,st.vacRear.auto, st.softlimits}, ",")
+    if sig ~= P._ui_sig then
+      P._ui_sig = sig
+      if UI and UI.SyncOutputs then pcall(UI.SyncOutputs, st) end
+    end
+  end
 
   -------------------------------------------------------
   --  Low air monitor (3-sample debounce) → hold/stop/disable + UI flag

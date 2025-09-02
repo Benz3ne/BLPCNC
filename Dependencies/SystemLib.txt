@@ -1960,8 +1960,7 @@ function SystemLib.Gcode.BuildLinearMove(inst, record, opts)
         table.insert(lines, prefix .. lin .. string.format("X%.4f Y%.4f Z%.4f", m.x or 0, m.y or 0, m.z or 0))
     end
 
-    return table.concat(lines, "
-")
+    return table.concat(lines, "\r\n")
 end
 
 return SystemLib

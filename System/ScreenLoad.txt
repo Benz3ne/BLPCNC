@@ -503,7 +503,7 @@ if not _G.PopulateTools then
 end
 
 if _G.PopulateTools then pcall(_G.PopulateTools) end
-
+--[[
 -- ===== UI service for legacy PLC flags (tool prompt / low air) =====
 local _panel = wx.wxPanel(wx.NULL, wx.wxID_ANY, wx.wxDefaultPosition, wx.wxSize(0,0))
 local _timer = wx.wxTimer(_panel)
@@ -534,4 +534,4 @@ _panel:Connect(wx.wxEVT_TIMER, function(_)
 end)
 
 _timer:Start(150)  -- mirrors your prior non-blocking timer pattern
-
+]]

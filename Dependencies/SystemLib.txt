@@ -1536,10 +1536,8 @@ function SystemLib.WorkOffset.AddDelta(inst, delta, opts)
     return n
 end
 
-
-
 -- ============================================================================
--- Unified Wait Engine (Lean v1)
+-- Unified Wait Engine
 -- SystemLib.Await(inst, spec, opts) -> ok:boolean, why:"ok"|"timeout"
 -- spec: exactly one of
 --   { idle = true }
@@ -1688,6 +1686,282 @@ function SystemLib.RunProfileScript(inst, filename)
   end
 
   return runFile(matches[1])
+end
+
+SystemLib.Presets = SystemLib.Presets or {}
+SystemLib.History = SystemLib.History or {}
+SystemLib.Units   = SystemLib.Units   or {}
+SystemLib.Gcode   = SystemLib.Gcode   or {}
+
+--[[ SystemLib.Presets.List
+List saved presets in a section.
+Params:
+  inst: Mach4 instance
+  section: Profile section (default "Presets.Generic")
+Returns:
+  presets: Array of { name=string, data=table }
+Notes:
+  Keys: __order="Name1|Name2|…"; P:Name=encoded (coords|units|x|y|z|move|feed|zfirst)
+--]]
+function SystemLib.Presets.List(inst, section)
+    local sec = tostring(section or "Presets.Generic")
+    local S = SystemLib.SettingsCreate(inst, sec)
+    local order = tostring(S:get("__order", ""))
+    local names = {}
+    for n in order:gmatch("([^|]+)") do names[#names+1] = n end
+    local out = {}
+    for _, name in ipairs(names) do
+        local raw = S:get("P:"..name, "")
+        if raw ~= "" then
+            local parts = {}; for v in tostring(raw):gmatch("([^|]+)") do parts[#parts+1]=v end
+            local function num(i) return tonumber(parts[i] or 0) or 0 end
+            local function tf(i)  return (parts[i] == "1") end
+            out[#out+1] = {
+                name = name,
+                data = {
+                    coords = parts[1] or "work",
+                    units  = parts[2] or "in",
+                    x = num(3), y = num(4), z = num(5),
+                    move = parts[6] or "rapid",
+                    feed = num(7),
+                    zfirst = tf(8),
+                }
+            }
+        end
+    end
+    return out
+end
+
+--[[ SystemLib.Presets.Get
+Retrieve a preset by name.
+Params:
+  inst: Mach4 instance
+  section: Profile section (default "Presets.Generic")
+  name: Preset name
+Returns:
+  table: {coords,units,x,y,z,move,feed,zfirst} or nil if not found
+--]]
+function SystemLib.Presets.Get(inst, section, name)
+    local sec = tostring(section or "Presets.Generic")
+    local S   = SystemLib.SettingsCreate(inst, sec)
+    local raw = S:get("P:"..tostring(name or ""), "")
+    if raw == "" then return nil end
+    local parts = {}; for v in tostring(raw):gmatch("([^|]+)") do parts[#parts+1]=v end
+    local function num(i) return tonumber(parts[i] or 0) or 0 end
+    local function tf(i)  return (parts[i] == "1") end
+    return {
+        coords = parts[1] or "work",
+        units  = parts[2] or "in",
+        x = num(3), y = num(4), z = num(5),
+        move = parts[6] or "rapid",
+        feed = num(7),
+        zfirst = tf(8),
+    }
+end
+
+--[[ SystemLib.Presets.Save
+Create or update a preset.
+Params:
+  inst: Mach4 instance
+  section: Profile section (default "Presets.Generic")
+  name: Preset name
+  record: Table {coords,units,x,y,z,move,feed,zfirst}
+Returns:
+  ok, err: true on success; false, message on failure
+--]]
+function SystemLib.Presets.Save(inst, section, name, record)
+    local sec = tostring(section or "Presets.Generic")
+    name = tostring(name or ""):gsub("[|%c]", "")
+    if name == "" then return false, "Invalid name" end
+    local S = SystemLib.SettingsCreate(inst, sec)
+    local function b(x) return (x and x~=0) and "1" or "0" end
+    local enc = table.concat({
+        record.coords or "work",
+        record.units  or "in",
+        tostring(record.x or 0), tostring(record.y or 0), tostring(record.z or 0),
+        record.move   or "rapid",
+        tostring(record.feed or 0),
+        b(record.zfirst ~= false)
+    }, "|")
+    S:set("P:"..name, enc)
+    local order = tostring(S:get("__order", ""))
+    local seen = {}; for n in order:gmatch("([^|]+)") do seen[n] = true end
+    seen[name] = true
+    local names = {}; for n,_ in pairs(seen) do names[#names+1] = n end
+    table.sort(names, function(a,b) return a:lower() < b:lower() end)
+    S:set("__order", table.concat(names, "|"))
+    S:flush()
+    return true
+end
+
+--[[ SystemLib.Presets.Delete
+Delete a preset by name.
+Params:
+  inst: Mach4 instance
+  section: Profile section (default "Presets.Generic")
+  name: Preset name
+Returns:
+  ok: true (idempotent)
+--]]
+function SystemLib.Presets.Delete(inst, section, name)
+    local sec = tostring(section or "Presets.Generic")
+    local S   = SystemLib.SettingsCreate(inst, sec)
+    local nm  = tostring(name or "")
+    S:set("P:"..nm, "")
+    local order = tostring(S:get("__order", ""))
+    local keep = {}
+    for n in order:gmatch("([^|]+)") do if n ~= nm then keep[#keep+1] = n end end
+    S:set("__order", table.concat(keep, "|"))
+    S:flush()
+    return true
+end
+
+--[[ SystemLib.History.Read
+Read records from a history section (newest first).
+Params:
+  inst: Mach4 instance
+  section: Profile section (default "History.Generic")
+Returns:
+  history: Array of records {coords,units,x,y,z,move,feed,zfirst}
+--]]
+function SystemLib.History.Read(inst, section)
+    local sec = tostring(section or "History.Generic")
+    local S   = SystemLib.SettingsCreate(inst, sec)
+    local out, i = {}, 1
+    while true do
+        local raw = S:get(tostring(i), "")
+        if raw == "" then break end
+        local parts = {}; for v in tostring(raw):gmatch("([^|]+)") do parts[#parts+1]=v end
+        local function num(j) return tonumber(parts[j] or 0) or 0 end
+        local function tf(j)  return (parts[j] == "1") end
+        out[#out+1] = {
+            coords = parts[1] or "work",
+            units  = parts[2] or "in",
+            x = num(3), y = num(4), z = num(5),
+            move = parts[6] or "rapid",
+            feed = num(7),
+            zfirst = tf(8),
+        }
+        i = i + 1
+    end
+    return out
+end
+
+--[[ SystemLib.History.Push
+Push a record into a history section, keeping a maximum size.
+Params:
+  inst: Mach4 instance
+  section: Profile section (default "History.Generic")
+  record: Record table {coords,units,x,y,z,move,feed,zfirst}
+  limit: Optional maximum length (default 10)
+Returns:
+  ok: true when written
+--]]
+function SystemLib.History.Push(inst, section, record, limit)
+    local sec = tostring(section or "History.Generic")
+    local S   = SystemLib.SettingsCreate(inst, sec)
+    limit = tonumber(limit or 10) or 10; if limit < 1 then limit = 1 end
+    local current, i = {}, 1
+    while true do
+        local raw = S:get(tostring(i), "")
+        if raw == "" then break end
+        current[#current+1] = raw
+        i = i + 1
+    end
+    local function b(x) return (x and x~=0) and "1" or "0" end
+    local enc = table.concat({
+        record.coords or "work",
+        record.units  or "in",
+        tostring(record.x or 0), tostring(record.y or 0), tostring(record.z or 0),
+        record.move   or "rapid",
+        tostring(record.feed or 0),
+        b(record.zfirst ~= false)
+    }, "|")
+    table.insert(current, 1, enc)
+    while #current > limit do table.remove(current) end
+    for idx, v in ipairs(current) do S:set(tostring(idx), v) end
+    S:set(tostring(#current + 1), "")
+    S:flush()
+    return true
+end
+
+--[[ SystemLib.Units.ConvertXYZF
+Convert x,y,z and feed between inches and millimeters.
+Params:
+  record: {units="in"|"mm", x,y,z,feed, coords?, move?, zfirst?}
+  toUnits: "in" or "mm"
+Returns:
+  record: New table in target units (original is not modified)
+--]]
+function SystemLib.Units.ConvertXYZF(record, toUnits)
+    local r  = record or {}
+    local from = r.units or "in"
+    local to   = toUnits or from
+    local function num(v) return tonumber(v or 0) or 0 end
+    if from == to then
+        return { coords = r.coords or "work", units = from,
+                 x = num(r.x), y = num(r.y), z = num(r.z),
+                 move = r.move or "rapid", feed = num(r.feed), zfirst = (r.zfirst ~= false) }
+    end
+    local factor = (from == "in" and to == "mm") and 25.4 or ((from == "mm" and to == "in") and (1/25.4) or 1)
+    return { coords = r.coords or "work", units = to,
+             x = num(r.x) * factor, y = num(r.y) * factor, z = num(r.z) * factor,
+             move = r.move or "rapid", feed = num(r.feed) * factor, zfirst = (r.zfirst ~= false) }
+end
+
+--[[ SystemLib.Gcode.BuildLinearMove
+Build a simple linear move (G0/G1) in absolute work/machine or relative.
+Params:
+  inst: Mach4 instance (unused)
+  record: {coords,units,x,y,z,move,feed,zfirst}
+  opts: {units?="in"|"mm"} Optional conversion before build
+Returns:
+  gcode: String
+--]]
+function SystemLib.Gcode.BuildLinearMove(inst, record, opts)
+    opts = opts or {}
+    local m = record or {}
+    if opts.units and m.units and opts.units ~= m.units then
+        local factor = (m.units == "in" and opts.units == "mm") and 25.4 or ((m.units == "mm" and opts.units == "in") and (1/25.4) or 1)
+        m = { coords = m.coords or "work", units = opts.units,
+              x = (tonumber(m.x or 0) or 0) * factor,
+              y = (tonumber(m.y or 0) or 0) * factor,
+              z = (tonumber(m.z or 0) or 0) * factor,
+              move = m.move or "rapid", feed = (tonumber(m.feed or 0) or 0) * factor,
+              zfirst = (m.zfirst ~= false) }
+    else
+        m = { coords = m.coords or "work", units = m.units or "in",
+              x = tonumber(m.x or 0) or 0, y = tonumber(m.y or 0) or 0, z = tonumber(m.z or 0) or 0,
+              move = m.move or "rapid", feed = tonumber(m.feed or 0) or 0, zfirst = (m.zfirst ~= false) }
+    end
+
+    local lines = {}
+    local setF = (m.move ~= "rapid") and string.format("F%.3f", m.feed or 0) or nil
+
+    if m.coords == "relative" then
+        table.insert(lines, "G91")
+        if setF then table.insert(lines, setF) end
+        if m.zfirst then
+            if (m.z or 0) ~= 0 then table.insert(lines, (m.move=="rapid" and "G0" or "G1") .. string.format(" Z%.4f", m.z)) end
+            if (m.x or 0) ~= 0 or (m.y or 0) ~= 0 then
+                table.insert(lines, (m.move=="rapid" and "G0" or "G1") .. string.format(" X%.4f Y%.4f", m.x or 0, m.y or 0))
+            end
+        else
+            if (m.x or 0) ~= 0 or (m.y or 0) ~= 0 then
+                table.insert(lines, (m.move=="rapid" and "G0" or "G1") .. string.format(" X%.4f Y%.4f", m.x or 0, m.y or 0))
+            end
+            if (m.z or 0) ~= 0 then table.insert(lines, (m.move=="rapid" and "G0" or "G1") .. string.format(" Z%.4f", m.z)) end
+        end
+        table.insert(lines, "G90")
+    else
+        local prefix = (m.coords == "machine") and "G53 " or ""
+        if setF then table.insert(lines, setF) end
+        local lin = (m.move == "rapid" and "G0 " or "G1 ")
+        table.insert(lines, prefix .. lin .. string.format("X%.4f Y%.4f Z%.4f", m.x or 0, m.y or 0, m.z or 0))
+    end
+
+    return table.concat(lines, "
+")
 end
 
 return SystemLib

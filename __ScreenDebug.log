@@ -1,26 +1,165 @@
-==== Mach4 Screen Debug 2025-09-01 18:53:18 ====
+==== Mach4 Screen Debug 2025-09-01 18:54:31 ====
 ROOT=C:\Mach4Hobby\Profiles\BLP\Scripts
 DEPS=C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies
 SYS =C:\Mach4Hobby\Profiles\BLP\Scripts\System
 package.path:
 C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\?.lua;C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\?.txt;C:\Mach4Hobby\lua\?.lua;C:\Mach4Hobby\lua\?\init.lua;C:\Mach4Hobby\?.lua;C:\Mach4Hobby\?\init.lua;C:\Mach4Hobby\..\share\lua\5.3\?.lua;C:\Mach4Hobby\..\share\lua\5.3\?\init.lua;.\?.lua;.\?\init.lua;C:/Mach4Hobby/ZeroBraneStudio/lualibs/mobdebug/?.lua;C:/Mach4Hobby/Profiles/BLP/Modules/?.lua;C:/Mach4Hobby/Profiles/BLP/Modules/?.luac;C:/Mach4Hobby/Profiles/BLP/Modules/?.mcs;C:/Mach4Hobby/Profiles/BLP/Modules/?.mcc;C:/Mach4Hobby/Modules/?.lua;C:/Mach4Hobby/Modules/?.luac;C:/Mach4Hobby/Modules/?.mcs;C:/Mach4Hobby/Modules/?.mcc;C:/Mach4Hobby/Pmc/?.lua;C:/Mach4Hobby/Pmc/?.luac;C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/?.lua;C:/Mach4Hobby/Modules/mcStandard/?.lua;C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/?.mcs;C:/Mach4Hobby/Modules/mcStandard/?.mcs;./Pmc/?.lua;./Pmc/?.luac
 -- compileOnly: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\SystemLib.txt
-OK syntax: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\SystemLib.txt
+!! SYNTAX ERROR: cannot open C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\SystemLib.txt: No such file or directory
 -- compileOnly: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\ToolLib.txt
-OK syntax: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\ToolLib.txt
+!! SYNTAX ERROR: cannot open C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\ToolLib.txt: No such file or directory
 -- compileOnly: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\AuxLib.txt
-OK syntax: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\AuxLib.txt
+!! SYNTAX ERROR: cannot open C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\AuxLib.txt: No such file or directory
 -- compileOnly: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.txt
-OK syntax: C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.txt
+!! SYNTAX ERROR: cannot open C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.txt: No such file or directory
 -- compileOnly: C:\Mach4Hobby\Profiles\BLP\Scripts\System\ScreenLoad.txt
 OK syntax: C:\Mach4Hobby\Profiles\BLP\Scripts\System\ScreenLoad.txt
 -- require 'SystemLib'
-OK require 'SystemLib' -> table {count=49, sample=[Coroutine, Edge, FormatSeconds, G68Active, GenerateDiagnostics, Init, Log, MachineEnabled, MachineState, Modals, ProfileRead, RequireReady, SafeZ, SetDebugMode, SignalGetHandle, SignalGetState, Spindle, ValidateFeedRate, WaitIdleOr, __dlgDepth]}
+!! require error 'SystemLib': module 'SystemLib' not found:
+	no field package.preload['SystemLib']
+	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\SystemLib.lua'
+	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\SystemLib.txt'
+	no file 'C:\Mach4Hobby\lua\SystemLib.lua'
+	no file 'C:\Mach4Hobby\lua\SystemLib\init.lua'
+	no file 'C:\Mach4Hobby\SystemLib.lua'
+	no file 'C:\Mach4Hobby\SystemLib\init.lua'
+	no file 'C:\Mach4Hobby\..\share\lua\5.3\SystemLib.lua'
+	no file 'C:\Mach4Hobby\..\share\lua\5.3\SystemLib\init.lua'
+	no file '.\SystemLib.lua'
+	no file '.\SystemLib\init.lua'
+	no file 'C:/Mach4Hobby/ZeroBraneStudio/lualibs/mobdebug/SystemLib.lua'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/SystemLib.lua'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/SystemLib.luac'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/SystemLib.mcs'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/SystemLib.mcc'
+	no file 'C:/Mach4Hobby/Modules/SystemLib.lua'
+	no file 'C:/Mach4Hobby/Modules/SystemLib.luac'
+	no file 'C:/Mach4Hobby/Modules/SystemLib.mcs'
+	no file 'C:/Mach4Hobby/Modules/SystemLib.mcc'
+	no file 'C:/Mach4Hobby/Pmc/SystemLib.lua'
+	no file 'C:/Mach4Hobby/Pmc/SystemLib.luac'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/SystemLib.lua'
+	no file 'C:/Mach4Hobby/Modules/mcStandard/SystemLib.lua'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/SystemLib.mcs'
+	no file 'C:/Mach4Hobby/Modules/mcStandard/SystemLib.mcs'
+	no file './Pmc/SystemLib.lua'
+	no file './Pmc/SystemLib.luac'
+	no file 'C:\Mach4Hobby\SystemLib.dll'
+	no file 'C:\Mach4Hobby\..\lib\lua\5.3\SystemLib.dll'
+	no file 'C:\Mach4Hobby\loadall.dll'
+	no file '.\SystemLib.dll'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/SystemLib.dll'
+	no file 'C:/Mach4Hobby/Modules/SystemLib.dll'
 -- require 'ToolLib'
-OK require 'ToolLib' -> table {count=31, sample=[CompensateForTip, DeployVirtual, DisableSentinel, EnsureActive, ExecuteProbe, GetCurrent, GetVirtualState, IsProbeActive, M6, ProbeCleanup, ProbeSingleAxis, ProbeTowards, ProbeValidation, RequestVirtual, RetractVirtual, SafeTravelWithRetry, SetCurrent, SyncHOffset, Update, VirtualGuard]}
+!! require error 'ToolLib': module 'ToolLib' not found:
+	no field package.preload['ToolLib']
+	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\ToolLib.lua'
+	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\ToolLib.txt'
+	no file 'C:\Mach4Hobby\lua\ToolLib.lua'
+	no file 'C:\Mach4Hobby\lua\ToolLib\init.lua'
+	no file 'C:\Mach4Hobby\ToolLib.lua'
+	no file 'C:\Mach4Hobby\ToolLib\init.lua'
+	no file 'C:\Mach4Hobby\..\share\lua\5.3\ToolLib.lua'
+	no file 'C:\Mach4Hobby\..\share\lua\5.3\ToolLib\init.lua'
+	no file '.\ToolLib.lua'
+	no file '.\ToolLib\init.lua'
+	no file 'C:/Mach4Hobby/ZeroBraneStudio/lualibs/mobdebug/ToolLib.lua'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/ToolLib.lua'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/ToolLib.luac'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/ToolLib.mcs'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/ToolLib.mcc'
+	no file 'C:/Mach4Hobby/Modules/ToolLib.lua'
+	no file 'C:/Mach4Hobby/Modules/ToolLib.luac'
+	no file 'C:/Mach4Hobby/Modules/ToolLib.mcs'
+	no file 'C:/Mach4Hobby/Modules/ToolLib.mcc'
+	no file 'C:/Mach4Hobby/Pmc/ToolLib.lua'
+	no file 'C:/Mach4Hobby/Pmc/ToolLib.luac'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/ToolLib.lua'
+	no file 'C:/Mach4Hobby/Modules/mcStandard/ToolLib.lua'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/ToolLib.mcs'
+	no file 'C:/Mach4Hobby/Modules/mcStandard/ToolLib.mcs'
+	no file './Pmc/ToolLib.lua'
+	no file './Pmc/ToolLib.luac'
+	no file 'C:\Mach4Hobby\ToolLib.dll'
+	no file 'C:\Mach4Hobby\..\lib\lua\5.3\ToolLib.dll'
+	no file 'C:\Mach4Hobby\loadall.dll'
+	no file '.\ToolLib.dll'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/ToolLib.dll'
+	no file 'C:/Mach4Hobby/Modules/ToolLib.dll'
 -- require 'AuxLib'
-OK require 'AuxLib' -> table {count=8, sample=[BindInterlocks, OnEvent, Register, Request, State, Update, __dev, __interlocks]}
+!! require error 'AuxLib': module 'AuxLib' not found:
+	no field package.preload['AuxLib']
+	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\AuxLib.lua'
+	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\AuxLib.txt'
+	no file 'C:\Mach4Hobby\lua\AuxLib.lua'
+	no file 'C:\Mach4Hobby\lua\AuxLib\init.lua'
+	no file 'C:\Mach4Hobby\AuxLib.lua'
+	no file 'C:\Mach4Hobby\AuxLib\init.lua'
+	no file 'C:\Mach4Hobby\..\share\lua\5.3\AuxLib.lua'
+	no file 'C:\Mach4Hobby\..\share\lua\5.3\AuxLib\init.lua'
+	no file '.\AuxLib.lua'
+	no file '.\AuxLib\init.lua'
+	no file 'C:/Mach4Hobby/ZeroBraneStudio/lualibs/mobdebug/AuxLib.lua'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/AuxLib.lua'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/AuxLib.luac'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/AuxLib.mcs'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/AuxLib.mcc'
+	no file 'C:/Mach4Hobby/Modules/AuxLib.lua'
+	no file 'C:/Mach4Hobby/Modules/AuxLib.luac'
+	no file 'C:/Mach4Hobby/Modules/AuxLib.mcs'
+	no file 'C:/Mach4Hobby/Modules/AuxLib.mcc'
+	no file 'C:/Mach4Hobby/Pmc/AuxLib.lua'
+	no file 'C:/Mach4Hobby/Pmc/AuxLib.luac'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/AuxLib.lua'
+	no file 'C:/Mach4Hobby/Modules/mcStandard/AuxLib.lua'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/AuxLib.mcs'
+	no file 'C:/Mach4Hobby/Modules/mcStandard/AuxLib.mcs'
+	no file './Pmc/AuxLib.lua'
+	no file './Pmc/AuxLib.luac'
+	no file 'C:\Mach4Hobby\AuxLib.dll'
+	no file 'C:\Mach4Hobby\..\lib\lua\5.3\AuxLib.dll'
+	no file 'C:\Mach4Hobby\loadall.dll'
+	no file '.\AuxLib.dll'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/AuxLib.dll'
+	no file 'C:/Mach4Hobby/Modules/AuxLib.dll'
 -- require 'UILib'
-OK require 'UILib' -> table {count=34, sample=[BindEnterEscape, CreateCheckBox, CreateChoice, CreateDialogWithPanel, CreateProbeDepthInput, CreateProbeDialog, CreateProbeDirectionSelector, CreateRadioBox, CreateSectionHeader, CreateSliderCombo, DialogGeometryLoad, DialogGeometrySave, FormBuilder, GetSafeParent, GridCreate, ShowToolSelectionDialog, SyncDROFromPV, SyncLED, SyncLabel, __lastTick]}
+!! require error 'UILib': module 'UILib' not found:
+	no field package.preload['UILib']
+	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.lua'
+	no file 'C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.txt'
+	no file 'C:\Mach4Hobby\lua\UILib.lua'
+	no file 'C:\Mach4Hobby\lua\UILib\init.lua'
+	no file 'C:\Mach4Hobby\UILib.lua'
+	no file 'C:\Mach4Hobby\UILib\init.lua'
+	no file 'C:\Mach4Hobby\..\share\lua\5.3\UILib.lua'
+	no file 'C:\Mach4Hobby\..\share\lua\5.3\UILib\init.lua'
+	no file '.\UILib.lua'
+	no file '.\UILib\init.lua'
+	no file 'C:/Mach4Hobby/ZeroBraneStudio/lualibs/mobdebug/UILib.lua'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/UILib.lua'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/UILib.luac'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/UILib.mcs'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/UILib.mcc'
+	no file 'C:/Mach4Hobby/Modules/UILib.lua'
+	no file 'C:/Mach4Hobby/Modules/UILib.luac'
+	no file 'C:/Mach4Hobby/Modules/UILib.mcs'
+	no file 'C:/Mach4Hobby/Modules/UILib.mcc'
+	no file 'C:/Mach4Hobby/Pmc/UILib.lua'
+	no file 'C:/Mach4Hobby/Pmc/UILib.luac'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/UILib.lua'
+	no file 'C:/Mach4Hobby/Modules/mcStandard/UILib.lua'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/mcStandard/UILib.mcs'
+	no file 'C:/Mach4Hobby/Modules/mcStandard/UILib.mcs'
+	no file './Pmc/UILib.lua'
+	no file './Pmc/UILib.luac'
+	no file 'C:\Mach4Hobby\UILib.dll'
+	no file 'C:\Mach4Hobby\..\lib\lua\5.3\UILib.dll'
+	no file 'C:\Mach4Hobby\loadall.dll'
+	no file '.\UILib.dll'
+	no file 'C:/Mach4Hobby/Profiles/BLP/Modules/UILib.dll'
+	no file 'C:/Mach4Hobby/Modules/UILib.dll'
 scr sandbox ENABLED
 -- RUN: C:\Mach4Hobby\Profiles\BLP\Scripts\System\ScreenLoad.txt
+OK ran: C:\Mach4Hobby\Profiles\BLP\Scripts\System\ScreenLoad.txt
+scr sandbox RESTORED
+==== DONE ====

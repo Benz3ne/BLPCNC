@@ -1,0 +1,117 @@
+-- OutputsDebug.txt
+-- Comprehensive diagnostic for Mach4 outputs 3..6 staying high
+-- Safe: does not enable machine, does not change e-stop. Optionally forces PVs to reduce interference.
+
+local inst = mc.mcGetInstance()
+
+-- User options
+local FORCE_AUTOS_OFF   = false   -- set true to force #400/#401/#402=0 and targets #404/#403/#411/#412=0 before tests
+local DELAY_MS          = 150     -- delay after writes before delayed readback
+local TEST_OUTPUTS      = {3,4,5,6}
+
+local function log(level, msg)
+  level = level or "INFO"
+  mc.mcCntlSetLastError(inst, string.format("[OUTDBG][%s] %s", level, tostring(msg)))
+end
+
+local function sigConst(n)
+  return mc[string.format("OSIG_OUTPUT%d", n)]
+end
+
+local function getHandle(n)
+  local id = sigConst(n)
+  if not id then return nil end
+  local h = mc.mcSignalGetHandle(inst, id)
+  return h, id
+end
+
+local function readState(n)
+  local h, id = getHandle(n)
+  if not h or h == 0 then return nil, id, h end
+  local st = mc.mcSignalGetState(h)
+  return st, id, h
+end
+
+local function writeState(n, val)
+  local h, id = getHandle(n)
+  if not h or h == 0 then return false, id, h, nil, nil end
+  mc.mcSignalSetState(h, (val and 1 or 0))
+  local imm = mc.mcSignalGetState(h)
+  wx.wxMilliSleep(DELAY_MS)
+  local aft = mc.mcSignalGetState(h)
+  return true, id, h, imm, aft
+end
+
+local function pvGet(num)
+  local v
+  if SystemLib and SystemLib.PoundVarGet then v = SystemLib.PoundVarGet(inst, num) else v = mc.mcCntlGetPoundVar(inst, num) end
+  return (type(v)=="number") and v or (tonumber(v) or 0)
+end
+
+local function pvSet(num, val)
+  if SystemLib and SystemLib.PoundVarSet then return SystemLib.PoundVarSet(inst, num, val) else return mc.mcCntlSetPoundVar(inst, num, val) end
+end
+
+local function snapshotAux()
+  if not AuxLib then return end
+  log("INFO", "Aux devices + PV snapshot:")
+  for name, d in pairs(AuxLib.__dev or {}) do
+    local spec = d.spec or {}
+    local pv   = spec.pv or {}
+    local auto = pv.auto and pvGet(pv.auto) or -1
+    local targ = pv.target and pvGet(pv.target) or -1
+    local outs = {}
+    for k, sigName in pairs(spec.outputs or {}) do table.insert(outs, string.format("%s=%s", k, tostring(sigName))) end
+    log("INFO", string.format("  %s: auto#%s=%s target#%s=%s outputs={%s}", tostring(name), tostring(pv.auto), tostring(auto), tostring(pv.target), tostring(targ), table.concat(outs, ", ")))    
+  end
+end
+
+local function maybeForceAutos()
+  if not FORCE_AUTOS_OFF then return end
+  log("WARNING", "FORCE_AUTOS_OFF=true -> clearing autos (#400/#401/#402) and targets (#404/#403/#411/#412)")
+  pvSet(400,0); pvSet(401,0); pvSet(402,0)
+  pvSet(404,0); pvSet(403,0); pvSet(411,0); pvSet(412,0)
+end
+
+local function enabled()
+  local h = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED)
+  return (h and h~=0 and mc.mcSignalGetState(h) == 1) and 1 or 0
+end
+
+-- Header
+log("INFO", "=== Outputs Debug: begin ===")
+log("INFO", string.format("Profile=%s  Time=%s", tostring(mc.mcProfileGetName(inst)), os.date("%Y-%m-%d %H:%M:%S")))
+log("INFO", string.format("Machine enabled=%d  Delay=%dms  FORCE_AUTOS_OFF=%s", enabled(), DELAY_MS, tostring(FORCE_AUTOS_OFF)))
+
+snapshotAux()
+maybeForceAutos()
+
+-- Per-output diagnostic
+for _, n in ipairs(TEST_OUTPUTS) do
+  local st0, id, h = readState(n)
+  if not id then
+    log("ERROR", string.format("Output%d: missing signal constant (mc.OSIG_OUTPUT%d)" , n, n))
+  elseif not h or h == 0 then
+    log("ERROR", string.format("Output%d: handle invalid (id=%s) -> check Control/IO mapping & plugin", n, tostring(id)))
+  else
+    log("INFO", string.format("Output%d: id=%s handle=%s initial=%s", n, tostring(id), tostring(h), tostring(st0)))
+    -- Try force 0
+    local ok0, _, _, imm0, aft0 = writeState(n, 0)
+    log("INFO", string.format("Output%d: write 0 -> imm=%s delayed=%s (enabled=%d)", n, tostring(imm0), tostring(aft0), enabled()))
+    -- Try force 1
+    local ok1, _, _, imm1, aft1 = writeState(n, 1)
+    log("INFO", string.format("Output%d: write 1 -> imm=%s delayed=%s (enabled=%d)", n, tostring(imm1), tostring(aft1), enabled()))
+    -- Try force 0 again
+    local ok2, _, _, imm2, aft2 = writeState(n, 0)
+    log("INFO", string.format("Output%d: write 0 -> imm=%s delayed=%s (enabled=%d)", n, tostring(imm2), tostring(aft2), enabled()))
+
+    if aft0 == 1 and aft1 == 1 and aft2 == 1 then
+      log("WARNING", string.format("Output%d: stuck HIGH (override suspected)", n))
+    elseif aft0 == 0 and aft1 == 0 and aft2 == 0 then
+      log("WARNING", string.format("Output%d: stuck LOW (writes ignored)", n))
+    end
+  end
+end
+
+log("INFO", "=== Outputs Debug: end ===")
+

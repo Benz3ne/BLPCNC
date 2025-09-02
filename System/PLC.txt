@@ -126,10 +126,12 @@ function PLC_Tick(inst)
     end
   end
 
-  -- Height Offset LED (G49 vs G43)
+  -- Height Offset LED (gate write)
   do
     local HOState = mc.mcCntlGetPoundVar(inst, 4008)
-    pcall(scr.SetProperty, "ledHOffset", "Value", (HOState == 49) and "0" or "1")
+    local cur = select(1, scr.GetProperty("ledHOffset", "Value"))
+    local want = (HOState == 49) and "0" or "1"  -- 49 = '1' char in some post chains
+    if cur ~= want then pcall(scr.SetProperty, "ledHOffset", "Value", want) end
   end
 
   -- Ratio DROs  -- tightened to use helper for consistency

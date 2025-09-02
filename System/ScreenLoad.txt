@@ -369,6 +369,14 @@ function UI.SyncOutputs()
   end
 end
 
+function UI.SyncSoftLimits()
+  local inst = mc.mcGetInstance()
+  local h = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_SOFTLIMITS)
+  local on = (h and mc.mcSignalGetState(h) == 1)
+  pcall(scr.SetProperty, "btnSoftLimits", "Button State", on and "1" or "0")
+  pcall(scr.SetProperty, "btnSoftLimits", "Bg Color", on and "#00FF00" or "#404040")
+end
+
 local function ctrlExists(name, prop) local ok = pcall(scr.GetProperty, name, prop or "Visible"); return ok end
 local function UpdateToolPreview()
   if not ctrlExists("lblToolPreview", "Label") then return end
@@ -401,6 +409,23 @@ if wx and wx.wxCallAfter then
       local ok, err = pcall(ToolLib.Init, inst)
       if not ok and SystemLib and SystemLib.Log then SystemLib.Log(inst, "ToolLib.Init failed: "..tostring(err), "ERROR") end
     end
+
+    -- Soft limits seed (idempotent)
+    local function SeedSoftLimits()
+      local inst = mc.mcGetInstance()
+      for _, ax in ipairs({0,1,2}) do  -- X,Y,Z axes
+        local ha = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_SOFTLIMITS)
+        if ha then
+          -- ensure enabled without flipping state repeatedly
+          if mc.mcSignalGetState(ha) ~= 1 then
+            mc.mcCntlSetLastError(inst, "Soft limits: enabling")
+            mc.mcSignalSetState(ha, 1)
+          end
+        end
+      end
+    end
+
+    if not _G.__SOFTLIMITS_SEEDED then _G.__SOFTLIMITS_SEEDED = true; pcall(SeedSoftLimits) end
 
     -- Replace old Screen-Load-time wxPanel/wxTimer with a safe timer
     _G.__SL_SVC = _G.__SL_SVC or {}

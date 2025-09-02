@@ -428,21 +428,18 @@ if wx and wx.wxCallAfter then
       if not ok and SystemLib and SystemLib.Log then SystemLib.Log(inst, "ToolLib.Init failed: "..tostring(err), "ERROR") end
     end
 
-    -- Soft limits seed (idempotent)
+    -- One-time soft-limits seed (opt-in via #497, default on)
     local function SeedSoftLimits()
       local inst = mc.mcGetInstance()
-      for _, ax in ipairs({0,1,2}) do  -- X,Y,Z axes
-        local ha = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_SOFTLIMITS)
-        if ha then
-          -- ensure enabled without flipping state repeatedly
-          if mc.mcSignalGetState(ha) ~= 1 then
-            mc.mcCntlSetLastError(inst, "Soft limits: enabling")
-            mc.mcSignalSetState(ha, 1)
-          end
+      local enable = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 497)) or mc.mcCntlGetPoundVar(inst, 497)
+      if tonumber(enable or 1) == 1 then
+        local h = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_SOFTLIMITS)
+        if h and mc.mcSignalGetState(h) ~= 1 then
+          mc.mcCntlSetLastError(inst, "Soft limits: enabling")
+          mc.mcSignalSetState(h, 1)
         end
       end
     end
-
     if not _G.__SOFTLIMITS_SEEDED then _G.__SOFTLIMITS_SEEDED = true; pcall(SeedSoftLimits) end
 
     -- Replace old Screen-Load-time wxPanel/wxTimer with a safe timer

@@ -1,74 +1,36 @@
-Startup outputs and UI control – findings and proposal
+﻿## Mach4: Outputs Engage At Enable + UI Control — Root Cause and Minimal Fixes
 
-Summary
-- Symptom: On Enable, dust collector and vacuums turn on unexpectedly and the UI buttons appear unresponsive.
-- Root cause: Startup state and auto rules combine to drive outputs immediately, then AUTO mode overrides manual UI toggles. Dust auto is too broad (spindle OR inCycle); vacs can reflect stale PVs before defaults are seeded.
-- Fix (minimal, targeted):
-  - Tighten dust’s auto rule to be spindle-only.
-  - Seed PV defaults once at ScreenLoad (before any AuxLib.Update runs) so vac autos/targets start OFF.
-  - Leave libraries unchanged; PLC PV normalization already resolved tonumber errors.
+Problem
+- After enabling, dust collector and vacuums energize; UI buttons seem ineffective.
 
-What I found
-- Device registration (ScreenLoad):
-  - Dust: outputs=OSIG_OUTPUT4; pv {auto=#400, target=#404}; auto rule: (ctx.spindle == 1 OR ctx.inCycle == 1).
-  - Boot: outputs=OSIG_OUTPUT3; pv {auto=#402, target=#403}; safety blocks during M6/virtual.
-  - VacRear/VacFront: outputs 5/6; both share pv.auto = #401; targets #411/#412; no auto rule → manual unless #401=1.
-- AuxLib.Update precedence (Dependencies/AuxLib):
-  1) safety(ctx) wins if it returns 0/1
-  2) if pv.auto==1 then desired = auto(ctx) else desired = pv.target
-  3) Write outputs if changed; in AUTO, mirrors desired to pv.target for visibility
-- PLC_Init defaults (PLC.txt, one-time):
-  - #400=1 (dust AUTO ON), #402=1 (boot AUTO ON), #401=0 (vac AUTO OFF)
-  - Targets forced OFF: #404/#403/#411/#412 = 0
-  - Then one Update tick to push state
-- Why dust runs at Enable:
-  - Some controllers report inCycle == 1 transiently at/after enable. With “spindle OR inCycle” and #400=1, dust auto evaluates to 1 and turns ON immediately.
-- Why vacs run and UI seems unresponsive:
-  - If #401 persisted as 1 from a prior session, both vacs are in AUTO. AUTO owns outputs, so manual toggles are overridden, making buttons feel “dead”.
-  - Even with #401=0 intended, if defaults are seeded after the first AuxLib.Update, stale pv.target 1 can turn outputs on briefly.
+Design Principle
+- Libraries: single source of truth for execution (read signals/PVs, compute desired from provided policy, write outputs safely).
+- Scripts (ScreenLoad/PLC): own logic/policy (auto rules, defaults), call libs to execute.
 
-Proposed changes (least intrusive, high impact)
-1) Tighten dust auto rule (ScreenLoad.txt)
-   - From: auto = function(ctx) return (ctx.spindle == 1 or ctx.inCycle == 1) and 1 or 0 end
-   - To:   auto = function(ctx) return (ctx.spindle == 1) and 1 or 0 end
-   Rationale: Prevents dust from engaging on an inCycle blip during Enable; only follows spindle state.
+Root Causes
+- PLC policy at startup: `PLC_Init` sets Auto defaults (`#400=1` dust, `#402=1` boot) and immediately calls `AuxLib.Update(inst)`. If controller reports `spindle==on` or `inCycle==1` at that instant, outputs energize before UI stabilizes.
+- Auto policy + target mirroring: While Auto is ON, AuxLib mirrors desired into manual target PVs. Turning Auto OFF later leaves targets latched, so devices stay ON; this looks like “buttons don’t work.”
+- Enable-time timing/latch: Spindle/inCycle can be transiently true during/after Enable; the early Update amplifies this.
 
-2) Seed PV defaults at ScreenLoad (once)
-   - After libs load, before device registration/any Update, mirror PLC_Init’s one-time defaults in ScreenLoad:
-     - #400=1 (dust auto ON), #402=1 (boot auto ON), #401=0 (vac auto OFF)
-     - #404/#403/#411/#412 = 0 (all targets OFF)
-   - Guard with a global flag to ensure it runs once per session:
-     Example snippet:
-       do
-         if not _G.__pv_defaults then
-           _G.__pv_defaults = true
-           local SL = _G.SystemLib; local inst = mc.mcGetInstance()
-           local set = function(n,v)
-             if SL and SL.PoundVarSet then SL.PoundVarSet(inst,n,v) else mc.mcCntlSetPoundVar(inst,n,v) end
-           end
-           set(400,1); set(402,1); set(401,0)
-           set(404,0); set(403,0); set(411,0); set(412,0)
-         end
-       end
-   Rationale: Ensures a known OFF state for vacs and targets before any AuxLib.Update tick, eliminating stale startup states.
+Minimal Fixes (correct and scoped)
+- PLC.txt (policy/timing)
+  - Remove the immediate `AuxLib.Update(inst)` from `PLC_Init` after setting PV defaults. Let the first PLC_Tick drive updates once UI and signals are stable.
+  - Optional safer default: initialize with Auto OFF (`#400=0`, `#402=0`) to avoid any unintended actuation on first enable. Keep manual targets 0.
+- ScreenLoad.txt (logic)
+  - Keep device registration logic here. If desired, tighten dust Auto to require spindle direction AND in-cycle:
+    - `auto = function(ctx) return ((mc.mcSpindleGetDirection(inst) ~= 0) and ctx.inCycle == 1) and 1 or 0 end`
+- AuxLib.txt (execution)
+  - Gate execution by machine enabled: if `OSIG_MACHINE_ENABLED` != 1, force `desired = 0` (don’t energize while disabled) and skip mirroring.
+  - Remove the “mirror desired into pv.target” behavior when in Auto. Mirroring is policy; leaving it out ensures Auto OFF immediately hands control to manual targets (which remain unchanged unless scripts explicitly set them).
 
-Optional diagnostics (no behavior change)
-- Log PVs and context once on enable rising edge to verify live conditions:
-  - Log #400/#401/#402 (autos), #404/#403/#411/#412 (targets), and spindle/inCycle.
+Why This Fix Addresses The Root Cause
+- Eliminates enable-time races by deferring the first write until after UI/signal stabilization.
+- Keeps policy decisions (when Auto should apply) in scripts, not in the library executor.
+- Prevents silent actuation while disabled and avoids latching manual targets from Auto decisions.
+- Makes Auto OFF immediately effective without extra UI steps, because the library no longer preserves a latched manual target implicitly.
 
-Why this solves the problems
-- Dust: With a spindle-only auto rule, an Enable event won’t turn dust on unless the spindle is actually running.
-- Vacs: With #401 forced to 0 and both vac targets cleared before the first update, vacs remain OFF until the operator toggles manual or explicitly enables AUTO.
-- UI responsiveness: In manual mode (AUTO=0), AuxLib.Update respects pv.target; manual toggles persist and the UI reflects state via UI.SyncOutputs.
-
-What we are NOT changing
-- Libraries’ semantics (SystemLib/AuxLib/ToolLib/UILib) remain intact; only ScreenLoad behavior is adjusted.
-- PLC PV normalization is already in place and independent of these changes.
-
-Verification
-- Restart Mach4 (or reload the screen):
-  - On Enable with spindle off: dust/vacs stay OFF; buttons respond.
-  - Start spindle: dust turns ON automatically; stopping spindle turns dust OFF.
-  - Toggle Vac Auto (#401) ON: both vacs will be controlled by AUTO (still no auto rule by default); manual toggles are overridden when AUTO is ON, by design.
-  - Check message console if you enabled diagnostics.
-
+Validation
+- With machine disabled, no device toggles outputs regardless of PV changes.
+- Enable with spindle OFF and not in-cycle: devices remain OFF.
+- Turn dust Auto ON, start a program (spindle ON + inCycle): dust turns ON; stop program: dust turns OFF.
+- Turn dust Auto OFF: device remains controlled only by manual target PV; manual buttons toggle reliably.

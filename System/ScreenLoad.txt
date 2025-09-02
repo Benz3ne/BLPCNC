@@ -9,7 +9,8 @@ package.path = DEPS .. [[\?.txt;]] .. DEPS .. [[\?.lua;]] .. package.path
 local function safeRequire(name)
   local ok, mod = pcall(require, name)
   if not ok then
-    mc.mcCntlSetLastError(inst, ("[Degraded Mode] Missing lib '%s'"):format(name))
+    local err = tostring(mod)
+    mc.mcCntlSetLastError(inst, ("[Degraded Mode] Missing lib '%s': %s"):format(name, err))
     return nil
   end
   return mod

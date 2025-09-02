@@ -1,0 +1,97 @@
+-- ===== PLC Trampoline (silent unless error; logs lazily on failure) =====
+local inst = mc.mcGetInstance()
+
+-- Paths (reuse ROOT/SYS defined at top)
+local PLCF = SYS  .. [[\PLC.txt]]
+local DEPS = ROOT .. [[\Dependencies]]
+
+-- Let PLC find your libs
+package.path = DEPS .. [[\?.txt;]] .. DEPS .. [[\?.lua;]] .. package.path
+
+-- One-time state for the trampoline
+_G.__PLC_TRAMP = _G.__PLC_TRAMP or { ready=false, init_called=false, last_err_at=0, last_err_msg="", log_path=nil }
+local T = _G.__PLC_TRAMP
+
+-- Lazy logging (created only when an error occurs)
+local function now() return os.date("%Y-%m-%d %H:%M:%S") end
+
+local function downloads_dir()
+  local up = os.getenv("USERPROFILE"); if up and #up > 0 then return (up .. "\\Downloads") end
+  local pub = os.getenv("PUBLIC");     if pub and #pub > 0 then return (pub .. "\\Downloads") end
+  return ROOT
+end
+
+local function ensure_log()
+  if T.log_path then return T.log_path end
+  local stamp = os.date("%Y-%m-%d_%H-%M-%S")
+  T.log_path = (downloads_dir() .. "\\Mach4_PLC_Errors_" .. stamp .. ".txt"):gsub("/", "\\")
+  local ok, f = pcall(io.open, T.log_path, "w")
+  if ok and f then
+    f:write(("==== PLC Trampoline Errors @ %s ====\r\nROOT=%s\r\nSYS=%s\r\nPLCF=%s\r\nDEPS=%s\r\n"):format(now(), ROOT, SYS, PLCF, DEPS))
+    f:flush(); f:close()
+  else
+    T.log_path = nil
+  end
+  return T.log_path
+end
+
+local function logline(...)
+  local path = ensure_log(); if not path then return end
+  local ok, f = pcall(io.open, path, "a"); if not ok or not f then return end
+  for i = 1, select("#", ...) do f:write(tostring(select(i, ...))) end
+  f:write("\r\n"); f:flush(); f:close()
+end
+
+local function errh(e) return ("%s\n%s"):format(tostring(e), debug.traceback("", 2)) end
+
+-- Expose a reload helper for a dev button (forces next-tick reload)
+function _G.Reload_PLC()
+  _G.__PLC_TRAMP = nil
+end
+
+-- Load external PLC once per Lua runtime
+if not T.ready then
+  T.ready = true
+  local loader, lerr = loadfile(PLCF)
+  if not loader then
+    logline("!! ", now(), " LOAD ERROR: ", tostring(lerr))
+    pcall(mc.mcCntlSetLastError, inst, "PLC load error (see log)")
+  else
+    local ok, runErr = xpcall(loader, errh)
+    if not ok then
+      logline("!! ", now(), " EVAL ERROR:\r\n", runErr)
+      pcall(mc.mcCntlSetLastError, inst, "PLC evaluation error (see log)")
+    end
+  end
+end
+
+-- Call PLC_Init once (protected)
+if not T.init_called and type(_G.PLC_Init) == "function" then
+  local ok, err = xpcall(function() _G.PLC_Init(inst) end, errh)
+  if not ok then
+    local nowc = os.clock()
+    logline("!! ", now(), " PLC_Init error:\r\n", err)
+    if nowc - (T.last_err_at or 0) > 2 then
+      pcall(mc.mcCntlSetLastError, inst, "PLC_Init error (see log)")
+      T.last_err_at = nowc
+    end
+  else
+    T.init_called = true
+  end
+end
+
+-- Call PLC_Tick each cycle (protected)
+if type(_G.PLC_Tick) == "function" then
+  local ok, err = xpcall(function() _G.PLC_Tick(inst) end, errh)
+  if not ok then
+    local nowc = os.clock()
+    if err ~= T.last_err_msg or (nowc - (T.last_err_at or 0)) > 2 then
+      logline("!! ", now(), " PLC_Tick error:\r\n", err)
+      pcall(mc.mcCntlSetLastError, inst, "PLC_Tick error (see log)")
+      T.last_err_msg = err
+      T.last_err_at  = nowc
+    end
+    -- swallow error so PLC keeps running
+  end
+end
+-- ===== end PLC Trampoline =====

@@ -5,7 +5,7 @@
 local inst = mc.mcGetInstance()
 
 -- User options
-local FORCE_AUTOS_OFF   = false   -- set true to force #400/#401/#402=0 and targets #404/#403/#411/#412=0 before tests
+local FORCE_AUTOS_OFF   = true   -- set true to force #400/#401/#402=0 and targets #404/#403/#411/#412=0 before tests
 local DELAY_MS          = 150     -- delay after writes before delayed readback
 local TEST_OUTPUTS      = {3,4,5,6}
 

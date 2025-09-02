@@ -120,9 +120,9 @@ function ToolLib.Init(inst)
     SystemLib.Init(inst)
     
     -- Get initial output states
-    state.outputs.probe = SystemLib.SignalGetState(inst, mc.OSIG_OUTPUT7) or 0
-    state.outputs.laser = SystemLib.SignalGetState(inst, mc.OSIG_OUTPUT1) or 0
-    state.outputs.clamp = SystemLib.SignalGetState(inst, mc.OSIG_OUTPUT2) or 0
+  --  state.outputs.probe = SystemLib.SignalGetState(inst, mc.OSIG_OUTPUT7) or 0
+  --  state.outputs.laser = SystemLib.SignalGetState(inst, mc.OSIG_OUTPUT1) or 0
+  --  state.outputs.clamp = SystemLib.SignalGetState(inst, mc.OSIG_OUTPUT2) or 0
     
     state.init = true
     SystemLib.Log(inst, "ToolLib initialized", "INFO")

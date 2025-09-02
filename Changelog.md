@@ -13,4 +13,6 @@
   - AuxLib.Update logs per-device evaluation (auto/target/desired) and writes when state changes.
   - Enable via `SystemLib.SetDebugMode(inst, true)` or set `#4990=1`.
 
+- ScreenLoad: added a simple debug mode toggle (DEBUG_MODE=true) that calls `SystemLib.SetDebugMode(inst, true)` at load so diagnostics are visible in the message console.
+
 Rationale: Keep libraries as the single source of truth for execution (IO/state). Move policy (when to run devices) and ordering (when defaults apply) into ScreenLoad/PLC. This resolves enable-time activations and UI repaint issues at the source with minimal, targeted changes.

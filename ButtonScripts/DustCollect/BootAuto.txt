@@ -1,6 +1,0 @@
-local inst = mc.mcGetInstance()
-local current = mc.mcCntlGetPoundVar(inst, 402)
-local want = (current == 0) and 1 or 0
-if dustLib and dustLib.toggleBootAuto then
-    dustLib.toggleBootAuto(inst, want == 1)
-end

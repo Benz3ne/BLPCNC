@@ -1,4 +1,0 @@
-local inst = mc.mcGetInstance()
-if dustLib and dustLib.manualToggleDust then
-    dustLib.manualToggleDust(inst)
-end

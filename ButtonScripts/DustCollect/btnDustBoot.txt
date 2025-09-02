@@ -1,0 +1,6 @@
+local inst = mc.mcGetInstance()
+if AuxLib and AuxLib.Request then
+  AuxLib.Request(inst, { device = "boot", action = "manual.toggle" })
+else
+  mc.mcCntlSetLastError(inst, "Missing AuxLib.Request: boot manual.toggle")
+end

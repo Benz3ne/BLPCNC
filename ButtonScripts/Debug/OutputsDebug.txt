@@ -8,6 +8,7 @@ local inst = mc.mcGetInstance()
 local FORCE_AUTOS_OFF   = true   -- set true to force #400/#401/#402=0 and targets #404/#403/#411/#412=0 before tests
 local DELAY_MS          = 150     -- delay after writes before delayed readback
 local TEST_OUTPUTS      = {3,4,5,6}
+local STEP_DELAY_MS     = 200     -- delay between logical steps when using AuxLib
 
 local function log(level, msg)
   level = level or "INFO"
@@ -86,7 +87,89 @@ log("INFO", string.format("Machine enabled=%d  Delay=%dms  FORCE_AUTOS_OFF=%s", 
 snapshotAux()
 maybeForceAutos()
 
--- Per-output diagnostic
+-- Map devices -> output numbers for cross checks
+local DEV_OUT = {
+  dust    = 4,
+  boot    = 3,
+  vacRear = 5,
+  vacFront= 6,
+}
+
+local function outStateForDevice(name)
+  local n = DEV_OUT[name]
+  if not n then return nil end
+  local st = readState(n)
+  return st
+end
+
+local function auxState(name)
+  if not AuxLib or not AuxLib.State then return nil end
+  local st = AuxLib.State(inst, name) or {}
+  return {
+    on = st.on,
+    auto = st.auto,
+    target = st.target,
+  }
+end
+
+local function requestAndUpdate(name, action)
+  if not AuxLib or not AuxLib.Request then return false, "AuxLib missing" end
+  local ok, err = pcall(AuxLib.Request, inst, { device=name, action=action })
+  if not ok then return false, tostring(err) end
+  if AuxLib.Update then pcall(AuxLib.Update, inst) end
+  wx.wxMilliSleep(STEP_DELAY_MS)
+  return true
+end
+
+-- SECTION A: AuxLib manual ON/OFF per device
+log("INFO", "-- SECTION A: AuxLib manual toggle (auto=0) --")
+for name, outN in pairs(DEV_OUT) do
+  -- Ensure auto off for this device
+  requestAndUpdate(name, "auto.off")
+  -- Manual ON
+  requestAndUpdate(name, "manual.on")
+  local st_on    = readState(outN)
+  local a_on     = auxState(name)
+  log("INFO", string.format("%s manual.on -> output%d=%s  aux={on=%s,auto=%s,target=%s}", name, outN, tostring(st_on and st_on or "nil"), tostring(a_on and a_on.on), tostring(a_on and a_on.auto), tostring(a_on and a_on.target)))
+  -- Manual OFF
+  requestAndUpdate(name, "manual.off")
+  local st_off   = readState(outN)
+  local a_off    = auxState(name)
+  log("INFO", string.format("%s manual.off -> output%d=%s aux={on=%s,auto=%s,target=%s}", name, outN, tostring(st_off and st_off or "nil"), tostring(a_off and a_off.on), tostring(a_off and a_off.auto), tostring(a_off and a_off.target)))
+end
+
+-- SECTION B: AuxLib auto toggle (effect depends on policy)
+log("INFO", "-- SECTION B: AuxLib auto toggle --")
+for name, outN in pairs(DEV_OUT) do
+  requestAndUpdate(name, "auto.on")
+  local st_aon  = readState(outN)
+  local as_on   = auxState(name)
+  log("INFO", string.format("%s auto.on -> output%d=%s aux={on=%s,auto=%s,target=%s}", name, outN, tostring(st_aon and st_aon or "nil"), tostring(as_on and as_on.on), tostring(as_on and as_on.auto), tostring(as_on and as_on.target)))
+  requestAndUpdate(name, "auto.off")
+  local st_aoff = readState(outN)
+  local as_off  = auxState(name)
+  log("INFO", string.format("%s auto.off -> output%d=%s aux={on=%s,auto=%s,target=%s}", name, outN, tostring(st_aoff and st_aoff or "nil"), tostring(as_off and as_off.on), tostring(as_off and as_off.auto), tostring(as_off and as_off.target)))
+end
+
+-- SECTION C: Direct write vs AuxLib re-apply
+log("INFO", "-- SECTION C: Direct write OFF/ON with and without AuxLib.Update --")
+for _, n in ipairs(TEST_OUTPUTS) do
+  local st0, id, h = readState(n)
+  log("INFO", string.format("O%d start=%s", n, tostring(st0)))
+  -- Direct OFF only
+  local ok0, _, _, imm0, aft0 = writeState(n, 0)
+  log("INFO", string.format("O%d direct OFF -> imm=%s delayed=%s (no Update)", n, tostring(imm0), tostring(aft0)))
+  -- Now force an Aux Update and read again
+  if AuxLib and AuxLib.Update then pcall(AuxLib.Update, inst); wx.wxMilliSleep(STEP_DELAY_MS) end
+  local st_afterUpd = select(1, readState(n))
+  log("INFO", string.format("O%d after Aux.Update -> %s", n, tostring(st_afterUpd)))
+  -- Direct ON + read
+  local ok1, _, _, imm1, aft1 = writeState(n, 1)
+  log("INFO", string.format("O%d direct ON  -> imm=%s delayed=%s", n, tostring(imm1), tostring(aft1)))
+end
+
+-- SECTION D: Per-output diagnostic (immediate + delayed) — original block
+log("INFO", "-- SECTION D: Low-level signal write/read --")
 for _, n in ipairs(TEST_OUTPUTS) do
   local st0, id, h = readState(n)
   if not id then
@@ -114,4 +197,3 @@ for _, n in ipairs(TEST_OUTPUTS) do
 end
 
 log("INFO", "=== Outputs Debug: end ===")
-

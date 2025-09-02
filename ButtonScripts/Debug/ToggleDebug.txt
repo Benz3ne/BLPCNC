@@ -1,0 +1,15 @@
+-- Toggle Mach4 debug mode (#4990) and keep SystemLib in sync
+local inst = mc.mcGetInstance()
+
+local function num(x) local n = tonumber(x); if n == nil then return 0 end return n end
+
+local cur = num(mc.mcCntlGetPoundVar(inst, 4990))
+local newVal = (cur == 1) and 0 or 1
+
+if SystemLib and SystemLib.SetDebugMode then
+  SystemLib.SetDebugMode(inst, newVal == 1)
+else
+  mc.mcCntlSetPoundVar(inst, 4990, newVal)
+  mc.mcCntlSetLastError(inst, "Debug mode: " .. ((newVal == 1) and "ON" or "OFF"))
+end
+

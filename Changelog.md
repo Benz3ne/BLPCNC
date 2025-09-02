@@ -10,7 +10,7 @@
 
 - AuxLib: added debug logging (gated by SystemLib debug mode #4990):
   - AuxLib.Request logs device/action and resulting auto/target PVs after a request.
-  - AuxLib.Update logs per-device evaluation (auto/target/desired) and writes when state changes.
+  - AuxLib.Update logs writes only when state changes, including signal name, ID, handle, enabled state, desired value, and read-back state.
   - Enable via `SystemLib.SetDebugMode(inst, true)` or set `#4990=1`.
 
 - ScreenLoad: added a simple debug mode toggle (DEBUG_MODE=true) that calls `SystemLib.SetDebugMode(inst, true)` at load so diagnostics are visible in the message console.

@@ -71,6 +71,26 @@ function PLC_Init(inst)
   pcall(mc.mcIoSetState, iReg, 1)
   if type(_G.KeyboardInputsToggle)=="function" then pcall(_G.KeyboardInputsToggle) end
 
+--One-time PV startup defaults 
+-- Spec: Dust Auto=ON (#400), Boot Auto=ON (#402), Vac Auto=OFF (#401)
+--       All manual targets OFF (#404/#403/#411/#412)
+_G.__pv_defaults = _G.__pv_defaults or false
+if not _G.__pv_defaults then
+  _G.__pv_defaults = true
+  local P = _G.__plc
+  -- autos
+  P.pvSet(400, 1)   -- dust auto ON
+  P.pvSet(402, 1)   -- boot auto ON
+  P.pvSet(401, 0)   -- vac auto OFF (both)
+  -- manual targets hard-off
+  P.pvSet(404, 0)   -- dust target
+  P.pvSet(403, 0)   -- boot target
+  P.pvSet(411, 0)   -- rear vac target
+  P.pvSet(412, 0)   -- front vac target
+  -- push the new desired states to outputs once
+  if P.AuxLib and P.AuxLib.Update then P.AuxLib.Update(inst) end
+end
+
   -- Initialize fractional DROs (if those helpers exist)
   if type(_G.DecToFrac)=="function" then
     pcall(_G.DecToFrac, 0); pcall(_G.DecToFrac, 1); pcall(_G.DecToFrac, 2)
@@ -174,7 +194,7 @@ function PLC_Tick(inst)
         local b  = S(inst, "boot")     or {}
         local vf = S(inst, "vacFront") or {}
         local vr = S(inst, "vacRear")  or {}
-        local hs = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_SOFTLIMITS)
+        local hs = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON)
         local sl = hs and mc.mcSignalGetState(hs) or 0
         return {
           dust={on=(d.on or 0),  auto=(d.auto or 0)},

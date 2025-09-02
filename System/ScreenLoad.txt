@@ -367,6 +367,9 @@ function UI.SyncOutputs()
     local pvAuto = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 401)) or mc.mcCntlGetPoundVar(inst, 401)
     setp("btnVacAuto", "Button State", (tonumber(pvAuto) == 1) and "1" or "0")
   end
+
+  -- Soft limits sync
+  if UI.SyncSoftLimits then pcall(UI.SyncSoftLimits) end
 end
 
 function UI.SyncSoftLimits()

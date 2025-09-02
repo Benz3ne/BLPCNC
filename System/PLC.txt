@@ -263,9 +263,4 @@ function PLC_Tick(inst)
     end
   end
 
--- === Device button UI sync ===
-do
-  if UI and UI.SyncOutputs then pcall(UI.SyncOutputs) end
-end
-
 end

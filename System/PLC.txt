@@ -183,11 +183,14 @@ function PLC_Tick(inst)
     local S = AuxLib and AuxLib.State
     if S then
 
-      -- Cheap PV accessor; defers to SystemLib when available
-      local function pv(n)
-        if SystemLib and SystemLib.PoundVarGet then return SystemLib.PoundVarGet(inst, n) end
-        return mc.mcCntlGetPoundVar(inst, n)
-      end
+      -- Cheap PV accessor; return ONLY the first value
+local function pv(n)
+  if SystemLib and SystemLib.PoundVarGet then
+    -- Some implementations return (value, rc); take the first only.
+    return select(1, SystemLib.PoundVarGet(inst, n))
+  end
+  return mc.mcCntlGetPoundVar(inst, n)
+end
 
       local function snap()
         local d  = S(inst, "dust")     or {}

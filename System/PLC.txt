@@ -155,6 +155,9 @@ function PLC_Tick(inst)
     end
   end
 
+  -- UI mirror (one call, safe)
+  if _G.UI and _G.UI.SyncOutputs then pcall(_G.UI.SyncOutputs) end
+
   -------------------------------------------------------
   --  Low air monitor (3-sample debounce) → hold/stop/disable + UI flag
   -------------------------------------------------------
@@ -262,37 +265,7 @@ function PLC_Tick(inst)
 
 -- === Device button UI sync ===
 do
-  local S = AuxLib and AuxLib.State
-  if S then
-    local dust = S(inst, "dust")
-    if dust then
-      -- main on/off
-      scr.SetProperty("btnDustCollect", "Button State", dust.on == 1 and "1" or "0")
-      scr.SetProperty("btnDustCollect", "Bg Color", dust.on == 1 and "#00FF00" or "#404040")
-      -- auto indicator (if you have a separate auto button/LED)
-      if scr.GetProperty then
-        pcall(scr.SetProperty, "btnDustAuto", "Button State", dust.auto == 1 and "1" or "0")
-      end
-    end
-
-    local boot = S(inst, "boot")
-    if boot then
-      scr.SetProperty("btnDustBoot", "Button State", boot.on == 1 and "1" or "0")
-      scr.SetProperty("btnDustBoot", "Bg Color",   boot.on == 1 and "#00FF00" or "#404040")
-    end
-
-    local rear = S(inst, "vacRear")
-    if rear then
-      scr.SetProperty("btnVacRear", "Button State", rear.on == 1 and "1" or "0")
-      scr.SetProperty("btnVacRear", "Bg Color",     rear.on == 1 and "#00FF00" or "#404040")
-    end
-
-    local front = S(inst, "vacFront")
-    if front then
-      scr.SetProperty("btnVacFront", "Button State", front.on == 1 and "1" or "0")
-      scr.SetProperty("btnVacFront", "Bg Color",     front.on == 1 and "#00FF00" or "#404040")
-    end
-  end
+  if UI and UI.SyncOutputs then pcall(UI.SyncOutputs) end
 end
 
 end

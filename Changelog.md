@@ -16,3 +16,4 @@
 - ScreenLoad: added a simple debug mode toggle (DEBUG_MODE=true) that calls `SystemLib.SetDebugMode(inst, true)` at load so diagnostics are visible in the message console.
 
 Rationale: Keep libraries as the single source of truth for execution (IO/state). Move policy (when to run devices) and ordering (when defaults apply) into ScreenLoad/PLC. This resolves enable-time activations and UI repaint issues at the source with minimal, targeted changes.
+- Diagnostics: added Scripts\Diagnostics\OutputsDebug.txt — comprehensive output test for OSIG_OUTPUT3..6 with immediate and delayed readback, optional PV forcing to reduce interference, and Aux device/PV snapshot. Logs are printed to the message console with an [OUTDBG] prefix.

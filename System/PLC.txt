@@ -1,7 +1,23 @@
 -- C:\Mach4Hobby\Profiles\BLP\Scripts\System\PLC.txt
--- Exposes PLC_Init(inst) and PLC_Tick(inst). The Screen PLC shim calls these.
+-- Exposes PLC_Init(inst) and PLC_Tick(inst). The GUI PLC shim calls these.
 
+----------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------
+-- Always take ONLY the first return from scr.GetProperty (value, rc)
+local function scrProp(name, prop)
+  return select(1, scr.GetProperty(name, prop))
+end
+
+-- Safe numeric read from a screen control
+local function scrNumber(name, prop)
+  local v = scrProp(name, prop)
+  return tonumber(v) or 0
+end
+
+----------------------------------------------------------------
 -- One-time init (handles, caches, first-run stuff)
+----------------------------------------------------------------
 function PLC_Init(inst)
   local mc = mc
 
@@ -50,7 +66,6 @@ function PLC_Init(inst)
   ----------------------------------------------------------------
   -- Mach default "first run" actions (run once here, not every tick)
   ----------------------------------------------------------------
-  -- Match your old behavior that ran when testcount == 1:
   -- Keyboard inputs: force a state that makes KeyboardInputsToggle() do a disable/enable
   local iReg = mc.mcIoGetHandle(inst, "Keyboard/Enable")
   pcall(mc.mcIoSetState, iReg, 1)
@@ -73,7 +88,9 @@ function PLC_Init(inst)
   end
 end
 
+----------------------------------------------------------------
 -- Per-cycle work
+----------------------------------------------------------------
 function PLC_Tick(inst)
   local mc = mc
   -- Keep compatibility with Mach defaults
@@ -92,9 +109,9 @@ function PLC_Tick(inst)
   -------------------------------------------------------
   --  UI updates you had in the default PLC (kept as-is)
   -------------------------------------------------------
-  -- Plate align LED (G68)
+  -- Plate align LED (G68)  -- FIXED: use scrNumber() so tonumber() gets one arg
   do
-    local curLedState = tonumber(scr.GetProperty("ledPlateAlign","Value")) or 0
+    local curLedState   = scrNumber("ledPlateAlign", "Value")
     local curAlignState = math.abs((mc.mcCntlGetPoundVar(inst, 4016) - 69))
     if curLedState ~= curAlignState then
       pcall(scr.SetProperty, "ledPlateAlign", "Value", tostring(curAlignState))
@@ -115,12 +132,12 @@ function PLC_Tick(inst)
     pcall(scr.SetProperty, "ledHOffset", "Value", (HOState == 49) and "0" or "1")
   end
 
-  -- Ratio DROs
+  -- Ratio DROs  -- tightened to use helper for consistency
   do
-    local spinmotormax = tonumber(select(1, scr.GetProperty('droSpinMotorMax','Value'))) or 1
-    local rangemax     = tonumber(select(1, scr.GetProperty('droRangeMax','Value'))) or 1
+    local spinmotormax = scrNumber('droSpinMotorMax','Value'); if spinmotormax == 0 then spinmotormax = 1 end
+    local rangemax     = scrNumber('droRangeMax','Value')
     pcall(scr.SetProperty, 'droRatio', 'Value', tostring(rangemax / spinmotormax))
-    local range = select(1, mc.mcSpindleGetCurrentRange(inst))
+    local range   = select(1, mc.mcSpindleGetCurrentRange(inst))
     local fbratio = select(1, mc.mcSpindleGetFeedbackRatio(inst, range))
     pcall(scr.SetProperty, 'droFeedbackRatio', 'Value', tostring(fbratio))
   end

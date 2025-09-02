@@ -95,6 +95,21 @@ SigLib = {
       mc.mcCntlSetLastError(inst, "Disable: virtual tools secured")
     else
       if _G.PopulateTools then pcall(_G.PopulateTools) end
+	do
+  local vt = tonumber((SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 406)) or mc.mcCntlGetPoundVar(inst, 406)) or 0
+  if vt >= 90 and ToolLib and ToolLib.RetractVirtual then
+    pcall(ToolLib.RetractVirtual, inst)
+  end
+
+  if AuxLib and AuxLib.Request then
+    for _, dev in ipairs({"dust","boot","vacRear","vacFront"}) do
+      pcall(AuxLib.Request, inst, { device=dev, action="manual.off" }) -- target=0, auto=0
+      -- If you want "auto but off until spindle", use this instead:
+      -- pcall(AuxLib.Request, inst, { device=dev, action="auto.on" })
+      -- pcall(AuxLib.Request, inst, { device=dev, action="reset" }) -- target=0
+    end
+  end
+end
     end
   end,
 

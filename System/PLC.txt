@@ -185,33 +185,32 @@ function PLC_Tick(inst)
     end
   end
 
-  -------------------------------------------------------
-  --  Low air monitor (3-sample debounce) → hold/stop/disable + UI flag
-  -------------------------------------------------------
+  -- === Low air pressure (1.0 s debounce) ===
   do
-    local P = _G.__plc
-    local low = (mc.mcSignalGetState(P.hInLowAir) == 1)
-    if low then P.air.deb = (P.air.deb or 0) + 1 else P.air.deb = 0 end
+    local P = _G.__plc or {}; _G.__plc = P
+    P.air = P.air or { last=0, t0=0 }
+    local lowNow = (mc.mcSignalGetState(P.hInLowAir) == 1)
 
-    if P.air.deb == 3 and P.air.last ~= 1 then
-      -- Transition to LOW
-      local st = mc.mcCntlGetState(inst)
-      if st == mc.MC_STATE_FRUN or st == mc.MC_STATE_MRUN then
-        mc.mcCntlFeedHold(inst); mc.mcCntlCycleStop(inst)
+    if lowNow then
+      if P.air.t0 == 0 then P.air.t0 = os.clock() end
+      if (os.clock() - P.air.t0) >= 1.0 and P.air.last ~= 1 then
+        local st = mc.mcCntlGetState(inst)
+        if st == mc.MC_STATE_FRUN or st == mc.MC_STATE_MRUN then
+          mc.mcCntlFeedHold(inst); mc.mcCntlCycleStop(inst)
+        end
+        if mc.mcSignalGetState(P.hSpindleOn) == 1 then mc.mcSpindleSetDirection(inst, 0) end
+        mc.mcCntlEnable(inst, 0)
+        _G.lowAirDisabled = true
+        _G.needLowAirDialog, _G.lowAirDialogType, _G.lowAirDialogMessage = true, "error", "Air pressure is LOW. Machine has been disabled."
+        P.air.last = 1
       end
-      if mc.mcSignalGetState(P.hSpindleOn) == 1 then mc.mcSpindleSetDirection(inst, 0) end
-      mc.mcCntlEnable(inst, 0)
-      _G.lowAirDisabled      = true
-      _G.needLowAirDialog    = true
-      _G.lowAirDialogType    = "error"
-      _G.lowAirDialogMessage = "Air pressure is LOW. Machine has been disabled."
-    elseif (not low) and P.air.last == 1 then
-      _G.lowAirDisabled      = false
-      _G.needLowAirDialog    = true
-      _G.lowAirDialogType    = "info"
-      _G.lowAirDialogMessage = "Air pressure restored. Re-enable the machine to continue."
+    else
+      if P.air.last == 1 then
+        _G.lowAirDisabled = false
+        _G.needLowAirDialog, _G.lowAirDialogType, _G.lowAirDialogMessage = true, "info", "Air pressure restored. Re-enable the machine to continue."
+      end
+      P.air.last, P.air.t0 = 0, 0
     end
-    P.air.last = low and 1 or 0
   end
 
   -------------------------------------------------------

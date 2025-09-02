@@ -324,10 +324,16 @@ function AuxLib.Update(inst)
             -- Write every declared output key to desired (common pattern)
             for key, sigName in pairs(spec.outputs or {}) do
                 _sig_write(inst, sigName, desired == 1)
-            end
-            if dbg then
-                local msg = string.format("AuxLib.Write %s -> %d (spindle=%d inCycle=%d)", tostring(name), desired, ctx.spindle or 0, ctx.inCycle or 0)
-                if SystemLib and SystemLib.Log then SystemLib.Log(inst, msg, "DEBUG") else mc.mcCntlSetLastError(inst, msg) end
+                if dbg then
+                    local id = mc[sigName] or sigName
+                    local h  = (type(id)=="number") and mc.mcSignalGetHandle(inst, id) or _sig_handle(inst, sigName)
+                    local en = (_sig_read(inst, "OSIG_MACHINE_ENABLED") == 1) and 1 or 0
+                    local rb = (h and h ~= 0) and (mc.mcSignalGetState(h) or -1) or -1
+                    local msg = string.format(
+                        "AuxLib.Write %s: %s id=%s handle=%s en=%d want=%d read=%s",
+                        tostring(name), tostring(sigName), tostring(id), tostring(h), en, desired, tostring(rb))
+                    if SystemLib and SystemLib.Log then SystemLib.Log(inst, msg, "DEBUG") else mc.mcCntlSetLastError(inst, msg) end
+                end
             end
             d.rt.last.main = (desired == 1)
         end

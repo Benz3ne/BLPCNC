@@ -873,9 +873,27 @@ function SystemLib.Files.WriteTemp(inst, subdir, basename, contents, opts)
     local profName = mc.mcProfileGetName and mc.mcProfileGetName(inst) or "Default"
     local dir = string.format("%s\\Mach4Temp\\%s\\%s\\", tempBase, profName, subdir or "Temp")
 
-    -- Ensure directory (best-effort, idempotent)
-    local mkcmd = 'mkdir "' .. dir:gsub("\\$", "") .. '" 2>nul'
-    pcall(os.execute, mkcmd)
+    -- Ensure directory (best-effort, idempotent) without spawning a shell
+    do
+        local ok = false
+        -- Prefer LuaFileSystem if available
+        if lfs_ok and lfs then
+            local function ensure(path)
+                local norm = tostring(path or ""):gsub("[\\/]+$", "")
+                local acc = ""
+                for part in norm:gmatch("[^\\/]+") do
+                    acc = (acc == "") and part or (acc .. "\\" .. part)
+                    pcall(lfs.mkdir, acc)
+                end
+            end
+            ok = pcall(ensure, dir)
+        end
+        -- Fallback to wx if available
+        if (not ok) and wx and wx.wxFileName then
+            local fn = wx.wxFileName(dir)
+            pcall(function() fn:Mkdir(511, wx.wxPATH_MKDIR_FULL) end)
+        end
+    end
 
     -- Unique filename
     local stamp = os.date("%Y%m%d_%H%M%S")
@@ -1642,7 +1660,10 @@ function SystemLib.RunProfileScript(inst, filename)
       mc.mcCntlSetLastError(inst, msg)
       return false, msg
     end
-    mc.mcCntlSetLastError(inst, "Executed: " .. path)
+    -- Quiet success in normal mode; log only when debug is enabled
+    if SystemLib and SystemLib.IsDebugMode and SystemLib.IsDebugMode() then
+      if SystemLib.Log then SystemLib.Log(inst, "Executed script: " .. path, "DEBUG") end
+    end
     return true, path
   end
 
@@ -1659,15 +1680,50 @@ function SystemLib.RunProfileScript(inst, filename)
   end
 
   -- Name only → single search method: recursive DIR under current profile
-  local matches = {}
+  -- Try canonical location first to avoid a recursive search
   do
-    local cmd = ('cmd /C dir /B /S /A:-D "%s\\%s"'):format(root, filename)
-    local p = io.popen(cmd)
-    if p then
-      for line in p:lines() do
-        if line and #line > 0 then table.insert(matches, line) end
+    local f = io.open(canonical, "r")
+    if f then f:close(); return runFile(canonical) end
+  end
+
+  -- Name only — search under ButtonScripts without spawning a shell
+  local matches = {}
+  local searchRoot = root .. "\\Scripts\\ButtonScripts"
+  do
+    if lfs_ok and lfs then
+      local function scan(dir)
+        for entry in lfs.dir(dir) do
+          if entry ~= "." and entry ~= ".." then
+            local p = dir .. "\\" .. entry
+            local attr = lfs.attributes(p)
+            if attr and attr.mode == "file" and entry == filename then
+              table.insert(matches, p)
+            elseif attr and attr.mode == "directory" then
+              scan(p)
+            end
+          end
+        end
       end
-      p:close()
+      pcall(scan, searchRoot)
+    elseif wx and wx.wxDir then
+      local function scan(dir)
+        local d = wx.wxDir(dir)
+        if not d:IsOpened() then return end
+        local name = wx.wxString()
+        local cont = d:GetFirst(name, "", wx.wxDIR_FILES)
+        while cont do
+          local fname = name:ToStdString()
+          if fname == filename then table.insert(matches, dir .. "\\" .. fname) end
+          cont = d:GetNext(name)
+        end
+        cont = d:GetFirst(name, "", wx.wxDIR_DIRS)
+        while cont do
+          local sub = dir .. "\\" .. name:ToStdString()
+          scan(sub)
+          cont = d:GetNext(name)
+        end
+      end
+      pcall(scan, searchRoot)
     end
   end
 

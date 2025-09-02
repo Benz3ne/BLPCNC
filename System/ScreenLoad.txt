@@ -420,16 +420,7 @@ function DecToFrac(axis)
 	scr.SetProperty((labNum), 'Label', tostring(numar))
 	scr.SetProperty((labDen), 'Label', "/" .. tostring(denom))
 end
----------------------------------------------------------------
---Timer panel example
----------------------------------------------------------------
-TimerPanel = wx.wxPanel (wx.NULL, wx.wxID_ANY, wx.wxDefaultPosition, wx.wxSize( 0,0 ) )
-timer = wx.wxTimer(TimerPanel)
-TimerPanel:Connect(wx.wxEVT_TIMER,
-function (event)
-    wx.wxMessageBox("Hello")
-    timer:Stop()
-end)
+
 ---------------------------------------------------------------
 -- Load modules
 ---------------------------------------------------------------

@@ -1,120 +1,36 @@
-﻿## Mach4: Outputs Engage On Enable + UI Unresponsive — Root Cause and Fix
+﻿## Mach4: Outputs Engage At Enable + UI Control — Root Cause and Minimal Fixes
 
-### What Happens
-- On first enable after load, the dust collector and vacuums energize, and UI buttons seem ineffective.
+Problem
+- After enabling, dust collector and vacuums energize; UI buttons seem ineffective.
 
-### Root Causes (from code review)
-1) PLC defaults force Auto ON and push an immediate Update
-   - `Scripts\System\PLC.txt` (PLC_Init):
-     - Sets PV defaults once per session: `#400=1` (dust Auto ON), `#402=1` (boot Auto ON), `#401=0` (vac Auto OFF)
-     - Forces all manual targets OFF: `#404/#403/#411/#412 = 0`
-     - Immediately calls `AuxLib.Update(inst)` after setting PVs.
-   - Impact: If at that moment Mach reports `spindle==on` or `inCycle==1`, Auto logic will drive outputs ON before the UI stabilizes.
+Design Principle
+- Libraries: single source of truth for execution (read signals/PVs, compute desired from provided policy, write outputs safely).
+- Scripts (ScreenLoad/PLC): own logic/policy (auto rules, defaults), call libs to execute.
 
-2) Dust auto is tied to spindle/inCycle; manual clicks can be overridden by Auto
-   - `Scripts\System\ScreenLoad.txt`: device registration
-     - Dust `auto(ctx)`: `return (ctx.spindle == 1 or ctx.inCycle == 1) and 1 or 0`.
-     - Vacuums have no auto function (manual only); boot has safety gate but no auto.
-   - `Scripts\Dependencies\AuxLib.txt` (Update):
-     - Builds `ctx.spindle` from `OSIG_SPINDLEON` and `ctx.inCycle` from `mcCntlIsInCycle`.
-     - If pv.auto==1 and `auto(ctx)` returns 1, desired state becomes ON and AuxLib writes every device output key to that state.
-     - Manual clicks that don’t disable Auto first are immediately overruled on the next Update tick, which feels like “buttons don’t work”.
+Root Causes
+- PLC policy at startup: `PLC_Init` sets Auto defaults (`#400=1` dust, `#402=1` boot) and immediately calls `AuxLib.Update(inst)`. If controller reports `spindle==on` or `inCycle==1` at that instant, outputs energize before UI stabilizes.
+- Auto policy + target mirroring: While Auto is ON, AuxLib mirrors desired into manual target PVs. Turning Auto OFF later leaves targets latched, so devices stay ON; this looks like “buttons don’t work.”
+- Enable-time timing/latch: Spindle/inCycle can be transiently true during/after Enable; the early Update amplifies this.
 
-3) State may be non-zero just after Enable
-   - If the spindle output line is latched or `mcCntlIsInCycle` briefly returns 1 at/after enable, dust Auto=ON will energize dust on the first `AuxLib.Update`.
-   - PLC’s immediate `AuxLib.Update` in `PLC_Init` amplifies this timing problem.
+Minimal Fixes (correct and scoped)
+- PLC.txt (policy/timing)
+  - Remove the immediate `AuxLib.Update(inst)` from `PLC_Init` after setting PV defaults. Let the first PLC_Tick drive updates once UI and signals are stable.
+  - Optional safer default: initialize with Auto OFF (`#400=0`, `#402=0`) to avoid any unintended actuation on first enable. Keep manual targets 0.
+- ScreenLoad.txt (logic)
+  - Keep device registration logic here. If desired, tighten dust Auto to require spindle direction AND in-cycle:
+    - `auto = function(ctx) return ((mc.mcSpindleGetDirection(inst) ~= 0) and ctx.inCycle == 1) and 1 or 0 end`
+- AuxLib.txt (execution)
+  - Gate execution by machine enabled: if `OSIG_MACHINE_ENABLED` != 1, force `desired = 0` (don’t energize while disabled) and skip mirroring.
+  - Remove the “mirror desired into pv.target” behavior when in Auto. Mirroring is policy; leaving it out ensures Auto OFF immediately hands control to manual targets (which remain unchanged unless scripts explicitly set them).
 
-4) Why vacuums appear ON too
-   - Vac devices are manual-only in the current registration, but if their output lines are latched high when AuxLib starts (or targets were set elsewhere), they can be perceived as ON.
-   - Regardless, the “UI unresponsive” symptom is explained by Auto overriding manual unless the UI action disables Auto.
+Why This Fix Addresses The Root Cause
+- Eliminates enable-time races by deferring the first write until after UI/signal stabilization.
+- Keeps policy decisions (when Auto should apply) in scripts, not in the library executor.
+- Prevents silent actuation while disabled and avoids latching manual targets from Auto decisions.
+- Makes Auto OFF immediately effective without extra UI steps, because the library no longer preserves a latched manual target implicitly.
 
-### Evidence Pointers
-- PLC defaults and early Update: Scripts\System\PLC.txt (PLC_Init) — block that sets #400/#402/#401 and calls `AuxLib.Update(inst)`.
-- Dust auto: Scripts\System\ScreenLoad.txt — `AuxLib.Register("dust", { auto=function(ctx) return (ctx.spindle==1 or ctx.inCycle==1) and 1 or 0 end, ... })`.
-- Update decision flow: Scripts\Dependencies\AuxLib.txt — in `Update`, precedence: safety -> auto -> manual; then writes outputs.
-
-### Fix Plan (precise, minimal, and correct)
-1) Gate all device outputs on machine enable
-   - Change `AuxLib.Update(inst)` to fetch enabled:
-     - `local enabled = (_sig_read(inst, "OSIG_MACHINE_ENABLED") == 1) and 1 or 0`
-   - If `enabled == 0`, force `desired = 0` for every device and skip mirroring to PVs.
-   - Why correct: Prevents any device from energizing while disabled or during transitions; matches operator expectation that nothing actuates until fully enabled.
-
-2) Remove the early output push in PLC_Init
-   - In `PLC_Init`, after setting PV defaults, remove `if P.AuxLib and P.AuxLib.Update then P.AuxLib.Update(inst) end`.
-   - Let the next `PLC_Tick` drive Update after the screen and Mach signals have stabilized.
-   - Why correct: Eliminates race/timing issues where stale/latched signals make Auto decide ON right after load.
-
-3) Make dust Auto less trigger-happy and/or off by default
-   - Option A (safer default): Initialize with Auto OFF for dust/boot:
-     - Set `#400=0`, `#402=0` in PLC_Init defaults (leave manual targets 0).
-   - Option B (more robust detection): In dust’s `auto(ctx)`, use spindle direction and require in-cycle:
-     - Replace with `return ((mc.mcSpindleGetDirection(inst) ~= 0) and ctx.inCycle == 1) and 1 or 0`.
-   - Why correct: Reduces false positives from a high `OSIG_SPINDLEON` and avoids energizing on mere spindle spin-up outside a program run.
-
-4) Ensure UI actions disable Auto when doing manual control
-   - Your `UI.Device(name, action)` already defaults to `manual.toggle`, and `AuxLib.Request` sets `pv.auto=0` before toggling manual targets — this is correct.
-   - Action: Confirm screen button scripts call the exact device names:
-     - `UI.Device('dust')`, `UI.Device('dust','auto.toggle')`
-     - `UI.Device('boot')`, `UI.Device('boot','auto.toggle')`
-     - `UI.Device('vacFront')`, `UI.Device('vacRear')`, `UI.Device('vac','auto.toggle')`
-   - Why correct: Ensures manual clicks actually clear Auto and take effect.
-
-### Code Changes (concrete)
-A) Scripts\Dependencies\AuxLib.txt — gate by enable inside Update
-- Near the start of `function AuxLib.Update(inst)` after building ctx, add:
-
-```lua
-  local enabled = (_sig_read(inst, "OSIG_MACHINE_ENABLED") == 1) and 1 or 0
-```
-
-- Before computing/manipulating desired per device, short-circuit when disabled:
-
-```lua
-  if enabled == 0 then
-      desired = 0
-  else
-      -- existing safety/auto/manual logic
-  end
-```
-
-- And avoid mirroring pv.target when disabled (skip the “Mirror into pv.target” line in the disabled branch).
-
-B) Scripts\System\PLC.txt — stop early Update in PLC_Init
-- Remove this line in the PV defaults block:
-
-```lua
-  if P.AuxLib and P.AuxLib.Update then P.AuxLib.Update(inst) end
-```
-
-C) Safer default (optional but recommended)
-- In the same PV defaults block in `PLC_Init`, set:
-
-```lua
-  P.pvSet(400, 0)   -- dust auto OFF (was 1)
-  P.pvSet(402, 0)   -- boot auto OFF (was 1)
-  P.pvSet(401, 0)   -- vac auto OFF
-  -- targets remain 0
-```
-
-D) Dust auto refinement (optional alternative to C)
-- In `ScreenLoad.txt` dust registration, change auto to require in-cycle and a real spindle direction:
-
-```lua
-  auto = function(ctx)
-    local dir = mc.mcSpindleGetDirection(inst)
-    return ((dir ~= 0) and ctx.inCycle == 1) and 1 or 0
-  end,
-```
-
-### Why This Fix Is Correct
-- Eliminates enable-time races: Deferring initial writes and gating on `OSIG_MACHINE_ENABLED` prevents spurious activations from transient/latched signals.
-- Honors operator intent: Auto must never silently override manual without explicit Auto ON; disabling Auto on manual actions is maintained and made effective by the enable gate.
-- Tightens auto semantics: Requiring both a live spindle direction and being in-cycle ensures dust only runs when it should, not on editor/idle transitions.
-- Minimal surface area: Changes are small, local, and consistent with your existing patterns (no new globals or flow changes).
-
-### Quick Validation
-- With machine disabled, toggling autos/targets never actuates outputs.
-- Enabling with spindle OFF and not in-cycle leaves devices OFF.
-- Press dust Auto ON, start a program (spindle ON + inCycle): dust turns ON; stop program: dust turns OFF.
-- Manual toggles work immediately (they clear Auto for that device), buttons reflect state changes.
+Validation
+- With machine disabled, no device toggles outputs regardless of PV changes.
+- Enable with spindle OFF and not in-cycle: devices remain OFF.
+- Turn dust Auto ON, start a program (spindle ON + inCycle): dust turns ON; stop program: dust turns OFF.
+- Turn dust Auto OFF: device remains controlled only by manual target PV; manual buttons toggle reliably.

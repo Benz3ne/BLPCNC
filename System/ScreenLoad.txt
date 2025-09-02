@@ -22,6 +22,11 @@ _G.ToolLib   = _G.ToolLib   or safeRequire("ToolLib")
 _G.AuxLib    = _G.AuxLib    or safeRequire("AuxLib")
 _G.UILib     = _G.UILib     or safeRequire("UILib")
 
+-- Numeric safety: avoid tonumber(number) traps in this runtime
+local function num(v, default)
+  return (type(v) == "number") and v or (tonumber(v) or default or 0)
+end
+
 -- --- Safety patch: convert numeric signal IDs -> handles everywhere -------
 do
   local SL = _G.SystemLib
@@ -52,16 +57,36 @@ if AuxLib and AuxLib.BindInterlocks then
   AuxLib.BindInterlocks({
     virtualActive  = function()
       local pv = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 406)) or mc.mcCntlGetPoundVar(inst, 406)
-      return (tonumber(pv) or 0) >= 90 and 1 or 0
+      return (num(pv) >= 90) and 1 or 0
     end,
     rotationActive = function()
       return (SystemLib and SystemLib.G68Active and select(1, SystemLib.G68Active(inst))) and 1 or 0
     end,
     m6Active       = function()
       local pv = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 499)) or mc.mcCntlGetPoundVar(inst, 499)
-      return (tonumber(pv) == 1) and 1 or 0
+      return (num(pv) == 1) and 1 or 0
     end,
   })
+end
+
+-- One-time PV defaults before any device updates (deterministic startup)
+do
+  if not _G.__pv_defaults then
+    _G.__pv_defaults = true
+    local SL = _G.SystemLib; local inst = mc.mcGetInstance()
+    local function set(n, v)
+      if SL and SL.PoundVarSet then SL.PoundVarSet(inst, n, v) else mc.mcCntlSetPoundVar(inst, n, v) end
+    end
+    -- autos
+    set(400, 1)  -- dust auto ON
+    set(402, 1)  -- boot auto ON
+    set(401, 0)  -- vac auto OFF (both)
+    -- manual targets hard-off
+    set(404, 0)  -- dust target
+    set(403, 0)  -- boot target
+    set(411, 0)  -- rear vac target
+    set(412, 0)  -- front vac target
+  end
 end
 
 -- --- Device registration (unchanged) --------------------------------------
@@ -69,7 +94,7 @@ if AuxLib and AuxLib.Register then
   AuxLib.Register("dust", {
     outputs = { main = "OSIG_OUTPUT4" },
     pv      = { auto = 400, target = 404, override = 405 },
-    auto    = function(ctx) return (ctx.spindle == 1 or ctx.inCycle == 1) and 1 or 0 end,
+    auto    = function(ctx) return (ctx.spindle == 1) and 1 or 0 end,
     events  = { offOnM30 = true, clearManualOnSpindleRise = true },
   })
   AuxLib.Register("boot", {

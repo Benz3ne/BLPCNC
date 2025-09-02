@@ -433,7 +433,7 @@ if wx and wx.wxCallAfter then
       local inst = mc.mcGetInstance()
       local enable = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 497)) or mc.mcCntlGetPoundVar(inst, 497)
       if tonumber(enable or 1) == 1 then
-        local h = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_SOFTLIMITS)
+        local h = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON)
         if h and mc.mcSignalGetState(h) ~= 1 then
           mc.mcCntlSetLastError(inst, "Soft limits: enabling")
           mc.mcSignalSetState(h, 1)

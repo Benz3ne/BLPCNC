@@ -1,0 +1,60 @@
+## Mach4 "Degraded Mode" Library Loading Error Analysis
+
+### The Problem
+When exiting the screen editor, you're getting these errors:
+- [Degraded Mode] Missing lib 'SystemLib'
+- [Degraded Mode] Missing lib 'ToolLib'
+- [Degraded Mode] Missing lib 'UILib'
+
+### What I Found
+
+1. **The Libraries Exist**: The library files are present in the correct location:
+   - C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\SystemLib.txt (62KB)
+   - C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\ToolLib.txt (57KB)
+   - C:\Mach4Hobby\Profiles\BLP\Scripts\Dependencies\UILib.txt (56KB)
+
+2. **The Loading Mechanism**: 
+   - ScreenLoad.txt (line 7) sets up the Lua package path:
+     ```lua
+     package.path = DEPS .. [[\?.txt;]] .. DEPS .. [[\?.lua;]] .. package.path
+     ```
+   - It then tries to load the libraries using:
+     ```lua
+     _G.SystemLib = _G.SystemLib or safeRequire("SystemLib")
+     ```
+
+3. **The Root Cause**: The Lua `require()` function is failing to find the files. This happens because:
+   - When in the screen editor, the Lua environment context may be different
+   - The package.path might not be set correctly in that context
+   - Lua's require() function has specific search patterns and the .txt extension might cause issues
+
+### Why The Proposed Changes Would Fix It
+
+**Option 1 - Rename to .lua files**: 
+- Lua naturally looks for .lua files when using require()
+- This is the standard convention for Lua modules
+- Would eliminate any ambiguity in the file loading process
+
+**Option 2 - Fix the require mechanism**:
+- Would make the loading more robust by using loadfile() instead of require()
+- Could add explicit path checking to diagnose issues
+- Would work regardless of the Lua environment context
+
+**Option 3 - Create wrapper files**:
+- Small .lua files that explicitly load the .txt files
+- Maintains backward compatibility
+- Works around the require() limitations
+
+### The Screen Editor Context Issue
+The error specifically happens when leaving the screen editor because:
+1. The screen editor likely runs in a different Lua state/context
+2. When transitioning out, it tries to reload the screen scripts
+3. The package.path set in the normal context isn't available in the editor context
+4. This causes the require() calls to fail and trigger the degraded mode
+
+### Recommendation
+Option 1 (renaming to .lua) is the cleanest solution because:
+- It follows Lua conventions
+- It's a simple change that addresses the root cause
+- It will work consistently across all Mach4 contexts
+- No code changes needed, just file renames

@@ -442,11 +442,18 @@ if wx and wx.wxCallAfter then
     end
     if not _G.__SOFTLIMITS_SEEDED then _G.__SOFTLIMITS_SEEDED = true; pcall(SeedSoftLimits) end
 
-    -- Replace old Screen-Load-time wxPanel/wxTimer with a safe timer
     _G.__SL_SVC = _G.__SL_SVC or {}
     local svc = _G.__SL_SVC
-    svc.timer = wx.wxTimer()
 
+    -- Stop & disconnect any prior timer before creating a new one
+    if svc.timer then
+      pcall(function()
+        svc.timer:Stop()
+        svc.timer:Disconnect(wx.wxEVT_TIMER)
+      end)
+    end
+
+    svc.timer = wx.wxTimer()
     svc.timer:Connect(wx.wxEVT_TIMER, function()
       if _G.needToolPrompt then
         _G.needToolPrompt = false
@@ -470,7 +477,6 @@ if wx and wx.wxCallAfter then
 
       pcall(UpdateToolPreview)
     end)
-
     svc.timer:Start(150)
   end)
 end

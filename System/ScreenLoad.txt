@@ -457,10 +457,9 @@ function ButtonEnable() --This function enables or disables buttons associated w
     end
     
 end
-ButtonEnable()
+--ButtonEnable()
 
 
---[[
 
 -- ===== UI helpers (optional: call from button scripts) =====
 _G.UI = _G.UI or {}
@@ -502,7 +501,7 @@ if not _G.PopulateTools then
   end
 end
 
-if _G.PopulateTools then pcall(_G.PopulateTools) end
+--if _G.PopulateTools then pcall(_G.PopulateTools) end
 
 -- ===== UI service for legacy PLC flags (tool prompt / low air) =====
 local _panel = wx.wxPanel(wx.NULL, wx.wxID_ANY, wx.wxDefaultPosition, wx.wxSize(0,0))
@@ -534,4 +533,3 @@ _panel:Connect(wx.wxEVT_TIMER, function(_)
 end)
 
 _timer:Start(150)  -- mirrors your prior non-blocking timer pattern
-]]

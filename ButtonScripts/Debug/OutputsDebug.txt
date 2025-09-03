@@ -1,199 +1,254 @@
--- OutputsDebug.txt
--- Comprehensive diagnostic for Mach4 outputs 3..6 staying high
--- Safe: does not enable machine, does not change e-stop. Optionally forces PVs to reduce interference.
+--[[
+Mach4 Output Flip Diagnostic
+Purpose: Find EXACTLY why outputs 3–6 flip back ON when you try to turn them OFF.
 
-local inst = mc.mcGetInstance()
+How to run (safe):
+ 1) Open the Mach4 Lua editor (Operator ▸ Edit/Debug Scripts), paste this whole file,
+    and press Run. OR save as a ButtonScript and click the button.
+ 2) Make sure nothing dangerous is attached to these outputs during testing.
+ 3) The script will:
+    - Snapshot current PVs/outputs
+    - Toggle each device ON, then OFF
+    - Watch for reassertions (who/what turned it back ON)
+    - Generate a report file inside your Profile:  Reports\OutputFlipDiag-YYYYMMDD-HHMMSS.log
 
--- User options
-local FORCE_AUTOS_OFF   = true   -- set true to force #400/#401/#402=0 and targets #404/#403/#411/#412=0 before tests
-local DELAY_MS          = 150     -- delay after writes before delayed readback
-local TEST_OUTPUTS      = {3,4,5,6}
-local STEP_DELAY_MS     = 200     -- delay between logical steps when using AuxLib
+Classifications in the summary:
+  EXTERNAL_REASSERT  -> a Brain or motion-controller mapping (not going through your libs)
+  AUXLIB_REASSERT    -> AuxLib.Update put it back ON (auto/safety/logic)
+  DIRECT_OK          -> direct OSIG write succeeds and stays
+  MANUAL_OK          -> manual target write succeeds and stays
 
-local function log(level, msg)
-  level = level or "INFO"
-  mc.mcCntlSetLastError(inst, string.format("[OUTDBG][%s] %s", level, tostring(msg)))
-end
+Notes:
+  - Uses your current PV layout (autos #400,#401,#402; targets #404,#403,#411,#412)
+  - If AuxLib/SystemLib are loaded, we hook them; otherwise the test still runs in a degraded mode
+  - No global state is left modified when finished (states are restored)
+]]
 
-local function sigConst(n)
-  return mc[string.format("OSIG_OUTPUT%d", n)]
-end
+local mc = mc
+local wx = require("wx")
 
-local function getHandle(n)
-  local id = sigConst(n)
-  if not id then return nil end
-  local h = mc.mcSignalGetHandle(inst, id)
-  return h, id
-end
-
-local function readState(n)
-  local h, id = getHandle(n)
-  if not h or h == 0 then return nil, id, h end
-  local st = mc.mcSignalGetState(h)
-  return st, id, h
-end
-
-local function writeState(n, val)
-  local h, id = getHandle(n)
-  if not h or h == 0 then return false, id, h, nil, nil end
-  mc.mcSignalSetState(h, (val and 1 or 0))
-  local imm = mc.mcSignalGetState(h)
-  wx.wxMilliSleep(DELAY_MS)
-  local aft = mc.mcSignalGetState(h)
-  return true, id, h, imm, aft
-end
-
-local function pvGet(num)
-  local v
-  if SystemLib and SystemLib.PoundVarGet then v = SystemLib.PoundVarGet(inst, num) else v = mc.mcCntlGetPoundVar(inst, num) end
-  return (type(v)=="number") and v or (tonumber(v) or 0)
-end
-
-local function pvSet(num, val)
-  if SystemLib and SystemLib.PoundVarSet then return SystemLib.PoundVarSet(inst, num, val) else return mc.mcCntlSetPoundVar(inst, num, val) end
-end
-
-local function snapshotAux()
-  if not AuxLib then return end
-  log("INFO", "Aux devices + PV snapshot:")
-  for name, d in pairs(AuxLib.__dev or {}) do
-    local spec = d.spec or {}
-    local pv   = spec.pv or {}
-    local auto = pv.auto and pvGet(pv.auto) or -1
-    local targ = pv.target and pvGet(pv.target) or -1
-    local outs = {}
-    for k, sigName in pairs(spec.outputs or {}) do table.insert(outs, string.format("%s=%s", k, tostring(sigName))) end
-    log("INFO", string.format("  %s: auto#%s=%s target#%s=%s outputs={%s}", tostring(name), tostring(pv.auto), tostring(auto), tostring(pv.target), tostring(targ), table.concat(outs, ", ")))    
+-- ==== helpers: path + logging =================================================
+local function getProfileDir(inst)
+  local mach = mc.mcCntlGetMachDir(inst)
+  local name; pcall(function() name = mc.mcProfileGetName(inst) end)
+  if type(name) == "string" and #name > 0 then
+    return mach .. "\\Profiles\\" .. name
   end
+  -- Fallback: try reading the currently loaded screen's profile, else use BLP
+  local prof = "BLP"
+  return mach .. "\\Profiles\\" .. prof
 end
 
-local function maybeForceAutos()
-  if not FORCE_AUTOS_OFF then return end
-  log("WARNING", "FORCE_AUTOS_OFF=true -> clearing autos (#400/#401/#402) and targets (#404/#403/#411/#412)")
-  pvSet(400,0); pvSet(401,0); pvSet(402,0)
-  pvSet(404,0); pvSet(403,0); pvSet(411,0); pvSet(412,0)
+local function nowStamp()
+  local t = os.date("!*t")
+  return string.format("%04d%02d%02d-%02d%02d%02d", t.year, t.month, t.day, t.hour, t.min, t.sec)
 end
 
-local function enabled()
-  local h = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED)
-  return (h and h~=0 and mc.mcSignalGetState(h) == 1) and 1 or 0
+local function ensureDir(path)
+  -- Windows shell mkdir via os.execute is fine here
+  os.execute(string.format('if not exist "%s" mkdir "%s"', path, path))
 end
 
--- Header
-log("INFO", "=== Outputs Debug: begin ===")
-log("INFO", string.format("Profile=%s  Time=%s", tostring(mc.mcProfileGetName(inst)), os.date("%Y-%m-%d %H:%M:%S")))
-log("INFO", string.format("Machine enabled=%d  Delay=%dms  FORCE_AUTOS_OFF=%s", enabled(), DELAY_MS, tostring(FORCE_AUTOS_OFF)))
+local function newLogger(inst)
+  local base = getProfileDir(inst) .. "\\Reports"
+  ensureDir(base)
+  local file = base .. "\\OutputFlipDiag-" .. nowStamp() .. ".log"
+  local fh = assert(io.open(file, "w"))
+  local function log(fmt, ...)
+    local msg = (select('#', ...) > 0) and string.format(fmt, ...) or tostring(fmt)
+    fh:write(os.date("%H:%M:%S "), msg, "\n"); fh:flush()
+    mc.mcCntlSetLastError(inst, msg)
+  end
+  return { file=file, log=log, close=function() fh:close() end }
+end
 
-snapshotAux()
-maybeForceAutos()
+-- ==== environment probes ======================================================
+local function sigHandle(inst, id)
+  local ok, h = pcall(mc.mcSignalGetHandle, inst, id)
+  return ok and h or nil
+end
 
--- Map devices -> output numbers for cross checks
-local DEV_OUT = {
-  dust    = 4,
-  boot    = 3,
-  vacRear = 5,
-  vacFront= 6,
+local function sigState(h)
+  local ok, s = pcall(mc.mcSignalGetState, h)
+  return ok and (s == 1 and 1 or 0) or -1
+end
+
+local function setSig(h, v)
+  local ok = pcall(mc.mcSignalSetState, h, (v and 1 or 0))
+  return ok
+end
+
+local function pvGet(inst, n)
+  local ok, v = pcall(mc.mcCntlGetPoundVar, inst, n)
+  if ok then return tonumber(v) end
+  return nil
+end
+
+local function pvSet(inst, n, v)
+  return pcall(mc.mcCntlSetPoundVar, inst, n, tonumber(v) or 0)
+end
+
+-- ==== optional library hooks (if present) =====================================
+local SystemLib = rawget(_G, "SystemLib")
+local AuxLib    = rawget(_G, "AuxLib")
+
+-- Hook SystemLib.SignalSetState (if available) to catch internal reassertors
+local ORIG_SignalSetState
+if SystemLib and SystemLib.SignalSetState and type(SystemLib.SignalSetState)=="function" then
+  ORIG_SignalSetState = SystemLib.SignalSetState
+end
+
+-- ==== device registry (your current mapping) ==================================
+local DEV = {
+  { key="dust",     name="Dust Collect", osig=mc.OSIG_OUTPUT4, autoPV=400, tgtPV=404 },
+  { key="boot",     name="Dust Boot",    osig=mc.OSIG_OUTPUT3, autoPV=402, tgtPV=403 },
+  { key="vacRear",  name="Vac Rear",     osig=mc.OSIG_OUTPUT5, autoPV=401, tgtPV=411 },
+  { key="vacFront", name="Vac Front",    osig=mc.OSIG_OUTPUT6, autoPV=401, tgtPV=412 },
 }
 
-local function outStateForDevice(name)
-  local n = DEV_OUT[name]
-  if not n then return nil end
-  local st = readState(n)
-  return st
-end
+-- ==== classification ==========================================================
+local CLASS = {
+  MANUAL_OK        = "MANUAL_OK",
+  DIRECT_OK        = "DIRECT_OK",
+  AUXLIB_REASSERT  = "AUXLIB_REASSERT",
+  EXTERNAL_REASSERT= "EXTERNAL_REASSERT",
+  BLOCKED_WRITE    = "BLOCKED_WRITE",
+  UNKNOWN          = "UNKNOWN",
+}
 
-local function auxState(name)
-  if not AuxLib or not AuxLib.State then return nil end
-  local st = AuxLib.State(inst, name) or {}
-  return {
-    on = st.on,
-    auto = st.auto,
-    target = st.target,
-  }
-end
-
-local function requestAndUpdate(name, action)
-  if not AuxLib or not AuxLib.Request then return false, "AuxLib missing" end
-  local ok, err = pcall(AuxLib.Request, inst, { device=name, action=action })
-  if not ok then return false, tostring(err) end
-  if AuxLib.Update then pcall(AuxLib.Update, inst) end
-  wx.wxMilliSleep(STEP_DELAY_MS)
-  return true
-end
-
--- SECTION A: AuxLib manual ON/OFF per device
-log("INFO", "-- SECTION A: AuxLib manual toggle (auto=0) --")
-for name, outN in pairs(DEV_OUT) do
-  -- Ensure auto off for this device
-  requestAndUpdate(name, "auto.off")
-  -- Manual ON
-  requestAndUpdate(name, "manual.on")
-  local st_on    = readState(outN)
-  local a_on     = auxState(name)
-  log("INFO", string.format("%s manual.on -> output%d=%s  aux={on=%s,auto=%s,target=%s}", name, outN, tostring(st_on and st_on or "nil"), tostring(a_on and a_on.on), tostring(a_on and a_on.auto), tostring(a_on and a_on.target)))
-  -- Manual OFF
-  requestAndUpdate(name, "manual.off")
-  local st_off   = readState(outN)
-  local a_off    = auxState(name)
-  log("INFO", string.format("%s manual.off -> output%d=%s aux={on=%s,auto=%s,target=%s}", name, outN, tostring(st_off and st_off or "nil"), tostring(a_off and a_off.on), tostring(a_off and a_off.auto), tostring(a_off and a_off.target)))
-end
-
--- SECTION B: AuxLib auto toggle (effect depends on policy)
-log("INFO", "-- SECTION B: AuxLib auto toggle --")
-for name, outN in pairs(DEV_OUT) do
-  requestAndUpdate(name, "auto.on")
-  local st_aon  = readState(outN)
-  local as_on   = auxState(name)
-  log("INFO", string.format("%s auto.on -> output%d=%s aux={on=%s,auto=%s,target=%s}", name, outN, tostring(st_aon and st_aon or "nil"), tostring(as_on and as_on.on), tostring(as_on and as_on.auto), tostring(as_on and as_on.target)))
-  requestAndUpdate(name, "auto.off")
-  local st_aoff = readState(outN)
-  local as_off  = auxState(name)
-  log("INFO", string.format("%s auto.off -> output%d=%s aux={on=%s,auto=%s,target=%s}", name, outN, tostring(st_aoff and st_aoff or "nil"), tostring(as_off and as_off.on), tostring(as_off and as_off.auto), tostring(as_off and as_off.target)))
-end
-
--- SECTION C: Direct write vs AuxLib re-apply
-log("INFO", "-- SECTION C: Direct write OFF/ON with and without AuxLib.Update --")
-for _, n in ipairs(TEST_OUTPUTS) do
-  local st0, id, h = readState(n)
-  log("INFO", string.format("O%d start=%s", n, tostring(st0)))
-  -- Direct OFF only
-  local ok0, _, _, imm0, aft0 = writeState(n, 0)
-  log("INFO", string.format("O%d direct OFF -> imm=%s delayed=%s (no Update)", n, tostring(imm0), tostring(aft0)))
-  -- Now force an Aux Update and read again
-  if AuxLib and AuxLib.Update then pcall(AuxLib.Update, inst); wx.wxMilliSleep(STEP_DELAY_MS) end
-  local st_afterUpd = select(1, readState(n))
-  log("INFO", string.format("O%d after Aux.Update -> %s", n, tostring(st_afterUpd)))
-  -- Direct ON + read
-  local ok1, _, _, imm1, aft1 = writeState(n, 1)
-  log("INFO", string.format("O%d direct ON  -> imm=%s delayed=%s", n, tostring(imm1), tostring(aft1)))
-end
-
--- SECTION D: Per-output diagnostic (immediate + delayed) — original block
-log("INFO", "-- SECTION D: Low-level signal write/read --")
-for _, n in ipairs(TEST_OUTPUTS) do
-  local st0, id, h = readState(n)
-  if not id then
-    log("ERROR", string.format("Output%d: missing signal constant (mc.OSIG_OUTPUT%d)" , n, n))
-  elseif not h or h == 0 then
-    log("ERROR", string.format("Output%d: handle invalid (id=%s) -> check Control/IO mapping & plugin", n, tostring(id)))
-  else
-    log("INFO", string.format("Output%d: id=%s handle=%s initial=%s", n, tostring(id), tostring(h), tostring(st0)))
-    -- Try force 0
-    local ok0, _, _, imm0, aft0 = writeState(n, 0)
-    log("INFO", string.format("Output%d: write 0 -> imm=%s delayed=%s (enabled=%d)", n, tostring(imm0), tostring(aft0), enabled()))
-    -- Try force 1
-    local ok1, _, _, imm1, aft1 = writeState(n, 1)
-    log("INFO", string.format("Output%d: write 1 -> imm=%s delayed=%s (enabled=%d)", n, tostring(imm1), tostring(aft1), enabled()))
-    -- Try force 0 again
-    local ok2, _, _, imm2, aft2 = writeState(n, 0)
-    log("INFO", string.format("Output%d: write 0 -> imm=%s delayed=%s (enabled=%d)", n, tostring(imm2), tostring(aft2), enabled()))
-
-    if aft0 == 1 and aft1 == 1 and aft2 == 1 then
-      log("WARNING", string.format("Output%d: stuck HIGH (override suspected)", n))
-    elseif aft0 == 0 and aft1 == 0 and aft2 == 0 then
-      log("WARNING", string.format("Output%d: stuck LOW (writes ignored)", n))
-    end
+-- ==== core measurement routine ===============================================
+local function waitAndSample(msTotal, sampleMs, sampler)
+  local t = 0
+  local samples = {}
+  while t <= msTotal do
+    table.insert(samples, sampler())
+    wx.wxMilliSleep(sampleMs)
+    t = t + sampleMs
   end
+  return samples
 end
 
-log("INFO", "=== Outputs Debug: end ===")
+local function firstReassertIndex(samples)
+  -- samples are integers 0/1 (state of OSIG) after we commanded OFF
+  for i=2, #samples do
+    if samples[i-1] == 0 and samples[i] == 1 then return i end
+  end
+  return nil
+end
+
+local function runOne(inst, L, d, handles)
+  L.log("\n=== Device: %s (%s) ===", d.name, d.key)
+  local h = handles[d.osig]
+  if not h then
+    L.log("Handle missing for %s", d.name)
+    return { key=d.key, class=CLASS.BLOCKED_WRITE, note="no handle" }
+  end
+
+  -- snapshot
+  local auto0, tgt0, sig0 = pvGet(inst,d.autoPV) or 0, pvGet(inst,d.tgtPV) or 0, sigState(h)
+  L.log("Start: AUTO=%d, TGT=%d, OSIG=%d", auto0, tgt0, sig0)
+
+  -- ensure AUTO off for manual test
+  pvSet(inst, d.autoPV, 0)
+
+  -- PHASE A: turn ON via manual target
+  pvSet(inst, d.tgtPV, 1)
+  if AuxLib and AuxLib.Update then pcall(AuxLib.Update, inst) end
+  wx.wxMilliSleep(50)
+  local sA = sigState(h)
+  L.log("After MANUAL ON: OSIG=%d", sA)
+
+  -- PHASE B: try to turn OFF via manual target
+  pvSet(inst, d.tgtPV, 0)
+  if AuxLib and AuxLib.Update then pcall(AuxLib.Update, inst) end
+  wx.wxMilliSleep(20)
+
+  -- watch for 1s @10ms resolution while OFF is commanded
+  local samples = waitAndSample(1000, 10, function() return sigState(h) end)
+  local reidx = firstReassertIndex(samples)
+  local endState = samples[#samples]
+  L.log("Manual OFF sweep: first=%d, last=%d, reassert_idx=%s", samples[1], endState, tostring(reidx))
+
+  if samples[1]==0 and not reidx and endState==0 then
+    L.log("Result: MANUAL_OK (sticks OFF)")
+    -- restore
+    pvSet(inst, d.autoPV, auto0); pvSet(inst, d.tgtPV, tgt0); if AuxLib and AuxLib.Update then pcall(AuxLib.Update, inst) end
+    return { key=d.key, class=CLASS.MANUAL_OK }
+  end
+
+  -- If it reasserted, try DIRECT OSIG write to 0 (bypass AuxLib logic)
+  L.log("Manual OFF did not stick. Trying DIRECT OSIG write to 0 …")
+  local okW = setSig(h, 0)
+  wx.wxMilliSleep(20)
+  local samples2 = waitAndSample(1000, 10, function() return sigState(h) end)
+  local reidx2 = firstReassertIndex(samples2)
+  local end2 = samples2[#samples2]
+  L.log("Direct OFF sweep: first=%d, last=%d, reassert_idx=%s (writeOK=%s)", samples2[1], end2, tostring(reidx2), tostring(okW))
+
+  local cls
+  if samples2[1]==0 and (not reidx2) and end2==0 then
+    cls = CLASS.DIRECT_OK
+    L.log("Result: DIRECT_OK (AuxLib likely reasserted earlier)")
+  else
+    cls = CLASS.EXTERNAL_REASSERT
+    L.log("Result: EXTERNAL_REASSERT (Brain/plugin or hardware mapping)")
+  end
+
+  -- restore
+  pvSet(inst, d.autoPV, auto0); pvSet(inst, d.tgtPV, tgt0); if AuxLib and AuxLib.Update then pcall(AuxLib.Update, inst) end
+  return { key=d.key, class=cls }
+end
+
+-- ==== optional internal hook: mark AuxLib reassertions ========================
+local function withAuxHook(inst, L, fn)
+  if not (AuxLib and AuxLib.Update) then return fn() end
+  local ORIG = AuxLib.Update
+  local stamp = 0
+  AuxLib.Update = function(i)
+    stamp = stamp + 1
+    return ORIG(i)
+  end
+  local res = fn()
+  AuxLib.Update = ORIG
+  res.__auxStamp = stamp
+  L.log("AuxLib.Update calls during test: %d", stamp)
+  return res
+end
+
+-- ==== runner =================================================================
+local function RunOutputFlipDiagnostic()
+  local inst = mc.mcGetInstance()
+  if not inst then return end
+  local L = newLogger(inst)
+  L.log("Mach4 Output Flip Diagnostic start")
+
+  -- Gather handles
+  local handles = {}
+  for _,d in ipairs(DEV) do
+    handles[d.osig] = handles[d.osig] or sigHandle(inst, d.osig)
+  end
+
+  local results = {}
+  for _,d in ipairs(DEV) do
+    local r = withAuxHook(inst, L, function() return runOne(inst, L, d, handles) end)
+    results[d.key] = r
+  end
+
+  -- Summarize
+  L.log("\n=== SUMMARY ===")
+  for _,d in ipairs(DEV) do
+    local r = results[d.key]
+    L.log("%-9s : %s%s", d.key, r.class or CLASS.UNKNOWN,
+      (r.note and (" ("..r.note..")") or ""))
+  end
+
+  L.log("\nInterpreting results:")
+  L.log("  - EXTERNAL_REASSERT: Disable Brains touching OSIG_OUTPUT3..6; check motion-controller mappings/charge-pump; test again.")
+  L.log("  - DIRECT_OK then MANUAL failed: Review AuxLib rules (auto/safety). Ensure AUTO PV=0 and no safety forcing ON.")
+  L.log("  - MANUAL_OK: System behaving; issue might be UI sync only.")
+  L.log("\nReport saved: %s", L.file)
+  L.close()
+end
+
+-- Run now
+RunOutputFlipDiagnostic()

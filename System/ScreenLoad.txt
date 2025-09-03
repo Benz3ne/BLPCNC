@@ -84,7 +84,8 @@ do
     SL.SignalSetState = function(_, signal, state)
       local h = toHandle(signal)
       if not h or h == 0 then return false end
-      mc.mcSignalSetState(h, (state and 1 or 0))
+      local v = (state == true or state == 1 or state == "1" or state == "HIGH" or state == "high") and 1 or 0
+      mc.mcSignalSetState(h, v)
       return true
     end
   end

@@ -46,7 +46,11 @@ end
 
 local function sigH(inst, id) local ok,h=pcall(mc.mcSignalGetHandle,inst,id); return ok and h or nil end
 local function sigR(h) local ok,s=pcall(mc.mcSignalGetState,h); return ok and (s==1 and 1 or 0) or -1 end
-local function sigW(h,v) pcall(mc.mcSignalSetState,h,(v and 1 or 0)) end
+-- Normalize to explicit 0/1; avoid (v and 1 or 0)
+local function sigW(h,v)
+  local want = (v == true or v == 1 or v == "1" or v == "HIGH" or v == "high") and 1 or 0
+  pcall(mc.mcSignalSetState, h, want)
+end
 local function pvG(inst,n) local ok,v=pcall(mc.mcCntlGetPoundVar,inst,n); return ok and tonumber(v) or 0 end
 local function pvS(inst,n,v) pcall(mc.mcCntlSetPoundVar,inst,n,tonumber(v) or 0) end
 
@@ -208,7 +212,8 @@ local function run()
   -- TEST 3: Method matrix (multiple methods, with/without Aux writes, enabled/disabled)
   LOG.log("TEST3: Method matrix")
   local function setEnable(on)
-    local ok = pcall(mc.mcCntlEnable, inst, (on and 1 or 0)); sleep(100); return ok
+    local want = (on == true or on == 1 or on == "1") and 1 or 0
+    local ok = pcall(mc.mcCntlEnable, inst, want); sleep(100); return ok
   end
   local methods = {
     { key="direct_handle", fn=function(h) sigW(h, 0) end },

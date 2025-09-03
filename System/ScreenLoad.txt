@@ -434,8 +434,6 @@ function UI.SyncOutputs(snapshot)
     local a = b01(pvAuto)
     if UILib and UILib.SyncToggleButton then
       UILib.SyncToggleButton("btnDustAuto", a==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
-      -- legacy alias
-      UILib.SyncToggleButton("btnDustCollectAuto", a==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
     else
       setp_ifdiff("btnDustAuto", "Button State", a == 1 and "1" or "0")
     end
@@ -454,7 +452,6 @@ function UI.SyncOutputs(snapshot)
     local a = b01(pvAuto)
     if UILib and UILib.SyncToggleButton then
       UILib.SyncToggleButton("btnBootAuto", a==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
-      UILib.SyncToggleButton("btnDustBootAuto", a==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
     else
       setp_ifdiff("btnBootAuto", "Button State", a == 1 and "1" or "0")
     end
@@ -482,7 +479,6 @@ function UI.SyncOutputs(snapshot)
     local a = b01(pvAuto)
     if UILib and UILib.SyncToggleButton then
       UILib.SyncToggleButton("btnVacAuto", a==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
-      UILib.SyncToggleButton("btnVacuumAuto", a==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
     else
       setp_ifdiff("btnVacAuto", "Button State", a == 1 and "1" or "0")
     end

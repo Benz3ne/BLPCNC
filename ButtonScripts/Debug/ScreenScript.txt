@@ -1,0 +1,2822 @@
+-- A system paths file was found.
+mcsp = require "./Modules/mcSysPaths"
+mcsp.SetupPaths("C:/Mach4Hobby", "BLP")
+
+-- PMC generated module load code.
+package.path = package.path .. ";./Pmc/?.lua"
+package.path = package.path .. ";./Pmc/?.luac"
+
+
+-- PMC generated module load code.
+function Mach_Cycle_Pmc()
+end
+
+-- Screen load script (Global)
+local ROOT = [[C:\Mach4Hobby\Profiles\BLP\Scripts]]
+local SYS  = ROOT .. [[\System]]
+
+-- ScreenLoad GUI stub (silent unless error; lazy logging on failure only)
+local SRC = SYS .. [[\ScreenLoad.txt]]
+
+
+-- One-time cache for this stub
+local SL = rawget(_G, "__SL_STUB") or { log_path = nil }
+_G.__SL_STUB = SL
+
+
+local function now() return os.date("%Y-%m-%d %H:%M:%S") end
+
+
+local function downloads_dir()
+local up = os.getenv("USERPROFILE"); if up and #up > 0 then return (up .. "\\Downloads") end
+local pub = os.getenv("PUBLIC"); if pub and #pub > 0 then return (pub .. "\\Downloads") end
+return ROOT
+end
+
+
+local function ensure_log()
+if SL.log_path then return SL.log_path end
+local stamp = os.date("%Y-%m-%d_%H-%M-%S")
+SL.log_path = (downloads_dir() .. "\\Mach4_ScreenLoad_Errors_" .. stamp .. ".txt"):gsub("/", "\\")
+local ok, f = pcall(io.open, SL.log_path, "w")
+if ok and f then
+f:write(("==== ScreenLoad Stub Errors @ %s ====\r\nROOT=%s\r\nSYS=%s\r\nSRC=%s\r\n"):format(now(), ROOT, SYS, SRC))
+f:flush(); f:close()
+else
+SL.log_path = nil
+end
+return SL.log_path
+end
+
+
+local function slog(...)
+local path = ensure_log(); if not path then return end
+local ok, f = pcall(io.open, path, "a"); if not ok or not f then return end
+for i = 1, select("#", ...) do f:write(tostring(select(i, ...))) end
+f:write("\r\n"); f:flush(); f:close()
+end
+
+
+local function errh(e)
+return ("%s\n%s"):format(tostring(e), debug.traceback("", 2))
+end
+
+
+-- Expose a reload helper for a dev button
+function _G.Reload_ScreenLoad()
+local chunk, lerr = loadfile(SRC)
+if not chunk then
+slog(("!! %s LOAD ERROR: %s"):format(now(), tostring(lerr)))
+error(lerr)
+end
+local ok, perr = xpcall(chunk, errh)
+if not ok then
+slog(("!! %s RUNTIME ERROR:\r\n%s"):format(now(), perr))
+error(perr)
+end
+end
+
+
+-- Initial run (silent on success)
+local ok, perr = pcall(_G.Reload_ScreenLoad)
+if not ok then
+  -- get a handle inline so we never depend on a later 'inst'
+  pcall(mc.mcCntlSetLastError, mc.mcGetInstance(), "ScreenLoad error (see log)")
+end
+
+-- PLC script
+function Mach_PLC_Script()
+    -- ===== PLC Trampoline (silent unless error; logs lazily on failure) =====
+    local inst = mc.mcGetInstance()
+    
+    -- Paths (reuse ROOT/SYS defined at top)
+    local PLCF = SYS  .. [[\PLC.txt]]
+    local DEPS = ROOT .. [[\Dependencies]]
+    
+    -- Let PLC find your libs
+    package.path = DEPS .. [[\?.txt;]] .. DEPS .. [[\?.lua;]] .. package.path
+    
+    -- One-time state for the trampoline
+    _G.__PLC_TRAMP = _G.__PLC_TRAMP or { ready=false, init_called=false, last_err_at=0, last_err_msg="", log_path=nil }
+    local T = _G.__PLC_TRAMP
+    
+    -- Lazy logging (created only when an error occurs)
+    local function now() return os.date("%Y-%m-%d %H:%M:%S") end
+    
+    local function downloads_dir()
+      local up = os.getenv("USERPROFILE"); if up and #up > 0 then return (up .. "\\Downloads") end
+      local pub = os.getenv("PUBLIC");     if pub and #pub > 0 then return (pub .. "\\Downloads") end
+      return ROOT
+    end
+    
+    local function ensure_log()
+      if T.log_path then return T.log_path end
+      local stamp = os.date("%Y-%m-%d_%H-%M-%S")
+      T.log_path = (downloads_dir() .. "\\Mach4_PLC_Errors_" .. stamp .. ".txt"):gsub("/", "\\")
+      local ok, f = pcall(io.open, T.log_path, "w")
+      if ok and f then
+        f:write(("==== PLC Trampoline Errors @ %s ====\r\nROOT=%s\r\nSYS=%s\r\nPLCF=%s\r\nDEPS=%s\r\n"):format(now(), ROOT, SYS, PLCF, DEPS))
+        f:flush(); f:close()
+      else
+        T.log_path = nil
+      end
+      return T.log_path
+    end
+    
+    local function logline(...)
+      local path = ensure_log(); if not path then return end
+      local ok, f = pcall(io.open, path, "a"); if not ok or not f then return end
+      for i = 1, select("#", ...) do f:write(tostring(select(i, ...))) end
+      f:write("\r\n"); f:flush(); f:close()
+    end
+    
+    local function errh(e) return ("%s\n%s"):format(tostring(e), debug.traceback("", 2)) end
+    
+    -- Expose a reload helper for a dev button (forces next-tick reload)
+    function _G.Reload_PLC()
+      _G.__PLC_TRAMP = nil
+    end
+    
+    -- Load external PLC once per Lua runtime
+    if not T.ready then
+      T.ready = true
+      local loader, lerr = loadfile(PLCF)
+      if not loader then
+        logline("!! ", now(), " LOAD ERROR: ", tostring(lerr))
+        pcall(mc.mcCntlSetLastError, inst, "PLC load error (see log)")
+      else
+        local ok, runErr = xpcall(loader, errh)
+        if not ok then
+          logline("!! ", now(), " EVAL ERROR:\r\n", runErr)
+          pcall(mc.mcCntlSetLastError, inst, "PLC evaluation error (see log)")
+        end
+      end
+    end
+    
+    -- Call PLC_Init once (protected)
+    if not T.init_called and type(_G.PLC_Init) == "function" then
+      local ok, err = xpcall(function() _G.PLC_Init(inst) end, errh)
+      if not ok then
+        local nowc = os.clock()
+        logline("!! ", now(), " PLC_Init error:\r\n", err)
+        if nowc - (T.last_err_at or 0) > 2 then
+          pcall(mc.mcCntlSetLastError, inst, "PLC_Init error (see log)")
+          T.last_err_at = nowc
+        end
+      else
+        T.init_called = true
+      end
+    end
+    
+    -- Call PLC_Tick each cycle (protected)
+    if type(_G.PLC_Tick) == "function" then
+      local ok, err = xpcall(function() _G.PLC_Tick(inst) end, errh)
+      if not ok then
+        local nowc = os.clock()
+        if err ~= T.last_err_msg or (nowc - (T.last_err_at or 0)) > 2 then
+          logline("!! ", now(), " PLC_Tick error:\r\n", err)
+          pcall(mc.mcCntlSetLastError, inst, "PLC_Tick error (see log)")
+          T.last_err_msg = err
+          T.last_err_at  = nowc
+        end
+        -- swallow error so PLC keeps running
+      end
+    end
+    -- ===== end PLC Trampoline =====
+end
+
+-- Signal script
+function Mach_Signal_Script(sig, state)
+    if SigLib[sig] ~= nil then
+        SigLib[sig](state);
+    end
+end
+
+-- Message script
+function Mach_Message_Script(msg, param1, param2)
+    if MsgLib ~= nil and MsgLib[msg] ~= nil then
+        MsgLib[msg](param1, param2);
+    end
+end
+
+-- Timer script
+-- 'timer' contains the timer number that fired the															 script.
+function Mach_Timer_Script(timer)
+    
+end
+
+-- Screen unload script
+function Mach_Screen_Unload_Script()
+    --Screen unload
+    if (Tframe ~= nil) then
+    
+    	Tframe:Close()
+        Tframe:Destroy()
+    end
+    
+end
+
+-- Screen Vision script
+function Mach_Screen_Vision_Script(...)
+    
+end
+
+-- Default-GlobalScript
+-- tabPositionsExtens-GlobalScript
+function tabPositionsExtens_On_Enter_Script(...)
+    local rc;
+    local tabG_Mdi, rc = scr.GetProperty("nbGCodeMDI1", "Current Tab")
+    
+    --See if we have to do an MDI command
+    if (tonumber(tabG_Mdi) == 1 ) then
+        scr.SetProperty('btnCycleStart', 'Label', 'Cycle Start\nMDI');
+    else
+        scr.SetProperty('btnCycleStart', 'Label', 'Cycle Start\nGcode');
+    end
+end
+-- nbpagePositions-GlobalScript
+function droMachineX_On_Update_Script(...)
+    local val = select(1,...) -- Get the system value.
+    val = tonumber(val) -- The value may be a number or a string. Convert as needed.
+    DecToFrac(0)
+    return val -- the script MUST return a value, otherwise, the control will not be updated.
+end
+function droMachineY_On_Update_Script(...)
+    local val = select(1,...) -- Get the system value.
+    val = tonumber(val) -- The value may be a number or a string. Convert as needed.
+    DecToFrac(1)
+    return val -- the script MUST return a value, otherwise, the control will not be updated.
+end
+function droMachineZ_On_Update_Script(...)
+    local val = select(1,...) -- Get the system value.
+    val = tonumber(val) -- The value may be a number or a string. Convert as needed.
+    DecToFrac(2)
+    return val -- the script MUST return a value, otherwise, the control will not be updated.
+end
+function btnReturnHome_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "MachineTo000.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function btnPark_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "MachinePark.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function droMyFix_On_Modify_Script(...)
+    inst = mc.mcGetInstance()
+    
+    local MyFix = scr.GetProperty("droMyFix", "Value")
+    MyFix = tonumber(MyFix)
+    if (MyFix > 0) and (MyFix) < 7 then
+        MyFix = MyFix + 53
+        mc.mcCntlGcodeExecute(inst, (string.format('G' .. MyFix)))
+    elseif (MyFix > 6) and (MyFix < 107) then
+    	MyFix = (MyFix - 6)
+    	mc.mcCntlGcodeExecute(inst, (string.format("G54.1 P" .. MyFix)))
+    else
+        wx.wxMessageBox("The fixtures you can call through this input are limited to 1-106 (G54-G54.1 P100).\n \nEnter a valid number (1-126) and try again.\n\n*** It will now default to 1 (G54) ***")
+        scr.SetProperty("droMyFix", "Value", "1")
+        mc.mcCntlGcodeExecute(inst, "G54")
+    end
+end
+function droCurrentZ_On_Update_Script(...)
+    local val = select(1,...) -- Get the system value.
+    val = tonumber(val) -- The value may be a number or a string. Convert as needed.
+    DecToFrac(2)
+    return val -- the script MUST return a value, otherwise, the control will not be updated.
+end
+function droCurrentY_On_Update_Script(...)
+    local val = select(1,...) -- Get the system value.
+    val = tonumber(val) -- The value may be a number or a string. Convert as needed.
+    DecToFrac(1)
+    return val -- the script MUST return a value, otherwise, the control will not be updated.
+end
+function droCurrentX_On_Update_Script(...)
+    local val = select(1,...) -- Get the system value.
+    val = tonumber(val) -- The value may be a number or a string. Convert as needed.
+    DecToFrac(0)
+    return val -- the script MUST return a value, otherwise, the control will not be updated.
+end
+function tbtnG56_Down_Script(...)
+    local inst = mc.mcGetInstance()
+    local set = 56
+    
+    -- Execute the work offset change
+    mc.mcCntlMdiExecute(inst, string.format("G%.0f", set))
+    
+    -- Update all buttons using the screen load function
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+end
+function tbtnG55_Down_Script(...)
+    local inst = mc.mcGetInstance()
+    local set = 55
+    
+    -- Execute the work offset change
+    mc.mcCntlMdiExecute(inst, string.format("G%.0f", set))
+    
+    -- Update all buttons using the screen load function
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+end
+function tbtnG59_Down_Script(...)
+    local inst = mc.mcGetInstance()
+    local set = 59
+    
+    -- Execute the work offset change
+    mc.mcCntlMdiExecute(inst, string.format("G%.0f", set))
+    
+    -- Update all buttons using the screen load function
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+end
+function tbtnG57_Down_Script(...)
+    local inst = mc.mcGetInstance()
+    local set = 57
+    
+    -- Execute the work offset change
+    mc.mcCntlMdiExecute(inst, string.format("G%.0f", set))
+    
+    -- Update all buttons using the screen load function
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+end
+function tbtnG58_Down_Script(...)
+    local inst = mc.mcGetInstance()
+    local set = 58
+    
+    -- Execute the work offset change
+    mc.mcCntlMdiExecute(inst, string.format("G%.0f", set))
+    
+    -- Update all buttons using the screen load function
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+end
+function tbtnG54_Down_Script(...)
+    local inst = mc.mcGetInstance()
+    local set = 54
+    
+    -- Execute the work offset change
+    mc.mcCntlMdiExecute(inst, string.format("G%.0f", set))
+    
+    -- Update all buttons using the screen load function
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+end
+function btnTargetMove_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "TargetMove.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function btnRefAllAxes_Left_Up_Script(...)
+    wait = coroutine.create (RefAllHome) --Run the RefAllHome function as a coroutine named wait.
+    --See RefAllHome function in screen load script for coroutine.yield and PLC script for coroutine.resume
+end
+function btnRemember_Left_Up_Script(...)
+    --Remember Position
+    RememberPosition() -- This runs the Remember Position Function that is in the screenload script.
+end
+function btnReturn_Left_Up_Script(...)
+    -- Return To Position
+    ReturnToPosition() -- This runs the Return to Position Function that is in the screenload script.
+end
+function btnCustomFixtureTable_Left_Up_Script(...)
+    -- Open Fixture Table button script
+    if ShowFixtureTable then
+        ShowFixtureTable()
+    end
+end
+-- nbGCodeInput1-GlobalScript
+function nbGCodeInput1_On_Enter_Script(...)
+     scr.SetProperty('btnCycleStart', 'Label', 'Cycle Start\nGcode');
+end
+-- nbMDIInput1-GlobalScript
+function nbMDIInput1_On_Enter_Script(...)
+    scr.SetProperty('btnCycleStart', 'Label', 'Cycle Start\nMDI');
+end
+-- lblToolPreview1-GlobalScript
+-- grpOutputs-GlobalScript
+function btnLaserDown_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "LaserDown.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function btnDustBoot_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "btnDustBoot.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function btnDustCollect_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "btnDustCollect.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function btnVacFront_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if AuxLib and AuxLib.Request then
+      AuxLib.Request(inst, { device = "vacFront", action = "manual.toggle" })
+    else
+      mc.mcCntlSetLastError(inst, "Missing AuxLib.Request: vacFront manual.toggle")
+    end
+end
+function btnVacRear_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if AuxLib and AuxLib.Request then
+      AuxLib.Request(inst, { device = "vacRear", action = "manual.toggle" })
+    else
+      mc.mcCntlSetLastError(inst, "Missing AuxLib.Request: vacRear manual.toggle")
+    end
+end
+function btnActivateLaser_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "LaserOn.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+-- tabOperations-GlobalScript
+function tabOperations_On_Enter_Script(...)
+    local FixOffset = mc.mcCntlGetPoundVar(inst, 4014)
+    FixOffset = 53 + (FixOffset * 10)
+    local Fixture = 54
+    
+    while (Fixture <= 59) do
+        local state = "0"
+        if (Fixture == FixOffset) then
+            state = "1"
+        end
+        scr.SetProperty(string.format("tbtnG%.0f", Fixture), "Button State", state)
+        Fixture = Fixture + 1
+    end
+    
+end
+function btnSetX_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if not inst then
+        return
+    end
+    
+    -- Check machine state (0 = IDLE)
+    local state = mc.mcCntlGetState(inst)
+    if state ~= 0 then
+        mc.mcCntlSetLastError(inst, "ERROR: Machine must be idle to set datum")
+        return
+    end
+    
+    -- Check if X axis is enabled
+    local xEnabled = mc.mcAxisIsEnabled(inst, mc.X_AXIS)
+    if xEnabled ~= 1 then
+        mc.mcCntlSetLastError(inst, "ERROR: X axis is not enabled")
+        return
+    end
+    
+    -- Get current X position in machine coordinates
+    local currentX = mc.mcAxisGetMachinePos(inst, mc.X_AXIS)
+    if not currentX then
+        mc.mcCntlSetLastError(inst, "ERROR: Failed to get X position")
+        return
+    end
+    
+    -- Store in pound variable #450
+    mc.mcCntlSetPoundVar(inst, 450, currentX)
+    
+    -- Get current work offset for display
+    local workOffset = mc.mcCntlGetPoundVar(inst, mc.SV_MOD_GROUP_14)
+    local offsetName = "G" .. string.format("%.0f", workOffset)
+    
+    -- Provide feedback
+    local msg = string.format("X position stored: %.4f (Machine coords) - Ready to set %s X center", 
+                             currentX, offsetName)
+    mc.mcCntlSetLastError(inst, msg)
+    
+    -- Visual feedback - make button green (with error handling)
+    local ok, err = pcall(function()
+        scr.SetProperty("btnSetX", "Bg Color", "#00FF00")
+        scr.SetProperty("btnSetX", "Fg Color", "#000000")  -- Black text
+        scr.SetProperty("btnSetX", "Label", "X Stored")
+        -- Also ensure Center button has default color
+        scr.SetProperty("btnCenterX", "Bg Color", "#4B4B4B")
+        scr.SetProperty("btnCenterX", "Fg Color", "#FFFFFF")  -- White text
+    end)
+    if not ok then
+        -- Button might not exist, but position is still stored
+        mc.mcCntlSetLastError(inst, msg .. " (Button update failed)")
+    end
+end
+function btnCenterX_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if not inst then
+        return
+    end
+    
+    -- Check machine state (0 = IDLE)
+    local state = mc.mcCntlGetState(inst)
+    if state ~= 0 then
+        mc.mcCntlSetLastError(inst, "ERROR: Machine must be idle to set datum")
+        return
+    end
+    
+    -- Check if X axis is enabled
+    local xEnabled = mc.mcAxisIsEnabled(inst, mc.X_AXIS)
+    if xEnabled ~= 1 then
+        mc.mcCntlSetLastError(inst, "ERROR: X axis is not enabled")
+        return
+    end
+    
+    -- Get stored X position from pound variable #450
+    local storedX = mc.mcCntlGetPoundVar(inst, 450)
+    
+    -- Check if position was previously stored
+    if storedX < -1e300 then
+        mc.mcCntlSetLastError(inst, "ERROR: No X position stored - Press 'Set X' first")
+        return
+    end
+    
+    -- Get current X position in machine coordinates
+    local currentX = mc.mcAxisGetMachinePos(inst, mc.X_AXIS)
+    if not currentX then
+        mc.mcCntlSetLastError(inst, "ERROR: Failed to get X position")
+        return
+    end
+    
+    -- Check that positions are different (avoid divide by zero conceptually)
+    if math.abs(currentX - storedX) < 0.0001 then
+        mc.mcCntlSetLastError(inst, "ERROR: Current position same as stored - move to opposite edge")
+        return
+    end
+    
+    -- Calculate center point
+    local centerX = (storedX + currentX) / 2
+    
+    -- Get current work offset
+    local workOffset = mc.mcCntlGetPoundVar(inst, mc.SV_MOD_GROUP_14)
+    local offsetNum = workOffset - 53  -- Convert G54-G59 to 1-6
+    
+    -- Validate work offset range
+    if offsetNum < 1 or offsetNum > 6 then
+        mc.mcCntlSetLastError(inst, "ERROR: Invalid work offset (must be G54-G59)")
+        return
+    end
+    
+    -- Calculate the offset value (where machine coord centerX = work coord 0)
+    local offsetValue = centerX
+    
+    -- Set the work offset for X axis
+    local poundVar = mc.SV_FIXTURES_START + ((offsetNum - 1) * mc.SV_FIXTURES_INC)
+    mc.mcCntlSetPoundVar(inst, poundVar, offsetValue)
+    
+    -- Apply the work offset by re-selecting it
+    mc.mcCntlGcodeExecuteWait(inst, string.format("G%d", workOffset))
+    
+    -- Clear stored value
+    mc.mcCntlSetPoundVar(inst, 450, -1.79e308)
+    
+    -- Reset button appearance (with error handling)
+    pcall(function()
+        scr.SetProperty("btnSetX", "Bg Color", "#4B4B4B")
+        scr.SetProperty("btnSetX", "Fg Color", "#FFFFFF")  -- White text
+        scr.SetProperty("btnSetX", "Label", "Set X")
+    end)
+    
+    -- Provide detailed feedback
+    local msg = string.format("X datum set to center: First=%.4f, Second=%.4f, Center=%.4f (G%d X0)", 
+                             storedX, currentX, centerX, workOffset)
+    mc.mcCntlSetLastError(inst, msg)
+end
+function bmbProbeOutsideCenter_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "OutsideCenter.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function btnCenterY_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if not inst then
+        return
+    end
+    
+    -- Check machine state (0 = IDLE)
+    local state = mc.mcCntlGetState(inst)
+    if state ~= 0 then
+        mc.mcCntlSetLastError(inst, "ERROR: Machine must be idle to set datum")
+        return
+    end
+    
+    -- Check if Y axis is enabled
+    local yEnabled = mc.mcAxisIsEnabled(inst, mc.Y_AXIS)
+    if yEnabled ~= 1 then
+        mc.mcCntlSetLastError(inst, "ERROR: Y axis is not enabled")
+        return
+    end
+    
+    -- Get stored Y position from pound variable #451
+    local storedY = mc.mcCntlGetPoundVar(inst, 451)
+    
+    -- Check if position was previously stored
+    if storedY < -1e300 then
+        mc.mcCntlSetLastError(inst, "ERROR: No Y position stored - Press 'Set Y' first")
+        return
+    end
+    
+    -- Get current Y position in machine coordinates
+    local currentY = mc.mcAxisGetMachinePos(inst, mc.Y_AXIS)
+    if not currentY then
+        mc.mcCntlSetLastError(inst, "ERROR: Failed to get Y position")
+        return
+    end
+    
+    -- Check that positions are different (avoid setting center at same point)
+    if math.abs(currentY - storedY) < 0.0001 then
+        mc.mcCntlSetLastError(inst, "ERROR: Current position same as stored - move to opposite edge")
+        return
+    end
+    
+    -- Calculate center point
+    local centerY = (storedY + currentY) / 2
+    
+    -- Get current work offset
+    local workOffset = mc.mcCntlGetPoundVar(inst, mc.SV_MOD_GROUP_14)
+    local offsetNum = workOffset - 53  -- Convert G54-G59 to 1-6
+    
+    -- Validate work offset range
+    if offsetNum < 1 or offsetNum > 6 then
+        mc.mcCntlSetLastError(inst, "ERROR: Invalid work offset (must be G54-G59)")
+        return
+    end
+    
+    -- Calculate the offset value for Y axis
+    -- Y offset is stored at FIXTURES_START + ((offsetNum - 1) * FIXTURES_INC) + 1
+    local poundVar = mc.SV_FIXTURES_START + ((offsetNum - 1) * mc.SV_FIXTURES_INC) + 1
+    mc.mcCntlSetPoundVar(inst, poundVar, centerY)
+    
+    -- Apply the work offset by re-selecting it
+    mc.mcCntlGcodeExecuteWait(inst, string.format("G%d", workOffset))
+    
+    -- Clear stored value
+    mc.mcCntlSetPoundVar(inst, 451, -1.79e308)
+    
+    -- Reset button appearance (with error handling)
+    pcall(function()
+        scr.SetProperty("btnSetY", "Bg Color", "#4B4B4B")
+        scr.SetProperty("btnSetY", "Fg Color", "#FFFFFF")  -- White text
+        scr.SetProperty("btnSetY", "Label", "Set Y")
+    end)
+    
+    -- Provide detailed feedback
+    local msg = string.format("Y datum set to center: First=%.4f, Second=%.4f, Center=%.4f (G%d Y0)", 
+                             storedY, currentY, centerY, workOffset)
+    mc.mcCntlSetLastError(inst, msg)
+end
+function btnSetY_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if not inst then
+        return
+    end
+    
+    -- Check machine state (0 = IDLE)
+    local state = mc.mcCntlGetState(inst)
+    if state ~= 0 then
+        mc.mcCntlSetLastError(inst, "ERROR: Machine must be idle to set datum")
+        return
+    end
+    
+    -- Check if Y axis is enabled
+    local yEnabled = mc.mcAxisIsEnabled(inst, mc.Y_AXIS)
+    if yEnabled ~= 1 then
+        mc.mcCntlSetLastError(inst, "ERROR: Y axis is not enabled")
+        return
+    end
+    
+    -- Get current Y position in machine coordinates
+    local currentY = mc.mcAxisGetMachinePos(inst, mc.Y_AXIS)
+    if not currentY then
+        mc.mcCntlSetLastError(inst, "ERROR: Failed to get Y position")
+        return
+    end
+    
+    -- Store in pound variable #451
+    mc.mcCntlSetPoundVar(inst, 451, currentY)
+    
+    -- Get current work offset for display
+    local workOffset = mc.mcCntlGetPoundVar(inst, mc.SV_MOD_GROUP_14)
+    local offsetName = "G" .. string.format("%.0f", workOffset)
+    
+    -- Provide feedback
+    local msg = string.format("Y position stored: %.4f (Machine coords) - Ready to set %s Y center", 
+                             currentY, offsetName)
+    mc.mcCntlSetLastError(inst, msg)
+    
+    -- Visual feedback - make button green (with error handling)
+    local ok, err = pcall(function()
+        scr.SetProperty("btnSetY", "Bg Color", "#00FF00")
+        scr.SetProperty("btnSetY", "Fg Color", "#000000")  -- Black text
+        scr.SetProperty("btnSetY", "Label", "Y Stored")
+        -- Also ensure Center button has default color
+        scr.SetProperty("btnCenterY", "Bg Color", "#4B4B4B")
+        scr.SetProperty("btnCenterY", "Fg Color", "#FFFFFF")  -- White text
+    end)
+    if not ok then
+        -- Button might not exist, but position is still stored
+        mc.mcCntlSetLastError(inst, msg .. " (Button update failed)")
+    end
+end
+function bmbProbeAngle_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "FindAngle.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function bmbProbeInsideCorner_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "InsideCorner.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function bmbProbeInsideCenter_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "InsideCenter.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function bmbProbeBore_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "ProbeBore.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function bmbProbeBoss_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "ProbeBoss.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+-- grpProbeJogging-GlobalScript
+function btnJogZMINUS_1__Left_Down_Script(...)
+    -- ===== Z- JOG BUTTON =====
+    -- Left Down Script:
+    local inst = mc.mcGetInstance()
+    mc.mcJogVelocityStop(inst, mc.Z_AXIS)
+    
+    local zEnabled = mc.mcAxisIsEnabled(inst, mc.Z_AXIS)
+    local zHomed = mc.mcAxisIsHomed(inst, mc.Z_AXIS)
+    
+    if zEnabled == 1 and zHomed ~= 1 then
+        if not _G.HOMING_WARNING_IGNORED then
+            if CheckHomingBeforeMove then
+                local result = CheckHomingBeforeMove()
+                if result then
+                    _G.HOMING_WARNING_IGNORED = true
+                    mc.mcCntlSetLastError(inst, "Warning ignored - press jog button again to move")
+                end
+                return
+            else
+                mc.mcCntlSetLastError(inst, "Z not homed - jog blocked")
+                return
+            end
+        end
+    end
+    
+    mc.mcJogVelocityStart(inst, mc.Z_AXIS, -1)
+    
+    
+end
+function btnJogZMINUS_1__Left_Up_Script(...)
+    -- Left Up Script:
+    local inst = mc.mcGetInstance()
+    mc.mcJogVelocityStop(inst, mc.Z_AXIS)
+end
+function btnJogYMINUS_1__Left_Down_Script(...)
+    -- ===== Y- JOG BUTTON =====
+    -- Left Down Script:
+    local inst = mc.mcGetInstance()
+    mc.mcJogVelocityStop(inst, mc.Y_AXIS)
+    
+    local yEnabled = mc.mcAxisIsEnabled(inst, mc.Y_AXIS)
+    local yHomed = mc.mcAxisIsHomed(inst, mc.Y_AXIS)
+    
+    if yEnabled == 1 and yHomed ~= 1 then
+        if not _G.HOMING_WARNING_IGNORED then
+            if CheckHomingBeforeMove then
+                local result = CheckHomingBeforeMove()
+                if result then
+                    _G.HOMING_WARNING_IGNORED = true
+                    mc.mcCntlSetLastError(inst, "Warning ignored - press jog button again to move")
+                end
+                return
+            else
+                mc.mcCntlSetLastError(inst, "Y not homed - jog blocked")
+                return
+            end
+        end
+    end
+    
+    mc.mcJogVelocityStart(inst, mc.Y_AXIS, -1)
+    
+    
+end
+function btnJogYMINUS_1__Left_Up_Script(...)
+    -- Left Up Script:
+    local inst = mc.mcGetInstance()
+    mc.mcJogVelocityStop(inst, mc.Y_AXIS)
+end
+function btnJogXMINUS_1__Left_Down_Script(...)
+    -- ===== X- JOG BUTTON =====
+    -- Left Down Script:
+    local inst = mc.mcGetInstance()
+    mc.mcJogVelocityStop(inst, mc.X_AXIS)
+    
+    local xEnabled = mc.mcAxisIsEnabled(inst, mc.X_AXIS)
+    local xHomed = mc.mcAxisIsHomed(inst, mc.X_AXIS)
+    
+    if xEnabled == 1 and xHomed ~= 1 then
+        if not _G.HOMING_WARNING_IGNORED then
+            if CheckHomingBeforeMove then
+                local result = CheckHomingBeforeMove()
+                if result then
+                    _G.HOMING_WARNING_IGNORED = true
+                    mc.mcCntlSetLastError(inst, "Warning ignored - press jog button again to move")
+                end
+                return
+            else
+                mc.mcCntlSetLastError(inst, "X not homed - jog blocked")
+                return
+            end
+        end
+    end
+    
+    mc.mcJogVelocityStart(inst, mc.X_AXIS, -1)
+    
+    
+end
+function btnJogXMINUS_1__Left_Up_Script(...)
+    -- Left Up Script:
+    local inst = mc.mcGetInstance()
+    mc.mcJogVelocityStop(inst, mc.X_AXIS)
+end
+function btnJogXPlus_1__Left_Down_Script(...)
+    -- ===== X+ JOG BUTTON =====
+    -- Left Down Script:
+    local inst = mc.mcGetInstance()
+    mc.mcJogVelocityStop(inst, mc.X_AXIS)
+    
+    local xEnabled = mc.mcAxisIsEnabled(inst, mc.X_AXIS)
+    local xHomed = mc.mcAxisIsHomed(inst, mc.X_AXIS)
+    
+    if xEnabled == 1 and xHomed ~= 1 then
+        -- Check if user already chose to ignore warnings this session
+        if not _G.HOMING_WARNING_IGNORED then
+            if CheckHomingBeforeMove then
+                local result = CheckHomingBeforeMove()
+                if result then
+                    -- User chose to ignore - set flag but DON'T jog yet
+                    _G.HOMING_WARNING_IGNORED = true
+                    mc.mcCntlSetLastError(inst, "Warning ignored - press jog button again to move")
+                end
+                return -- Exit either way - no jog on first press
+            else
+                mc.mcCntlSetLastError(inst, "X not homed - jog blocked")
+                return
+            end
+        end
+        -- If we get here, warning was previously ignored - allow jog
+    end
+    
+    mc.mcJogVelocityStart(inst, mc.X_AXIS, 1)
+end
+function btnJogXPlus_1__Left_Up_Script(...)
+    -- Left Up Script:
+    local inst = mc.mcGetInstance()
+    mc.mcJogVelocityStop(inst, mc.X_AXIS)
+end
+function btnJogZPlus_1__Left_Down_Script(...)
+    -- ===== Z+ JOG BUTTON =====
+    -- Left Down Script:
+    local inst = mc.mcGetInstance()
+    mc.mcJogVelocityStop(inst, mc.Z_AXIS)
+    
+    local zEnabled = mc.mcAxisIsEnabled(inst, mc.Z_AXIS)
+    local zHomed = mc.mcAxisIsHomed(inst, mc.Z_AXIS)
+    
+    if zEnabled == 1 and zHomed ~= 1 then
+        if not _G.HOMING_WARNING_IGNORED then
+            if CheckHomingBeforeMove then
+                local result = CheckHomingBeforeMove()
+                if result then
+                    _G.HOMING_WARNING_IGNORED = true
+                    mc.mcCntlSetLastError(inst, "Warning ignored - press jog button again to move")
+                end
+                return
+            else
+                mc.mcCntlSetLastError(inst, "Z not homed - jog blocked")
+                return
+            end
+        end
+    end
+    
+    mc.mcJogVelocityStart(inst, mc.Z_AXIS, 1)
+    
+end
+function btnJogZPlus_1__Left_Up_Script(...)
+    -- Left Up Script:
+    local inst = mc.mcGetInstance()
+    mc.mcJogVelocityStop(inst, mc.Z_AXIS)
+end
+function btnJogYPlus_1__Left_Down_Script(...)
+    -- ===== Y+ JOG BUTTON =====
+    -- Left Down Script:
+    local inst = mc.mcGetInstance()
+    mc.mcJogVelocityStop(inst, mc.Y_AXIS)
+    
+    local yEnabled = mc.mcAxisIsEnabled(inst, mc.Y_AXIS)
+    local yHomed = mc.mcAxisIsHomed(inst, mc.Y_AXIS)
+    
+    if yEnabled == 1 and yHomed ~= 1 then
+        if not _G.HOMING_WARNING_IGNORED then
+            if CheckHomingBeforeMove then
+                local result = CheckHomingBeforeMove()
+                if result then
+                    _G.HOMING_WARNING_IGNORED = true
+                    mc.mcCntlSetLastError(inst, "Warning ignored - press jog button again to move")
+                end
+                return
+            else
+                mc.mcCntlSetLastError(inst, "Y not homed - jog blocked")
+                return
+            end
+        end
+    end
+    
+    mc.mcJogVelocityStart(inst, mc.Y_AXIS, 1)
+    
+    
+end
+function btnJogYPlus_1__Left_Up_Script(...)
+    -- Left Up Script:
+    local inst = mc.mcGetInstance()
+    mc.mcJogVelocityStop(inst, mc.Y_AXIS)
+end
+function btnKeyboardJog_1_Left_Up_Script(...)
+    KeyboardInputsToggle()
+end
+function droJogRate_2__On_Modify_Script(...)
+    local inst = mc.mcGetInstance()
+    local val = scr.GetProperty("droJogRate", "Value")
+    mc.mcProfileWriteString(inst, "PersistentDROs", "droJogRate", string.format (val)) --Create a register and write the machine coordinates to it
+end
+-- grpProbingPositioning-GlobalScript
+function droMachineX_1__On_Update_Script(...)
+    local val = select(1,...) -- Get the system value.
+    val = tonumber(val) -- The value may be a number or a string. Convert as needed.
+    DecToFrac(0)
+    return val -- the script MUST return a value, otherwise, the control will not be updated.
+end
+function droMachineY_1__On_Update_Script(...)
+    local val = select(1,...) -- Get the system value.
+    val = tonumber(val) -- The value may be a number or a string. Convert as needed.
+    DecToFrac(1)
+    return val -- the script MUST return a value, otherwise, the control will not be updated.
+end
+function droMachineZ_1__On_Update_Script(...)
+    local val = select(1,...) -- Get the system value.
+    val = tonumber(val) -- The value may be a number or a string. Convert as needed.
+    DecToFrac(2)
+    return val -- the script MUST return a value, otherwise, the control will not be updated.
+end
+function droCurrentX_1__On_Update_Script(...)
+    local val = select(1,...) -- Get the system value.
+    val = tonumber(val) -- The value may be a number or a string. Convert as needed.
+    DecToFrac(0)
+    return val -- the script MUST return a value, otherwise, the control will not be updated.
+end
+function droCurrentY_1__On_Update_Script(...)
+    local val = select(1,...) -- Get the system value.
+    val = tonumber(val) -- The value may be a number or a string. Convert as needed.
+    DecToFrac(1)
+    return val -- the script MUST return a value, otherwise, the control will not be updated.
+end
+function droCurrentZ_1__On_Update_Script(...)
+    local val = select(1,...) -- Get the system value.
+    val = tonumber(val) -- The value may be a number or a string. Convert as needed.
+    DecToFrac(2)
+    return val -- the script MUST return a value, otherwise, the control will not be updated.
+end
+function btnTargetMove_1__Left_Up_Script(...)
+      local inst = mc.mcGetInstance()
+      if not inst then return end
+    
+      local scriptPath = mc.mcCntlGetMachDir(inst) .. "\\Profiles\\BLP\\Scripts\\System\\TargetMove.txt"
+      local script = loadfile(scriptPath)
+      if script then script() else mc.mcCntlSetLastError(inst, "File not found") end
+end
+function tbtnG54_1_Down_Script(...)
+    local inst = mc.mcGetInstance()
+    local set = 54
+    
+    -- Execute the work offset change
+    mc.mcCntlMdiExecute(inst, string.format("G%.0f", set))
+    
+    -- Update all buttons using the screen load function
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+end
+function tbtnG55_1_Down_Script(...)
+    local inst = mc.mcGetInstance()
+    local set = 55
+    
+    -- Execute the work offset change
+    mc.mcCntlMdiExecute(inst, string.format("G%.0f", set))
+    
+    -- Update all buttons using the screen load function
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+end
+function tbtnG56_1_Down_Script(...)
+    local inst = mc.mcGetInstance()
+    local set = 56
+    
+    -- Execute the work offset change
+    mc.mcCntlMdiExecute(inst, string.format("G%.0f", set))
+    
+    -- Update all buttons using the screen load function
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+end
+function tbtnG57_1_Down_Script(...)
+    local inst = mc.mcGetInstance()
+    local set = 57
+    
+    -- Execute the work offset change
+    mc.mcCntlMdiExecute(inst, string.format("G%.0f", set))
+    
+    -- Update all buttons using the screen load function
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+end
+function tbtnG58_1_Down_Script(...)
+    local inst = mc.mcGetInstance()
+    local set = 58
+    
+    -- Execute the work offset change
+    mc.mcCntlMdiExecute(inst, string.format("G%.0f", set))
+    
+    -- Update all buttons using the screen load function
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+end
+function tbtnG59_1_Down_Script(...)
+    local inst = mc.mcGetInstance()
+    local set = 59
+    
+    -- Execute the work offset change
+    mc.mcCntlMdiExecute(inst, string.format("G%.0f", set))
+    
+    -- Update all buttons using the screen load function
+    if UpdateWorkOffsetButtons then
+        UpdateWorkOffsetButtons()
+    end
+end
+function droMyFix_2__On_Modify_Script(...)
+    inst = mc.mcGetInstance()
+    
+    local MyFix = scr.GetProperty("droMyFix", "Value")
+    MyFix = tonumber(MyFix)
+    if (MyFix > 0) and (MyFix) < 7 then
+        MyFix = MyFix + 53
+        mc.mcCntlGcodeExecute(inst, (string.format('G' .. MyFix)))
+    elseif (MyFix > 6) and (MyFix < 107) then
+    	MyFix = (MyFix - 6)
+    	mc.mcCntlGcodeExecute(inst, (string.format("G54.1 P" .. MyFix)))
+    else
+        wx.wxMessageBox("The fixtures you can call through this input are limited to 1-106 (G54-G54.1 P100).\n \nEnter a valid number (1-126) and try again.\n\n*** It will now default to 1 (G54) ***")
+        scr.SetProperty("droMyFix", "Value", "1")
+        mc.mcCntlGcodeExecute(inst, "G54")
+    end
+end
+function btnReturnHome_1__Left_Up_Script(...)
+    -- Return to Zero Button Script for Mach4 - Rapids Z to safe max (0), then XY to machine 0
+    mc.mcCntlSetLastError(mc.mcGetInstance(), "ZERO BUTTON CLICKED")
+    
+    local inst = mc.mcGetInstance()
+    
+    -- Check control state - must be idle
+    local controlState = mc.mcCntlGetState(inst)
+    if controlState ~= mc.MC_STATE_IDLE then
+        wx.wxMessageBox("Machine must be idle to return to zero!\n\nCurrent state: " .. tostring(controlState), 
+                        "Machine Not Idle", wx.wxOK + wx.wxICON_ERROR)
+        return
+    end
+    
+    -- Check if machine is homed
+    local xHomed = mc.mcAxisIsHomed(inst, mc.X_AXIS)
+    local yHomed = mc.mcAxisIsHomed(inst, mc.Y_AXIS) 
+    local zHomed = mc.mcAxisIsHomed(inst, mc.Z_AXIS)
+    
+    if not xHomed or not yHomed or not zHomed then
+        wx.wxMessageBox("Machine must be homed before returning to zero!\n\nPlease home all axes first.", 
+                        "Machine Not Homed", wx.wxOK + wx.wxICON_ERROR)
+        return
+    end
+    
+    -- Get soft limits for safe Z (assuming max Z=0 is safe)
+    local zMax = mc.mcAxisGetSoftlimitMax(inst, mc.Z_AXIS)
+    
+    -- Build G-code: Rapid Z to max safe first, then XY to 0 (machine coords)
+    local gcode = "G90\n"  -- Absolute mode
+    gcode = gcode .. string.format("G53 G0 Z%.4f\n", zMax)  -- Rapid Z to 0 (safe height)
+    gcode = gcode .. "G53 G0 X0 Y0\n"  -- Then XY to 0
+    
+    -- Log for sanity
+    mc.mcCntlSetLastError(inst, "Returning to machine X0 Y0 Z0 - Path clear?")
+    
+    -- Optional confirm dialog - uncomment if you want a safety net
+    -- if wx.wxMessageBox("Confirm return to machine zero?\nEnsure path is clear!", "Park Confirm", wx.wxYES_NO + wx.wxICON_WARNING) ~= wx.wxID_YES then
+    --     return
+    -- end
+    
+    -- Execute
+    local rc = mc.mcCntlGcodeExecuteWait(inst, gcode)
+    if rc ~= mc.MERROR_NOERROR then
+        wx.wxMessageBox("Return to zero failed! Error: " .. tostring(rc), "Zero Error", wx.wxOK + wx.wxICON_ERROR)
+    end
+end
+function btnProbeSettings_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    
+    -- Check if function exists before calling
+    if ShowProbeSettingsDialog then
+        ShowProbeSettingsDialog()
+    else
+        wx.wxMessageBox("Probe settings dialog not found.\n\n" ..
+                       "Please ensure ShowProbeSettingsDialog() function\n" ..
+                       "is added to your Screen Load Script.",
+                       "Configuration Error", 
+                       wx.wxOK + wx.wxICON_ERROR)
+    end
+end
+function SurfX_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "ProbeXY.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function SurfZNEG_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "-ZProbe.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function btnTouchProbe_Left_Up_Script(...)
+    -- ProbeDown button clicked script
+    local inst = mc.mcGetInstance()
+    local currentTool = mc.mcToolGetCurrent(inst)
+    
+    if currentTool == 90 then
+        mc.mcCntlMdiExecute(inst, "T0 M6")
+    else
+        mc.mcCntlMdiExecute(inst, "T90 M6")
+    end
+    
+    -- Clear manual override when toggling automation
+    if ClearDustBootOverride then
+        ClearDustBootOverride()
+    end
+end
+function bmbLaserCut_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "LaserCuttingWizard.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function bmbLaserRaster_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "LaserRasterWizard.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+-- nbpSurfaceMap-GlobalScript
+function checkmaps(action)
+	local inst = mc.mcGetInstance("SMap list pop")
+	local MapNumber = {}	--Might not want this to be local... but I guess I'll pass the info 
+	local selected = scr.GetProperty("lst(Maps)", "Selected") -- Let's get the selected list entity in case we need it
+	local reg = mc.mcRegGetHandle(inst, "mcSurfaceMap0/smCommand")
+	resp, rc = mc.mcRegSendCommand(reg, "GET MAP LIST") --Grab the list of .dat files in the curr dir
+	local tkz = wx.wxStringTokenizer(resp, ("\n"));	--Makes a token for each segment ending in \n
+	local i = 0 -- Counter
+	rc = scr.SetProperty("lst(Maps)","Strings","") --CLEAR LIST BEFORE WE WRITE TO IT
+	--The below function will update the maps list. I need to do it before and after an operation... so that's what we're gonna do
+	function updatelist(tkz)
+		rc = scr.SetProperty("lst(Maps)","Strings","") --CLEAR LIST BEFORE WE WRITE TO IT
+		resp, rc = mc.mcRegSendCommand(reg, "GET MAP LIST") --Grab the list of .dat files in the curr dir
+		tkz = wx.wxStringTokenizer(resp, ("\n"));	--Makes a token for each segment ending in \n
+		while (tkz:HasMoreTokens()) do	--While we have more tokens, do this WORK
+			local token = tkz:GetNextToken()
+			local start, finish = string.find(tostring(token), ",1") --Here we're looking if the string has a ,1... if it does it's active
+			--"C:\\Mach4Hobby4866\\Profiles\\Mach4Mill\\zLevelMap0.dat,1\nC:\\Mach4Hobby4866\\Profiles\\Mach4Mill\\zLevelMap1.dat,1\n
+			if (start ~= nil) then
+				local new = string.gsub(tostring(token) , ",1", "") --Now I remove the ,1 or ,0 from the file name and put in table.
+				new = "ACTIVE -" .. tostring(new)
+				MapNumber[tostring(i)] = tostring(new)
+				local currcontent = scr.GetProperty("lst(Maps)", "Strings")
+					if (currcontent == "") then
+						newcontent = tostring(new) .. "|"
+					else
+						newcontent = tostring(currcontent) .. "|" .. tostring(new) .. "|"
+					end
+				rc = scr.SetProperty("lst(Maps)", "Strings", newcontent)
+			else
+				local new = string.gsub(tostring(token) , ",0", "") --Now I remove the ,1 or ,0 from the file name and put in table.
+				new = "INACTIVE -" .. tostring(new)
+				MapNumber[tostring(i)] = tostring(new)
+				local currcontent = scr.GetProperty("lst(Maps)", "Strings")
+					if (currcontent == "") then
+						newcontent = tostring(new) .. "|"
+					else
+						newcontent = tostring(currcontent) .. "|" .. tostring(new) .. "|"
+					end
+				rc = scr.SetProperty("lst(Maps)", "Strings", newcontent)
+			end
+			i = i + 1
+		end
+	end
+	updatelist(tkz) --UPDATE LIST EVERY TIME WE CALL THIS FUNCTION
+	
+		if (action == "enable") and (tostring(selected) ~= "-1") then	--IF ENABLE IS ACTION
+			--Here we're going to get the selected string from the map list and enable (or disable) it
+			--and we already have the map data because we ran this func
+			--now with the selected number I can check the map list and see if it's "ACTIVE"
+			str = MapNumber[tostring(selected)] --This is the map number as well...
+			start, finish = string.find(tostring(str), "INACTIVE") --Here we're looking if the string says active
+			if (start ~= nil) then 
+				--We have to activate the map
+				selected = tonumber(selected) + 1
+				resp, rc = mc.mcRegSendCommand(reg, "SET MAP " .. tostring(selected) .. " ENABLED") --Grab the list of .dat files in the curr dir
+				updatelist(tkz) -- NOW UPDATE LIST AGAIN TO SHOW WE ACTIVATED IT
+			else
+				--Leave it alone
+				return
+			end
+		elseif (action == "disable") and (tostring(selected) ~= "-1") then			--IF DISABLE IS ACTION
+			str = MapNumber[tostring(selected)] --This is the map number as well...
+			start, finish = string.find(tostring(str), "INACTIVE") --Here we're looking if the string says active
+			if (start == nil) then 
+				--We have to activate the map
+				selected = tonumber(selected) + 1
+				resp, rc = mc.mcRegSendCommand(reg, "SET MAP " .. tostring(selected) .. " DISABLED") --Grab the list of .dat files in the curr dir
+				updatelist(tkz) -- NOW UPDATE LIST AGAIN TO SHOW WE ACTIVATED IT
+			else
+				return
+			end
+		end
+		rc = scr.SetProperty("lst(Maps)","Selected", tostring(selected))
+	return maps
+end
+function btnMapEnable_Clicked_Script(...)
+    checkmaps("enable")
+    
+end
+function btnDisableMap_Clicked_Script(...)
+    checkmaps("disable")
+end
+function tmr_3__Timer_Event_Script(...)
+    --checkmaps(action)
+end
+-- nbpDebug-GlobalScript
+function btnClearCache_Left_Up_Script(...)
+    -- Mach4 Clear Cache & Debug Button Script
+    -- Version 2.0 - Detailed status bar output with fixed API calls
+    -- Place this in any button's "Left Up Script" or call ClearCacheDebug() from elsewhere
+    
+    function ClearCacheDebug()
+        local inst = mc.mcGetInstance()
+        local report = {}  -- Collect all messages
+        local errors = {}  -- Collect any errors
+        local startTime = os.clock()
+        local statusMessages = {}  -- For detailed status bar output
+        
+        -- Helper function to output to status bar
+        local function statusPrint(msg)
+            table.insert(statusMessages, msg)
+            mc.mcCntlSetLastError(inst, msg)
+            wx.wxMilliSleep(50)  -- Small delay so messages are visible
+        end
+        
+        -- Helper function to safely execute and report
+        local function safeExecute(description, func)
+            local success, result = pcall(func)
+            if success then
+                if result ~= nil then
+                    local msg = "✓ " .. description .. ": " .. tostring(result)
+                    table.insert(report, msg)
+                    statusPrint(msg)  -- Also output to status
+                else
+                    local msg = "✓ " .. description
+                    table.insert(report, msg)
+                    statusPrint(msg)
+                end
+                return true, result
+            else
+                local errorMsg = "✗ " .. description .. " FAILED: " .. tostring(result)
+                table.insert(errors, errorMsg)
+                table.insert(report, errorMsg)
+                statusPrint(errorMsg)  -- Output errors to status
+                return false, nil
+            end
+        end
+        
+        -- Start report
+        statusPrint("=== STARTING CACHE CLEAR & DEBUG ===")
+        table.insert(report, "Time: " .. os.date("%Y-%m-%d %H:%M:%S"))
+        
+        -- 1. Memory state before
+        local memBefore = 0
+        safeExecute("Initial memory", function()
+            memBefore = collectgarbage("count")
+            return string.format("%.3f MB (%.0f KB)", memBefore / 1024, memBefore)
+        end)
+        
+        -- 2. Check and clear toolpath (with better error handling)
+        safeExecute("Toolpath check", function()
+            local result = {}
+            
+            -- Try to check if toolpath functions exist first
+            if mc.mcToolPathClear then
+                -- Clear the toolpath
+                local ok, err = pcall(mc.mcToolPathClear, inst)
+                if ok then
+                    table.insert(result, "Cleared")
+                else
+                    table.insert(result, "Clear failed")
+                end
+            else
+                table.insert(result, "No toolpath API")
+            end
+            
+            -- Try to disable toolpath generation (may not exist in all versions)
+            if mc.mcToolPathSetVisible then
+                local ok = pcall(mc.mcToolPathSetVisible, inst, 0)
+                if ok then table.insert(result, "Hidden") end
+            end
+            
+            return table.concat(result, ", ")
+        end)
+        
+        -- 3. Clear motion planner
+        safeExecute("Motion planner", function()
+            -- Check if motion planner clear exists
+            if mc.mcMotionClearPlanner then
+                mc.mcMotionClearPlanner(inst)
+                return "Cleared"
+            else
+                -- Alternative: Execute a null move to flush
+                mc.mcCntlGcodeExecuteWait(inst, "G4 P0")
+                return "Flushed with dwell"
+            end
+        end)
+        
+        -- 4. Check for stuck coroutines (more detailed)
+        safeExecute("Coroutine scan", function()
+            local threads = {}
+            local threadDetails = {}
+            local count = 0
+            local activeCount = 0
+            
+            for k, v in pairs(_G) do
+                if type(v) == "thread" then
+                    count = count + 1
+                    local status = coroutine.status(v)
+                    if status ~= "dead" then
+                        activeCount = activeCount + 1
+                        -- Try to get more info
+                        local info = debug.getinfo(v, 1)
+                        if info then
+                            table.insert(threadDetails, string.format("%s[%s@%s:%d]", 
+                                tostring(k), status, info.short_src or "?", info.currentline or 0))
+                        else
+                            table.insert(threadDetails, string.format("%s[%s]", tostring(k), status))
+                        end
+                    end
+                end
+            end
+            
+            if activeCount > 0 then
+                return string.format("%d total, %d active: %s", 
+                    count, activeCount, table.concat(threadDetails, "; "))
+            elseif count > 0 then
+                return string.format("%d threads (all dead)", count)
+            else
+                return "No threads found"
+            end
+        end)
+        
+        -- 5. Check global table sizes with more detail
+        safeExecute("Memory leak scan", function()
+            local bigTables = {}
+            local totalTables = 0
+            local suspiciousTables = 0
+            
+            for k, v in pairs(_G) do
+                if type(v) == "table" then
+                    totalTables = totalTables + 1
+                    local size = 0
+                    local hasFunction = false
+                    local hasThread = false
+                    
+                    -- Safely count table size and check contents
+                    local ok, result = pcall(function()
+                        for key, val in pairs(v) do
+                            size = size + 1
+                            if type(val) == "function" then hasFunction = true end
+                            if type(val) == "thread" then hasThread = true end
+                            if size > 10000 then 
+                                suspiciousTables = suspiciousTables + 1
+                                break  -- Stop counting huge tables
+                            end
+                        end
+                    end)
+                    
+                    if ok and size > 100 then
+                        local flags = ""
+                        if hasFunction then flags = flags .. "F" end
+                        if hasThread then flags = flags .. "T" end
+                        if size > 1000 then flags = flags .. "!" end
+                        table.insert(bigTables, string.format("%s(%d%s)", k, size, flags))
+                    end
+                end
+            end
+            
+            local result = string.format("%d tables", totalTables)
+            if #bigTables > 0 then
+                result = result .. ", Large: " .. table.concat(bigTables, ", ")
+            end
+            if suspiciousTables > 0 then
+                result = result .. string.format(" [%d SUSPICIOUS!]", suspiciousTables)
+            end
+            return result
+        end)
+        
+        -- 6. Clear status history (multiple methods)
+        safeExecute("Status history", function()
+            local methods = {}
+            
+            -- Method 1: Clear history if function exists
+            if mc.mcCntlClearStatusHistory then
+                local ok = pcall(mc.mcCntlClearStatusHistory, inst)
+                if ok then table.insert(methods, "API") end
+            end
+            
+            -- Method 2: Flood with empty messages
+            for i = 1, 20 do
+                mc.mcCntlSetLastError(inst, "")
+            end
+            table.insert(methods, "Flooded")
+            
+            return "Cleared via: " .. table.concat(methods, "+")
+        end)
+        
+        -- 7. Deep check PLC variables
+        safeExecute("PLC variable audit", function()
+            local issues = {}
+            local details = {}
+            
+            -- Virtual tool state
+            local virtTool = mc.mcCntlGetPoundVar(inst, 406)
+            if virtTool > 0 then
+                table.insert(issues, string.format("VirtualTool=#406=%.0f", virtTool))
+                -- Check related vars
+                local xDelta = mc.mcCntlGetPoundVar(inst, 407)
+                local yDelta = mc.mcCntlGetPoundVar(inst, 408)
+                if xDelta ~= 0 or yDelta ~= 0 then
+                    table.insert(details, string.format("Deltas: X=%.4f Y=%.4f", xDelta, yDelta))
+                end
+            end
+            
+            -- M6 suppression
+            local m6Suppress = mc.mcCntlGetPoundVar(inst, 498)
+            if m6Suppress > 0 then
+                table.insert(issues, string.format("M6Suppress=#498=%.0f", m6Suppress))
+                mc.mcCntlSetPoundVar(inst, 498, 0)  -- Clear it
+                table.insert(details, "M6 suppression cleared")
+            end
+            
+            -- Tool change in progress
+            local m6Running = mc.mcCntlGetPoundVar(inst, 499)
+            if m6Running > 0 then
+                table.insert(issues, string.format("M6Running=#499=%.0f", m6Running))
+            end
+            
+            -- Probe state
+            local probeState = mc.mcCntlGetPoundVar(inst, 496)
+            if probeState > 0 then
+                table.insert(issues, string.format("ProbeFlag=#496=%.0f", probeState))
+            end
+            
+            -- Dust collection states
+            local dustStates = {}
+            local dust400 = mc.mcCntlGetPoundVar(inst, 400)
+            local dust401 = mc.mcCntlGetPoundVar(inst, 401)
+            local dust402 = mc.mcCntlGetPoundVar(inst, 402)
+            if dust400 > 0 then table.insert(dustStates, "DustAuto=ON") end
+            if dust401 > 0 then table.insert(dustStates, "VacAuto=ON") end
+            if dust402 > 0 then table.insert(dustStates, "BootAuto=ON") end
+            
+            local result = ""
+            if #issues > 0 then
+                result = table.concat(issues, ", ")
+            else
+                result = "All normal"
+            end
+            
+            if #details > 0 then
+                result = result .. " [" .. table.concat(details, "; ") .. "]"
+            end
+            
+            if #dustStates > 0 then
+                result = result .. " Dust: " .. table.concat(dustStates, ", ")
+            end
+            
+            return result
+        end)
+        
+        -- 8. Detailed signal check
+        safeExecute("Hardware signals", function()
+            local outputs = {}
+            local inputs = {}
+            local problem = {}
+            
+            -- Check all outputs
+            local outputChecks = {
+                {mc.OSIG_OUTPUT1, "Laser", true},      -- true = problem if on
+                {mc.OSIG_OUTPUT2, "ToolRelease", true},
+                {mc.OSIG_OUTPUT3, "DustBoot", false},  -- false = normal if on
+                {mc.OSIG_OUTPUT4, "DustCollect", false},
+                {mc.OSIG_OUTPUT5, "Vacuum1", false},
+                {mc.OSIG_OUTPUT6, "Vacuum2", false},
+                {mc.OSIG_OUTPUT7, "Probe", true},
+            }
+            
+            for _, cfg in ipairs(outputChecks) do
+                local handle = mc.mcSignalGetHandle(inst, cfg[1])
+                if handle and handle > 0 then
+                    local state = mc.mcSignalGetState(handle)
+                    if state == 1 then
+                        table.insert(outputs, cfg[2])
+                        if cfg[3] then  -- This is a problem
+                            table.insert(problem, cfg[2] .. "!")
+                        end
+                    end
+                end
+            end
+            
+            -- Check critical inputs
+            local inputChecks = {
+                {mc.ISIG_PROBE, "ProbeTrig"},
+                {mc.ISIG_INPUT6, "LowAir"},
+                {mc.ISIG_INPUT17, "ToolPresent"},
+            }
+            
+            for _, cfg in ipairs(inputChecks) do
+                local handle = mc.mcSignalGetHandle(inst, cfg[1])
+                if handle and handle > 0 then
+                    local state = mc.mcSignalGetState(handle)
+                    if state == 1 then
+                        table.insert(inputs, cfg[2])
+                    end
+                end
+            end
+            
+            local result = ""
+            if #outputs > 0 then
+                result = "Out:" .. table.concat(outputs, ",")
+            end
+            if #inputs > 0 then
+                if result ~= "" then result = result .. " " end
+                result = result .. "In:" .. table.concat(inputs, ",")
+            end
+            if #problem > 0 then
+                result = result .. " PROBLEMS:" .. table.concat(problem, ",")
+            end
+            
+            if result == "" then
+                result = "All signals normal"
+            end
+            
+            return result
+        end)
+        
+        -- 9. Multi-pass garbage collection with details
+        safeExecute("Garbage collection", function()
+            local passes = {}
+            local totalFreed = 0
+            
+            -- Stop automatic GC temporarily
+            local oldPause = collectgarbage("setpause", 300)
+            local oldMul = collectgarbage("setstepmul", 400)
+            
+            for i = 1, 5 do
+                local before = collectgarbage("count")
+                
+                if i <= 2 then
+                    collectgarbage("collect")  -- Full collection
+                else
+                    collectgarbage("step", 100)  -- Incremental
+                end
+                
+                local after = collectgarbage("count")
+                local freed = before - after
+                totalFreed = totalFreed + freed
+                
+                if freed > 10 then  -- Only report significant frees
+                    table.insert(passes, string.format("P%d:%.1fK", i, freed))
+                end
+            end
+            
+            -- Restore GC settings
+            collectgarbage("setpause", oldPause)
+            collectgarbage("setstepmul", oldMul)
+            collectgarbage("restart")
+            
+            if #passes > 0 then
+                return string.format("%.1fKB total [%s]", totalFreed, table.concat(passes, " "))
+            else
+                return "Nothing significant to collect"
+            end
+        end)
+        
+        -- 10. File handle check
+        safeExecute("File handles", function()
+            local openFiles = {}
+            local count = 0
+            
+            -- Check common file variable names
+            local fileVars = {"logFile", "debugFile", "probeLog", "file", "f", 
+                             "input", "output", "handle", "csvFile", "dataFile"}
+            
+            for _, varName in ipairs(fileVars) do
+                local var = _G[varName]
+                if var then
+                    local varType = type(var)
+                    if varType == "userdata" or (varType == "table" and var.close) then
+                        count = count + 1
+                        table.insert(openFiles, varName)
+                    end
+                end
+            end
+            
+            -- Check for io library default files
+            if io.input() ~= io.stdin then
+                count = count + 1
+                table.insert(openFiles, "io.input")
+            end
+            if io.output() ~= io.stdout then
+                count = count + 1
+                table.insert(openFiles, "io.output")
+            end
+            
+            if count > 0 then
+                return string.format("%d open: %s", count, table.concat(openFiles, ", "))
+            else
+                return "No open files detected"
+            end
+        end)
+        
+        -- 11. Screen and timer check
+        safeExecute("Screen/Timer check", function()
+            local info = {}
+            
+            -- Check screen refresh rate
+            local refreshOk, rate = pcall(scr.GetProperty, "MainScreen", "Refresh Rate")
+            if refreshOk and rate then
+                table.insert(info, "Refresh:" .. rate .. "ms")
+            end
+            
+            -- Count screen controls (might be causing lag)
+            local controlCount = 0
+            local droCount = 0
+            local ledCount = 0
+            
+            -- Sample check for common control names
+            for i = 0, 100 do
+                if pcall(scr.GetProperty, "dro" .. i, "Value") then droCount = droCount + 1 end
+                if pcall(scr.GetProperty, "led" .. i, "Value") then ledCount = ledCount + 1 end
+            end
+            
+            if droCount > 0 then table.insert(info, "DROs:" .. droCount) end
+            if ledCount > 0 then table.insert(info, "LEDs:" .. ledCount) end
+            
+            -- Check for wx timers
+            local timerCount = 0
+            for k, v in pairs(_G) do
+                if type(v) == "userdata" and tostring(v):find("timer") then
+                    timerCount = timerCount + 1
+                end
+            end
+            if timerCount > 0 then table.insert(info, "Timers:" .. timerCount) end
+            
+            return table.concat(info, ", ")
+        end)
+        
+        -- 12. Final memory state
+        local memAfter = 0
+        local memFreed = 0
+        safeExecute("Final memory", function()
+            memAfter = collectgarbage("count")
+            memFreed = memBefore - memAfter
+            local percent = (memFreed / memBefore) * 100
+            return string.format("%.3f MB (freed %.3f MB = %.1f%%)", 
+                               memAfter / 1024, memFreed / 1024, percent)
+        end)
+        
+        -- 13. Execution time
+        local execTime = (os.clock() - startTime) * 1000
+        
+        -- Build final summary
+        local summary = string.format(
+            "=== CACHE CLEAR COMPLETE: %.1fms, Memory %.2f→%.2f MB (freed %.2f MB), Errors: %d ===",
+            execTime, memBefore / 1024, memAfter / 1024, memFreed / 1024, #errors
+        )
+        
+        -- Output final summary to status
+        wx.wxMilliSleep(100)  -- Small pause before summary
+        statusPrint(summary)
+        
+        -- Save to log file
+        safeExecute("Save log", function()
+            local profileName = mc.mcProfileGetName(inst)
+            local logPath = mc.mcCntlGetMachDir(inst) .. "\\Profiles\\" .. 
+                           profileName .. "\\CacheDebug_" .. os.date("%Y%m%d_%H%M%S") .. ".log"
+            local file = io.open(logPath, "w")
+            if file then
+                file:write(table.concat(report, "\n"))
+                file:write("\n\n=== Execution Time: " .. execTime .. " ms ===\n")
+                file:close()
+                return "Saved: " .. logPath:match("([^\\]+)$")
+            end
+            return "Could not write log"
+        end)
+        
+        -- Optional: Show dialog with full report (comment out if not wanted)
+        -- Uncomment the next 3 lines to see full report in a dialog
+        -- pcall(function()
+        --     wx.wxMessageBox(table.concat(report, "\n"), "Cache Debug Report", wx.wxOK + wx.wxICON_INFORMATION)
+        -- end)
+        
+        return true
+    end
+    
+    -- Execute the function
+    ClearCacheDebug()
+    
+    -- For standalone testing or alternate calling
+    -- return ClearCacheDebug
+end
+function btn_55__Left_Down_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "OutputsTrace.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function btn_56__Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    
+    -- Create diagnostic report
+    local report = {}
+    local function add(str) 
+        table.insert(report, str) 
+    end
+    
+    add("===========================================")
+    add("Z-AXIS LIMIT DIAGNOSTIC REPORT")
+    add("Generated: " .. os.date())
+    add("===========================================\n")
+    
+    -- 1. CURRENT MACHINE STATE
+    add("MACHINE STATE:")
+    add("-------------------")
+    local machEnabled = mc.mcSignalGetState(mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED))
+    local machState = mc.mcCntlGetState(inst)
+    local inCycle = mc.mcCntlIsInCycle(inst)
+    add(string.format("Machine Enabled: %s", machEnabled == 1 and "YES" or "NO"))
+    add(string.format("Machine State: %d", machState))
+    add(string.format("In Cycle: %s", inCycle == 1 and "YES" or "NO"))
+    
+    -- 2. Z-AXIS POSITIONS
+    add("\nZ-AXIS POSITIONS:")
+    add("-------------------")
+    local ok, zMachine = pcall(mc.mcAxisGetMachinePos, inst, 2)
+    if not ok then zMachine = -999 end
+    local ok, zWork = pcall(mc.mcAxisGetPos, inst, 2)
+    if not ok then zWork = -999 end
+    local zProbed = mc.mcCntlGetPoundVar(inst, 5073)  -- Last probed Z
+    
+    add(string.format("Z Machine Pos: %.4f", zMachine))
+    add(string.format("Z Work Pos: %.4f", zWork))
+    add(string.format("Last Probed Z: %.4f", zProbed))
+    
+    -- Check distance from home
+    if zMachine ~= -999 then
+        add(string.format("Distance from Z0: %.4f", math.abs(zMachine)))
+        if zMachine > 0 then
+            add("*** ERROR: Z IS ABOVE HOME (POSITIVE) ***")
+        end
+    end
+    
+    -- 3. HEIGHT OFFSET STATE
+    add("\nHEIGHT OFFSET:")
+    add("-------------------")
+    local currentTool = mc.mcToolGetCurrent(inst)
+    local hOffset = mc.mcCntlGetPoundVar(inst, 4120)  -- Active H number
+    local hMode = mc.mcCntlGetPoundVar(inst, 4008)    -- 43=G43, 49=G49
+    local ok, toolHeight = pcall(mc.mcToolGetData, inst, mc.MTOOL_MILL_HEIGHT, currentTool)
+    if not ok then toolHeight = 0 end
+    
+    add(string.format("Current Tool: T%d", currentTool))
+    add(string.format("Active H Offset: H%d", hOffset))
+    add(string.format("H Mode: %s", hMode == 43 and "G43" or hMode == 49 and "G49" or tostring(hMode)))
+    add(string.format("Tool Height: %.4f", toolHeight))
+    
+    -- Check for H mismatch
+    if currentTool > 0 and currentTool < 90 and hOffset ~= currentTool then
+        add("*** WARNING: Tool/H mismatch! ***")
+    end
+    
+    -- 4. SOFT LIMITS
+    add("\nSOFT LIMITS:")
+    add("-------------------")
+    local ok, softLimitOn = pcall(mc.mcSoftLimitGetState, inst, 2)
+    if not ok then softLimitOn = -1 end
+    local ok, softMax = pcall(mc.mcSoftLimitGetMax, inst, 2)
+    if not ok then softMax = 0 end
+    local ok, softMin = pcall(mc.mcSoftLimitGetMin, inst, 2)
+    if not ok then softMin = -999 end
+    
+    add(string.format("Soft Limits Enabled: %s", softLimitOn == 1 and "YES" or softLimitOn == 0 and "NO" or "ERROR"))
+    add(string.format("Z Soft Max: %.4f", softMax))
+    add(string.format("Z Soft Min: %.4f", softMin))
+    
+    -- Check if current position exceeds soft limits
+    if zMachine and zMachine ~= -999 and softMax then
+        if zMachine > softMax then
+            add(string.format("*** ERROR: Z position (%.4f) exceeds soft max (%.4f) ***", zMachine, softMax))
+        end
+    end
+    
+    -- 5. LIMIT SWITCHES
+    add("\nLIMIT SWITCHES:")
+    add("-------------------")
+    -- Check multiple possible limit signals with error handling
+    local limits = {
+        {mc.ISIG_MOTOR2_PLUS, "Z++ Limit"},
+        {mc.ISIG_MOTOR2_MINUS, "Z-- Limit"},
+        {mc.ISIG_MOTOR2_HOME, "Z Home"}
+    }
+    
+    for _, limit in ipairs(limits) do
+        local ok, handle = pcall(mc.mcSignalGetHandle, inst, limit[1])
+        if ok and handle and handle > 0 then
+            local ok2, state = pcall(mc.mcSignalGetState, handle)
+            if ok2 then
+                add(string.format("%s: %s", limit[2], state == 1 and "TRIGGERED" or "Clear"))
+                if state == 1 then
+                    add("*** ACTIVE LIMIT DETECTED ***")
+                end
+            else
+                add(string.format("%s: Error reading state", limit[2]))
+            end
+        end
+    end
+    
+    -- Also check generic limit override
+    local ok, limitOverride = pcall(mc.mcSignalGetHandle, inst, mc.OSIG_LIMIT_OVERRIDE)
+    if ok and limitOverride and limitOverride > 0 then
+        local ok2, state = pcall(mc.mcSignalGetState, limitOverride)
+        if ok2 then
+            add(string.format("Limit Override: %s", state == 1 and "ACTIVE" or "Inactive"))
+        end
+    end
+    
+    -- 6. WORK OFFSET
+    add("\nWORK OFFSET:")
+    add("-------------------")
+    local currentWCS = mc.mcCntlGetPoundVar(inst, 4014)  -- Modal group 14
+    local wcsZ = 0
+    if currentWCS >= 54 and currentWCS <= 59 then
+        local baseVar = 5221 + ((math.floor(currentWCS) - 54) * 20) + 2  -- +2 for Z
+        wcsZ = mc.mcCntlGetPoundVar(inst, baseVar)
+    end
+    add(string.format("Active WCS: G%.1f", currentWCS))
+    add(string.format("WCS Z Offset: %.4f", wcsZ))
+    
+    -- Calculate total Z offset
+    local totalOffset = wcsZ + (toolHeight or 0)
+    add(string.format("Total Z Offset: %.4f (WCS + Tool)", totalOffset))
+    
+    -- 7. VIRTUAL TOOL CHECK
+    add("\nVIRTUAL TOOL:")
+    add("-------------------")
+    local virtualTool = mc.mcCntlGetPoundVar(inst, 406)
+    if virtualTool >= 90 then
+        add(string.format("*** Virtual Tool T%d Active ***", virtualTool))
+        local xDelta = mc.mcCntlGetPoundVar(inst, 407)
+        local yDelta = mc.mcCntlGetPoundVar(inst, 408)
+        add(string.format("X Delta: %.4f, Y Delta: %.4f", xDelta, yDelta))
+    else
+        add("No virtual tool active")
+    end
+    
+    -- 8. G68 ROTATION CHECK
+    add("\nROTATION:")
+    add("-------------------")
+    local rotation = mc.mcCntlGetPoundVar(inst, 4016)
+    if rotation == 68 then
+        add("*** G68 ACTIVE ***")
+        local g68X = mc.mcCntlGetPoundVar(inst, 1245)
+        local g68Y = mc.mcCntlGetPoundVar(inst, 1246)
+        local g68R = mc.mcCntlGetPoundVar(inst, 1247)
+        add(string.format("Center: X%.4f Y%.4f, Angle: %.4f", g68X, g68Y, g68R))
+    else
+        add("No rotation (G69)")
+    end
+    
+    -- 9. KEY POUND VARIABLES
+    add("\nKEY POUND VARIABLES:")
+    add("-------------------")
+    -- Check critical pound variables used in scripts
+    local criticalVars = {
+        {353, "Work Surface Z"},
+        {389, "Probe Contact Z"},
+        {445, "Virtual Tool Atomic Op"},
+        {446, "Virtual Tool Op Type"},
+        {495, "Spindle Delay Armed"},
+        {498, "Dialog Suppression"},
+        {400, "Dust Collect Auto"},
+        {402, "Dust Boot Auto"}
+    }
+    
+    for _, var in ipairs(criticalVars) do
+        local val = mc.mcCntlGetPoundVar(inst, var[1])
+        if val and val > -1e300 then
+            add(string.format("#%d (%s): %.4f", var[1], var[2], val))
+            
+            -- Flag suspicious values
+            if var[1] == 353 and math.abs(val) < 1 then
+                add("  *** WARNING: Work surface Z seems too small ***")
+            end
+            if var[1] == 445 and val == 1 then
+                add("  *** Virtual tool operation was interrupted ***")
+            end
+        end
+    end
+    
+    -- 10. RECENT GCODE
+    add("\nRECENT GCODE:")
+    add("-------------------")
+    local ok, currentLine = pcall(mc.mcCntlGetCurrentLine, inst)
+    if not ok then currentLine = -1 end
+    local ok, gcodeFile = pcall(mc.mcCntlGetGcodeFileName, inst)
+    if ok and gcodeFile and gcodeFile ~= "" then
+        add(string.format("File: %s", gcodeFile))
+        add(string.format("Current Line: %d", currentLine))
+        
+        -- Try to get the actual line of code
+        if currentLine > 0 then
+            local ok2, codeLine = pcall(mc.mcCntlGetGcodeLine, inst, currentLine)
+            if ok2 and codeLine then
+                add(string.format("Code: %s", codeLine))
+            end
+            
+            -- Also get previous line for context
+            if currentLine > 1 then
+                local ok3, prevLine = pcall(mc.mcCntlGetGcodeLine, inst, currentLine - 1)
+                if ok3 and prevLine then
+                    add(string.format("Previous: %s", prevLine))
+                end
+            end
+        end
+    else
+        add("No program loaded")
+    end
+    
+    -- Get last error message
+    add("\nLAST ERROR:")
+    add("-------------------")
+    local ok, lastError = pcall(mc.mcCntlGetLastError, inst)
+    if ok and lastError and lastError ~= "" then
+        add(string.format("Last Error: %s", lastError))
+    else
+        add("No recent error message")
+    end
+    
+    -- 11. M6 STATE
+    add("\nM6 TOOL CHANGE:")
+    add("-------------------")
+    local m6Running = mc.mcCntlGetPoundVar(inst, 499)
+    add(string.format("M6 Running: %s", m6Running == 1 and "YES" or "NO"))
+    if m6Running == 1 then
+        add("*** LIMIT TRIP DURING TOOL CHANGE ***")
+    end
+    
+    -- 12. FEED RATES AND OVERRIDES
+    add("\nFEED RATES & OVERRIDES:")
+    add("-------------------")
+    local ok, fro = pcall(mc.mcCntlGetFRO, inst)
+    if ok then add(string.format("Feed Rate Override: %d%%", fro)) end
+    
+    local ok, rro = pcall(mc.mcCntlGetRRO, inst) 
+    if ok then add(string.format("Rapid Rate Override: %d%%", rro)) end
+    
+    local ok, sso = pcall(mc.mcSpindleGetOverride, inst)
+    if ok then add(string.format("Spindle Speed Override: %.1f%%", sso)) end
+    
+    local ok, feedrate = pcall(mc.mcCntlGetPoundVar, inst, 5410)  -- Current feedrate
+    if ok and feedrate > 0 then add(string.format("Current Feed Rate: %.1f", feedrate)) end
+    
+    -- 13. Z-AXIS MOTOR CONFIGURATION
+    add("\nZ-AXIS CONFIGURATION:")
+    add("-------------------")
+    local ok, zVel = pcall(mc.mcAxisGetVel, inst, 2)
+    if ok then add(string.format("Z Velocity: %.4f", zVel)) end
+    
+    local ok, zAccel = pcall(mc.mcAxisGetAccel, inst, 2)
+    if ok then add(string.format("Z Acceleration: %.4f", zAccel)) end
+    
+    local ok, zBacklash = pcall(mc.mcAxisGetBacklash, inst, 2)
+    if ok then add(string.format("Z Backlash: %.6f", zBacklash)) end
+    
+    -- Check if Z was moving at time of capture
+    if ok and math.abs(zVel) > 0.001 then
+        add(string.format("*** Z WAS MOVING: %.4f in/min ***", zVel))
+    end
+    
+    -- 14. SYSTEM INFO
+    add("\nSYSTEM INFO:")
+    add("-------------------")
+    local ok, version = pcall(mc.mcCntlGetVersion, inst)
+    if ok then add(string.format("Mach4 Version: %s", version)) end
+    
+    local ok, uptime = pcall(mc.mcCntlGetRunTime, inst)
+    if ok then add(string.format("Session Uptime: %.1f min", uptime / 60)) end
+    
+    -- 15. DIAGNOSTIC SUMMARY
+    add("\n===========================================")
+    add("DIAGNOSTIC SUMMARY:")
+    add("===========================================")
+    
+    -- Check for common issues
+    local issues = {}
+    
+    if machEnabled == 0 then
+        table.insert(issues, "Machine is disabled (likely from limit trip)")
+    end
+    
+    if zMachine > softMax then
+        table.insert(issues, string.format("Z position exceeds soft limit by %.4f", zMachine - softMax))
+    end
+    
+    if currentTool > 0 and hOffset ~= currentTool then
+        table.insert(issues, string.format("Tool/Height mismatch: T%d but H%d active", currentTool, hOffset))
+    end
+    
+    if totalOffset > 5.0 then  -- Arbitrary threshold
+        table.insert(issues, string.format("Large total offset: %.4f inches", totalOffset))
+    end
+    
+    if virtualTool >= 90 then
+        table.insert(issues, "Virtual tool was active during incident")
+    end
+    
+    if rotation == 68 then
+        table.insert(issues, "G68 rotation was active")
+    end
+    
+    if m6Running == 1 then
+        table.insert(issues, "Tool change was in progress")
+    end
+    
+    if #issues > 0 then
+        add("POTENTIAL ISSUES FOUND:")
+        for i, issue in ipairs(issues) do
+            add(string.format("%d. %s", i, issue))
+        end
+    else
+        add("No obvious issues detected - check positions and offsets above")
+    end
+    
+    -- SAVE REPORT TO FILE
+    local reportText = table.concat(report, "\n")
+    local path = mc.mcCntlGetInstancePath(inst)
+    local filename = path .. "\\Z_Diagnostic_" .. os.date("%Y%m%d_%H%M%S") .. ".txt"
+    
+    local saveSuccess = false
+    local saveError = ""
+    
+    -- Try primary save location
+    local file, err = io.open(filename, "w")
+    if file then
+        file:write(reportText)
+        file:close()
+        saveSuccess = true
+    else
+        saveError = err or "Unknown error"
+        
+        -- Try fallback location (desktop)
+        local fallbackPath = os.getenv("USERPROFILE") .. "\\Desktop\\Z_Diagnostic_" .. os.date("%Y%m%d_%H%M%S") .. ".txt"
+        file, err = io.open(fallbackPath, "w")
+        if file then
+            file:write(reportText)
+            file:close()
+            filename = fallbackPath
+            saveSuccess = true
+            saveError = "Saved to Desktop (primary location failed)"
+        else
+            saveError = "Both save locations failed: " .. (err or "Unknown error")
+        end
+    end
+    
+    -- Always show results, even if save failed
+    if saveSuccess then
+        -- Try to copy to clipboard
+        local clipSuccess = false
+        if wx.wxClipboard.Get():Open() then
+            local clipData = wx.wxTextDataObject(reportText)
+            wx.wxClipboard.Get():SetData(clipData)
+            wx.wxClipboard.Get():Close()
+            clipSuccess = true
+        end
+        
+        -- Show success message
+        local message = "Diagnostic report saved to:\n" .. filename .. "\n\n" .. 
+                       "Summary: " .. (#issues > 0 and table.concat(issues, "\n• ") or "No obvious issues found") .. "\n\n" ..
+                       (clipSuccess and "Report also copied to clipboard" or "")
+        
+        wx.wxMessageBox(message, "Z Diagnostic Complete", wx.wxOK + wx.wxICON_INFORMATION)
+        mc.mcCntlSetLastError(inst, "Z Diagnostic saved: " .. filename)
+    else
+        -- Save failed - show report in dialog anyway
+        local dlg = wx.wxDialog(wx.NULL, wx.wxID_ANY, "Z Diagnostic Report - SAVE FAILED", 
+                               wx.wxDefaultPosition, wx.wxSize(800, 600))
+        
+        local panel = wx.wxPanel(dlg, wx.wxID_ANY)
+        local sizer = wx.wxBoxSizer(wx.wxVERTICAL)
+        
+        -- Error message
+        local errorText = wx.wxStaticText(panel, wx.wxID_ANY, 
+                                         "Failed to save file: " .. saveError .. "\nCopy the text below manually:")
+        errorText:SetForegroundColour(wx.wxColour(255, 0, 0))
+        sizer:Add(errorText, 0, wx.wxALL + wx.wxEXPAND, 10)
+        
+        -- Report text box
+        local textCtrl = wx.wxTextCtrl(panel, wx.wxID_ANY, reportText,
+                                      wx.wxDefaultPosition, wx.wxDefaultSize,
+                                      wx.wxTE_MULTILINE + wx.wxTE_READONLY + wx.wxTE_WORDWRAP)
+        sizer:Add(textCtrl, 1, wx.wxALL + wx.wxEXPAND, 10)
+        
+        -- Copy button
+        local copyBtn = wx.wxButton(panel, wx.wxID_ANY, "Copy All to Clipboard")
+        copyBtn:Connect(wx.wxEVT_COMMAND_BUTTON_CLICKED, function(event)
+            if wx.wxClipboard.Get():Open() then
+                local clipData = wx.wxTextDataObject(reportText)
+                wx.wxClipboard.Get():SetData(clipData)
+                wx.wxClipboard.Get():Close()
+                wx.wxMessageBox("Report copied to clipboard", "Success", wx.wxOK + wx.wxICON_INFORMATION)
+            end
+        end)
+        sizer:Add(copyBtn, 0, wx.wxALL + wx.wxALIGN_CENTER, 10)
+        
+        panel:SetSizer(sizer)
+        dlg:ShowModal()
+        dlg:Destroy()
+        
+        mc.mcCntlSetLastError(inst, "ERROR: Z Diagnostic could not save - displayed in dialog")
+    end
+    
+    -- RE-ENABLE MACHINE PROMPT
+    if machEnabled == 0 then
+        local result = wx.wxMessageBox(
+            "Machine is currently disabled.\nWould you like to clear the limit and re-enable?",
+            "Re-enable Machine?",
+            wx.wxYES_NO + wx.wxICON_QUESTION
+        )
+        
+        if result == wx.wxYES then
+            -- Clear limits and re-enable
+            mc.mcAxisDerefAll(inst)
+            wx.wxMilliSleep(100)
+            mc.mcCntlEnable(inst, 1)
+        end
+    end
+end
+function btn_57__Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    
+    
+    -- 1) PLC: force the trampoline to reload the external PLC on the next tick
+    _G.__PLC_TRAMP = nil
+    
+    
+    -- 2) ScreenLoad: re‑run the external ScreenLoad file (safe, idempotent path)
+    local ROOT = [[C:\Mach4Hobby\Profiles\BLP\Scripts]]
+    local SYS = ROOT .. [[\System]]
+    local SRC = SYS .. [[\ScreenLoad.txt]]
+    
+    
+    -- Prefer calling an exported helper if your stub defines it; otherwise load directly
+    if _G.Reload_ScreenLoad then
+    local ok, err = pcall(_G.Reload_ScreenLoad)
+    if not ok then mc.mcCntlSetLastError(inst, "ScreenLoad reload error: " .. tostring(err)) end
+    else
+    local chunk, lerr = loadfile(SRC)
+    if not chunk then
+    mc.mcCntlSetLastError(inst, "ScreenLoad load error: " .. tostring(lerr))
+    else
+    local ok, perr = pcall(chunk)
+    if not ok then mc.mcCntlSetLastError(inst, "ScreenLoad runtime error: " .. tostring(perr)) end
+    end
+    end
+    
+    
+    -- Optional: nudge UI to refresh labels/colors if you have a centralized UI sync
+    if _G.UI and _G.UI.SyncOutputs then _G.UI.SyncOutputs() end
+end
+function btnToggleDebug_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "ToggleDebug.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function btnMasterDebug_Left_Up_Script(...)
+    -- Directly turn OFF OSIG_OUTPUT4/5/6 and report readback
+    local inst = mc.mcGetInstance()
+    
+    local targets = {
+      { name = "OSIG_OUTPUT4", id = mc.OSIG_OUTPUT4 },
+      { name = "OSIG_OUTPUT5", id = mc.OSIG_OUTPUT5 },
+      { name = "OSIG_OUTPUT6", id = mc.OSIG_OUTPUT6 },
+    }
+    
+    for _, t in ipairs(targets) do
+      local h = mc.mcSignalGetHandle(inst, t.id)
+      if h and h > 0 then
+        mc.mcSignalSetState(h, 0)
+        local rb = mc.mcSignalGetState(h)
+        mc.mcCntlSetLastError(inst, string.format("%s -> OFF, readback=%s", t.name, tostring(rb)))
+      else
+        mc.mcCntlSetLastError(inst, string.format("%s handle invalid", t.name))
+      end
+    end
+    
+    
+end
+-- grpFeedRate-GlobalScript
+function btnFROMax_Left_Up_Script(...)
+    local maxval = scr.GetProperty('slideFRO', 'Max Value')
+    scr.SetProperty('slideFRO', 'Value', tostring(maxval));
+end
+function btnFROUp_Left_Up_Script(...)
+    local val = scr.GetProperty('slideFRO', 'Value');
+    val = tonumber(val) + 10;
+    local maxval = scr.GetProperty('slideFRO', 'Max Value')
+    if (tonumber(val) >= tonumber(maxval)) then
+     val = maxval;
+    end
+    scr.SetProperty('slideFRO', 'Value', tostring(val));
+end
+function btnFRO100_Left_Up_Script(...)
+    scr.SetProperty('slideFRO', 'Value', tostring(100));
+end
+function btnFROMin_Left_Up_Script(...)
+    --scr.SetProperty('slideFRO', 'Value', tostring(0));
+    local minval = scr.GetProperty('slideFRO', 'Min Value')
+    scr.SetProperty('slideFRO', 'Value', tostring(minval));
+end
+function btnFRODn_Left_Up_Script(...)
+    --local val = scr.GetProperty('slideFRO', 'Value');
+    --val = tonumber(val) - 10;
+    --if (val < 0 ) then
+    --    val =0;
+    --end
+    --scr.SetProperty('slideFRO', 'Value', tostring(val));
+    -- Down
+    local val = scr.GetProperty('slideFRO', 'Value');
+    val = tonumber(val) - 10;
+    local minval = scr.GetProperty('slideFRO', 'Min Value')
+    if (tonumber(val) <= tonumber(minval)) then
+     val = minval;
+    end
+    scr.SetProperty('slideFRO', 'Value', tostring(val));
+end
+-- grpRapid Rate-GlobalScript
+function btnRROMax_Left_Up_Script(...)
+    --Max
+    local maxval = scr.GetProperty('slideRRO', 'Max Value')
+    scr.SetProperty('slideRRO', 'Value', tostring(maxval));
+end
+function btnRROUp_Left_Up_Script(...)
+    -- Up
+    local val = scr.GetProperty('slideRRO', 'Value');
+    val = tonumber(val) + 10;
+    local maxval = scr.GetProperty('slideRRO', 'Max Value')
+    if (tonumber(val) >= tonumber(maxval)) then
+     val = maxval;
+    end
+    scr.SetProperty('slideRRO', 'Value', tostring(val));
+end
+function btnRRO50_Left_Up_Script(...)
+    -- 50
+    scr.SetProperty('slideRRO', 'Value', tostring(50));
+end
+function btnRROMin_Left_Up_Script(...)
+    -- Min
+    local minval = scr.GetProperty('slideRRO', 'Min Value')
+    scr.SetProperty('slideRRO', 'Value', tostring(minval));
+end
+function btnRRODn_Left_Up_Script(...)
+    -- Down
+    local val = scr.GetProperty('slideRRO', 'Value');
+    val = tonumber(val) - 10;
+    local minval = scr.GetProperty('slideRRO', 'Min Value')
+    if (tonumber(val) <= tonumber(minval)) then
+     val = minval;
+    end
+    scr.SetProperty('slideRRO', 'Value', tostring(val));
+end
+-- grpSpindle-GlobalScript
+function btnSROMax_Left_Up_Script(...)
+    --Max
+    local maxval = scr.GetProperty('slideSRO', 'Max Value')
+    scr.SetProperty('slideSRO', 'Value', tostring(maxval));
+end
+function btnSROUp_Left_Up_Script(...)
+    -- Up
+    local val = scr.GetProperty('slideSRO', 'Value');
+    val = tonumber(val) + 10;
+    local maxval = scr.GetProperty('slideSRO', 'Max Value')
+    if (tonumber(val) >= tonumber(maxval)) then
+     val = maxval;
+    end
+    scr.SetProperty('slideSRO', 'Value', tostring(val));
+end
+function btnSRO100_Left_Up_Script(...)
+    -- 100
+    scr.SetProperty('slideSRO', 'Value', tostring(100));
+end
+function btnSROMin_Left_Up_Script(...)
+    -- Min
+    local minval = scr.GetProperty('slideSRO', 'Min Value')
+    scr.SetProperty('slideSRO', 'Value', tostring(minval));
+end
+function btnSRODn_Left_Up_Script(...)
+    -- Down
+    local val = scr.GetProperty('slideSRO', 'Value');
+    val = tonumber(val) - 10;
+    local minval = scr.GetProperty('slideSRO', 'Min Value')
+    if (tonumber(val) <= tonumber(minval)) then
+     val = minval;
+    end
+    scr.SetProperty('slideSRO', 'Value', tostring(val));
+end
+function btnSpindleCW_Left_Up_Script(...)
+    SpinCW()
+end
+function btnSpindleCCW_Left_Up_Script(...)
+    SpinCCW()
+end
+-- grpTool-GlobalScript
+function btnSetTool_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "SetToolButton.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function lstCurrentTool_On_Modify_Script(...)
+    -- lstCurrentTool On Update Script (properly trimmed)
+    local inst = mc.mcGetInstance()
+    local rawValue = scr.GetProperty("lstCurrentTool", "Value")
+    local selectedIndex = nil
+    
+    -- Try number first
+    local numValue = tonumber(rawValue)
+    if numValue and numValue >= 0 then
+        selectedIndex = numValue
+    else
+        -- It's a string - find it in toolChoices
+        if _G.toolChoices and rawValue and rawValue ~= "" then
+            for i, choice in ipairs(_G.toolChoices) do
+                if choice == rawValue then
+                    selectedIndex = i - 1  -- Convert to 0-based
+                    break
+                end
+            end
+            
+            -- If not found, try parsing tool number
+            if not selectedIndex then
+                local toolNum = rawValue:match("^(%d+)")
+                if toolNum then
+                    toolNum = tonumber(toolNum)
+                    for i, t in ipairs(_G.toolNumbers) do
+                        if t == toolNum then
+                            selectedIndex = i - 1
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Process the selection
+    if selectedIndex and selectedIndex >= 0 then
+        _G.selectedToolIndex = selectedIndex
+        
+        if _G.toolNumbers and _G.toolNumbers[selectedIndex + 1] then
+            local toolNum = _G.toolNumbers[selectedIndex + 1]
+            local desc = (toolNum == 0) and "No Tool" or 
+                         (mc.mcToolGetDesc(inst, toolNum) or "Unnamed")
+            mc.mcCntlSetLastError(inst, string.format("Selected T%d - %s", toolNum, desc))
+        end
+    end
+end
+function btnMeasureCurrentTool_Left_Up_Script(...)
+    -- Measure Tool Button Script with Full Debugging
+    -- Set DEBUG_MODE = false when everything is working
+    
+    -- ============================================
+    -- DEBUG CONFIGURATION
+    -- ============================================
+    local DEBUG_MODE = false  -- SET TO false FOR PRODUCTION
+    
+    -- ============================================
+    -- MAIN SCRIPT
+    -- ============================================
+    local inst = mc.mcGetInstance()
+    
+    -- Debug function
+    local function debugLog(message)
+        if DEBUG_MODE then
+            mc.mcCntlSetLastError(inst, "DEBUG: " .. tostring(message))
+            -- Also log to console if available
+            if mc.mcCntlLog then
+                mc.mcCntlLog(inst, "Button Script: " .. tostring(message), "", -1)
+            end
+        end
+    end
+    
+    -- Step 1: Verify instance
+    debugLog("Step 1: Getting instance...")
+    if not inst then
+        wx.wxMessageBox("FATAL ERROR: Could not get Mach4 instance!", "Error", wx.wxOK + wx.wxICON_ERROR)
+        return
+    end
+    debugLog("Instance obtained: " .. tostring(inst))
+    
+    -- Step 2: Check machine state
+    debugLog("Step 2: Checking machine state...")
+    local machineState = mc.mcCntlGetState(inst)
+    if not machineState then
+        debugLog("ERROR: mcCntlGetState returned nil!")
+        wx.wxMessageBox("FATAL ERROR: Could not get machine state!", "Error", wx.wxOK + wx.wxICON_ERROR)
+        return
+    end
+    debugLog("Machine state code: " .. tostring(machineState))
+    
+    local stateNames = {
+        [0] = "IDLE",
+        [100] = "FEED_RUNNING", 
+        [101] = "FEED_HOLD",
+        [102] = "PROBE_HOLD",
+        [103] = "HOLD",
+        [109] = "STOP",
+        [110] = "HOLD_SYNC",
+        [200] = "MDI_RUNNING",
+        [201] = "MDI_FEED_HOLD"
+    }
+    local stateName = stateNames[machineState] or "UNKNOWN"
+    debugLog("Machine state: " .. stateName .. " (" .. tostring(machineState) .. ")")
+    
+    -- Check if machine is enabled
+    local machEnabled = 0
+    local machEnabledHandle = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED)
+    if machEnabledHandle and machEnabledHandle > 0 then
+        local state = mc.mcSignalGetState(machEnabledHandle)
+        machEnabled = state or 0
+    end
+    debugLog("Machine enabled: " .. tostring(machEnabled))
+    
+    if machEnabled == 0 then
+        if DEBUG_MODE then
+            wx.wxMessageBox("Machine is not enabled. Please enable the machine first.", 
+                           "Machine Disabled", wx.wxOK + wx.wxICON_WARNING)
+        else
+            mc.mcCntlSetLastError(inst, "Machine must be enabled to measure tools")
+        end
+        return
+    end
+    
+    -- Step 3: Check if in cycle
+    debugLog("Step 3: Checking if in cycle...")
+    local inCycle = mc.mcCntlIsInCycle(inst)
+    if inCycle == nil then
+        debugLog("WARNING: mcCntlIsInCycle returned nil, assuming not in cycle")
+        inCycle = 0
+    end
+    debugLog("In cycle: " .. tostring(inCycle))
+    
+    if inCycle == 1 then
+        if DEBUG_MODE then
+            wx.wxMessageBox("Cannot measure tool while program is running.", 
+                           "Program Running", wx.wxOK + wx.wxICON_WARNING)
+        else
+            mc.mcCntlSetLastError(inst, "Cannot measure tool during program execution")
+        end
+        return
+    end
+    
+    -- Step 4: Check current tool
+    debugLog("Step 4: Checking current tool...")
+    local currentTool = mc.mcToolGetCurrent(inst)
+    if not currentTool then
+        debugLog("ERROR: mcToolGetCurrent returned nil!")
+        currentTool = 0
+    end
+    debugLog("Current tool: T" .. tostring(currentTool))
+    
+    if currentTool == 0 then
+        debugLog("WARNING: No tool currently loaded (T0)")
+        -- Let m2010 handle this with its own error message
+    end
+    
+    -- Step 5: Check if macro exists
+    debugLog("Step 5: Checking if m2010 macro exists...")
+    local machDir = mc.mcCntlGetMachDir(inst)
+    local profileName = mc.mcProfileGetName(inst)
+    
+    if not machDir or not profileName then
+        debugLog("ERROR: Could not get machine directory or profile name")
+        debugLog("MachDir: " .. tostring(machDir))
+        debugLog("Profile: " .. tostring(profileName))
+        return
+    end
+    
+    local macroPath = machDir .. "\\Profiles\\" .. profileName .. "\\Macros\\m2010.mcs"
+    debugLog("Looking for macro at: " .. macroPath)
+    
+    -- Check if file exists (basic check)
+    local file = io.open(macroPath, "r")
+    if file then
+        file:close()
+        debugLog("Macro file found!")
+    else
+        debugLog("WARNING: Macro file not found at expected location")
+        -- Still try to run it - might be in a different location
+    end
+    
+    -- Step 6: Check critical pound variables
+    debugLog("Step 6: Checking critical pound variables...")
+    local criticalVars = {
+        {var = 311, name = "Probe Station X", default = 2.4},
+        {var = 312, name = "Probe Station Y", default = 12.65},
+        {var = 314, name = "Max Probe Depth", default = -9.0},
+        {var = 353, name = "Work Surface Z", default = -7.8}
+    }
+    
+    for _, v in ipairs(criticalVars) do
+        local value = mc.mcCntlGetPoundVar(inst, v.var)
+        if not value or value < -1e300 then
+            debugLog(string.format("WARNING: #%d (%s) not set, will use default: %.3f", 
+                                  v.var, v.name, v.default))
+        else
+            debugLog(string.format("#%d (%s) = %.4f", v.var, v.name, value))
+        end
+    end
+    
+    -- Step 7: Check rotation (G68) state
+    debugLog("Step 7: Checking for coordinate rotation (G68)...")
+    if CheckRotationWithPrompt then
+        debugLog("CheckRotationWithPrompt function found")
+        -- Call it with the warning message
+        local rotationOk = CheckRotationWithPrompt("Warning: Setting tool height will reset all coordinate rotations (G68→G69).\nProceed?")
+        if not rotationOk then
+            debugLog("User cancelled due to G68 rotation active")
+            mc.mcCntlSetLastError(inst, "Tool measurement cancelled - G68 active")
+            return
+        end
+        debugLog("Rotation check passed")
+    else
+        debugLog("WARNING: CheckRotationWithPrompt not found - rotation check skipped")
+    end
+    
+    -- Step 8: Check dust boot and probe signals
+    debugLog("Step 8: Checking hardware signals...")
+    debugLog("Step 8: Checking hardware signals...")
+    
+    local signalChecks = {
+        {signal = mc.OSIG_OUTPUT3, name = "Dust Boot Output", type = "output"},
+        {signal = mc.ISIG_INPUT7, name = "Dust Boot Up Sensor", type = "input"},
+        {signal = mc.ISIG_INPUT17, name = "Tool Present Sensor", type = "input"},
+        {signal = mc.ISIG_PROBE, name = "Height Setter", type = "input"}
+    }
+    
+    for _, sig in ipairs(signalChecks) do
+        local handle = mc.mcSignalGetHandle(inst, sig.signal)
+        if handle and handle > 0 then
+            local state = mc.mcSignalGetState(handle)
+            if state then
+                debugLog(string.format("%s: %s (state=%d)", sig.name, "CONFIGURED", state))
+            else
+                debugLog(string.format("%s: CONFIGURED but state is nil", sig.name))
+            end
+        else
+            debugLog(string.format("WARNING: %s NOT CONFIGURED!", sig.name))
+        end
+    end
+    
+    -- Step 9: Check PLC pound variables
+    debugLog("Step 9: Checking PLC state variables...")
+    local plcVars = {
+        {var = 402, name = "Dust Boot Auto Mode"},
+        {var = 403, name = "Dust Boot Target"},
+        {var = 499, name = "M6 Running Flag"},
+        {var = 406, name = "Virtual Tool State"}
+    }
+    
+    for _, v in ipairs(plcVars) do
+        local value = mc.mcCntlGetPoundVar(inst, v.var)
+        if not value or value < -1e300 then
+            debugLog(string.format("#%d (%s) = UNINITIALIZED", v.var, v.name))
+        else
+            debugLog(string.format("#%d (%s) = %.0f", v.var, v.name, value))
+        end
+    end
+    
+    -- Step 10: Execute the macro
+    debugLog("Step 10: Attempting to execute m2010 macro...")
+    debugLog("=========================================")
+    
+    -- Try using mcCntlMdiExecute
+    local rc = mc.mcCntlMdiExecute(inst, "m2010")
+    
+    if not rc then
+        debugLog("ERROR: mcCntlMdiExecute returned nil!")
+        rc = -999
+    end
+    
+    debugLog("MDI Execute return code: " .. tostring(rc))
+    
+    -- Interpret return code
+    local rcMessages = {
+        [0] = "SUCCESS - Command accepted",
+        [-2] = "ERROR_NOT_NOW - Machine busy or wrong state",
+        [-3] = "ERROR_NOT_COMPILED - Macro not found or compilation error",
+        [-18] = "ERROR_NOT_ENABLED - Machine not enabled",
+        [-20] = "ERROR_IN_CYCLE - Already in cycle",
+        [-24] = "ERROR_NO_SCRIPT - Script not found"
+    }
+    
+    local rcMessage = rcMessages[rc] or "UNKNOWN ERROR CODE"
+    debugLog("Result: " .. rcMessage)
+    
+    if rc ~= 0 then
+        -- Try alternative method
+        debugLog("First method failed, trying alternative...")
+        
+        -- Check if we can use mcCntlGcodeExecuteWait
+        local altRc = mc.mcCntlGcodeExecuteWait(inst, "M2010")
+        if not altRc then
+            debugLog("ERROR: mcCntlGcodeExecuteWait returned nil!")
+            altRc = -999
+        end
+        debugLog("Alternative execute return code: " .. tostring(altRc))
+        
+        if altRc ~= 0 then
+            -- Both methods failed
+            local errorMsg = string.format(
+                "Failed to execute m2010 macro!\n\n" ..
+                "MDI Execute Error: %s (code %d)\n" ..
+                "G-code Execute Error: code %d\n\n" ..
+                "Please check:\n" ..
+                "1. m2010.mcs exists in Macros folder\n" ..
+                "2. The macro has no syntax errors\n" ..
+                "3. Machine is in IDLE state\n" ..
+                "4. Machine is enabled",
+                rcMessage, rc, altRc
+            )
+            
+            if DEBUG_MODE then
+                wx.wxMessageBox(errorMsg, "Macro Execution Failed", wx.wxOK + wx.wxICON_ERROR)
+            else
+                mc.mcCntlSetLastError(inst, "ERROR: Failed to execute m2010 - " .. rcMessage)
+            end
+        else
+            debugLog("Alternative method succeeded!")
+        end
+    else
+        debugLog("Macro execution initiated successfully!")
+        
+        if not DEBUG_MODE then
+            -- Production mode - just set simple status
+            mc.mcCntlSetLastError(inst, "Measuring tool height...")
+        end
+    end
+    
+    debugLog("=========================================")
+    debugLog("Button script completed")
+end
+function btnChangeTool_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "TargetMove.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+-- ControlGroup-GlobalScript
+function btnStop_Left_Up_Script(...)
+    CycleStop()
+end
+function btnCycleStart_1__Left_Up_Script(...)
+    CycleStart()
+end
+-- grpFileOps-GlobalScript
+-- grpControls-GlobalScript
+function tbtnLimOv_Down_Script(...)
+    wx.wxMessageBox(
+        "WARNING: Limits Override is ACTIVE!\n\nMachine will NOT stop at limits!",
+        "DANGER",
+        wx.wxOK + wx.wxICON_WARNING
+    )
+end
+function btnHeightOffset_Left_Up_Script(...)
+    --Toggle height offset button
+    local HOState = mc.mcCntlGetPoundVar(inst, 4008)
+    if (HOState == 49) then
+        mc.mcCntlMdiExecute(inst, "G43")
+    else
+        mc.mcCntlMdiExecute(inst, "G49")
+    end
+    
+end
+function btnBootAuto_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "btnBootAuto.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function btnDustAuto_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "btnDustAuto.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end
+function btnVacAuto_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if AuxLib and AuxLib.Request then
+      AuxLib.Request(inst, { device = "vacFront", action = "auto.toggle" })
+      AuxLib.Request(inst, { device = "vacRear",  action = "auto.toggle" })
+    else
+      mc.mcCntlSetLastError(inst, "Missing AuxLib.Request: vacFront/vacRear auto.toggle")
+    end
+end
+function btnSoftLimits_Left_Up_Script(...)
+    local inst = mc.mcGetInstance()
+    if SystemLib and SystemLib.RunProfileScript then
+      SystemLib.RunProfileScript(inst, "SoftLimitsToggle.txt")
+    else mc.mcCntlSetLastError(inst, "File Not Found at C:\\Mach4Hobby\\Profiles\\BLP\\Scripts\\Dependencies\\SystemLib.txt") end
+    
+end

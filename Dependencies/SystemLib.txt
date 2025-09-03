@@ -1190,7 +1190,9 @@ function SystemLib.Signals.Wait(inst, sig, target, opts)
   local tmo = opts.timeout_ms or 3000
   local step = opts.poll_ms or 25
   while true do
-    if (mc.mcSignalGetState(h) or 0) == (target and 1 or 0) then return true end
+    -- NOTE: avoid (target and 1 or 0) truthy bug; normalize explicitly
+    local want = (target == true or target == 1 or target == "1" or target == "HIGH" or target == "high") and 1 or 0
+    if (mc.mcSignalGetState(h) or 0) == want then return true end
     if (wx.wxGetUTCTimeMillis() - t0):ToNumber() > tmo then
       return false, "Timeout waiting for signal "..tostring(sig).." == "..tostring(target)
     end

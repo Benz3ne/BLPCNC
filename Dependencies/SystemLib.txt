@@ -237,22 +237,25 @@ function SystemLib.SignalSetState(inst, signal, state)
     traceOn = ok and (tonumber(v) == 1) or false
   end
 
+  -- Normalize state once for all subsequent logic
+  local v = (state == true or state == 1 or state == "1" or state == "HIGH" or state == "high") and 1 or 0
+
   -- Optional guard: #4991 blocks ON writes to O3..O6
   if id and _isTracked(id) then
     local ok, guard = pcall(mc.mcCntlGetPoundVar, inst, 4991)
-    -- NOTE: do NOT use (state and 1 or 0) here (0 is truthy in Lua). Use normalized v.
+    -- NOTE: compare against normalized v (avoid truthy bug)
     if ok and tonumber(guard) == 1 and v == 1 then
       mc.mcCntlSetLastError(inst, string.format("[SYSDBG][GUARD] Block ON write id=%s", tostring(id)))
       return true
     end
   end
 
-  local v = (state == true or state == 1 or state == "1" or state == "HIGH" or state == "high") and 1 or 0
   mc.mcSignalSetState(handle, v)
 
   if debugOn and traceOn and id and _isTracked(id) then
     local imm = mc.mcSignalGetState(handle)
-    local t = os.clock(); while os.clock() - t < 0.15 do end
+    -- Use non-busy sleep to allow IO to settle without spinning CPU
+    wx.wxMilliSleep(150)
     local aft = mc.mcSignalGetState(handle)
     local enH = SystemLib.SignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED)
     local en = (enH and mc.mcSignalGetState(enH) == 1) and 1 or 0

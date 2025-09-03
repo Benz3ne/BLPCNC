@@ -1647,7 +1647,8 @@ function SystemLib.Await(inst, spec, opts)
     elseif spec.signal then
         local id = (type(spec.signal) == "string" and mc[spec.signal]) or spec.signal
         local h  = (SystemLib.SignalGetHandle and SystemLib.SignalGetHandle(inst, id)) or mc.mcSignalGetHandle(inst, id)
-        local want = (spec.state and 1 or 0)
+        -- Normalize target state explicitly; avoid (spec.state and 1 or 0)
+        local want = (spec.state == true or spec.state == 1 or spec.state == "1" or spec.state == "HIGH" or spec.state == "high") and 1 or 0
         if not h or h == 0 then
             -- Invalid handle: immediate timeout for lean v1
             return false, "timeout"

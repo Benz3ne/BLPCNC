@@ -1,0 +1,105 @@
+-- PVTrace.txt
+-- Purpose: End-to-end, in-Lua audit of PVs -> desired -> signals for dust/boot/vacs.
+-- Does not write anything; only reads and computes the same decision path AuxLib.Update uses.
+
+local inst = mc.mcGetInstance()
+
+local function log(level, msg)
+  mc.mcCntlSetLastError(inst, string.format("[PVTRACE][%s] %s", level or "INFO", tostring(msg)))
+end
+
+local function pvGet(n)
+  local v
+  if SystemLib and SystemLib.PoundVarGet then v = SystemLib.PoundVarGet(inst, n) else v = mc.mcCntlGetPoundVar(inst, n) end
+  return (type(v)=="number") and v or (tonumber(v) or 0)
+end
+
+local function sigRead(nameOrId)
+  local id = (type(nameOrId)=="number") and nameOrId or mc[nameOrId]
+  local h = mc.mcSignalGetHandle(inst, id)
+  if not h or h==0 then return -1 end
+  return mc.mcSignalGetState(h) or -1
+end
+
+local function ctxNow()
+  local spindle = sigRead("OSIG_SPINDLEON")
+  local inCycle = (mc.mcCntlIsInCycle(inst) == 1) and 1 or 0
+  local interlocks = AuxLib and AuxLib.__interlocks
+  local m6  = interlocks and interlocks.m6Active and (interlocks.m6Active() and 1 or 0) or 0
+  local virt= interlocks and interlocks.virtualActive and (interlocks.virtualActive() and 1 or 0) or 0
+  local rot = interlocks and interlocks.rotationActive and (interlocks.rotationActive() and 1 or 0) or 0
+  return { spindle=spindle, inCycle=inCycle, m6=m6, virt=virt, rotation=rot }
+end
+
+local function computeDesired(dev, ctx)
+  local spec = dev.spec or {}
+  local pv   = spec.pv or {}
+  local reason = "?"
+  -- 1) safety
+  if type(spec.safety) == "function" then
+    local ok, val = pcall(spec.safety, ctx)
+    if ok and (val == 0 or val == 1) then return val, "safety" end
+  end
+  -- 2) auto vs manual target
+  local autoPV = pv.auto and pvGet(pv.auto) or 0
+  if autoPV == 1 then
+    if type(spec.auto) == "function" then
+      local ok, val = pcall(spec.auto, ctx)
+      if ok and (val == 0 or val == 1) then return val, "auto(fn)" end
+    elseif type(spec.auto) == "table" then
+      local on_if, off_if = spec.auto.on_if, spec.auto.off_if
+      local should_on = false
+      if type(on_if) == "string" and ctx[on_if] == 1 then should_on = true
+      elseif type(on_if) == "table" then
+        local all = true
+        for _,k in ipairs(on_if) do if ctx[k] ~= 1 then all=false; break end end
+        should_on = all
+      end
+      if should_on then
+        if type(off_if) == "string" and ctx[off_if] == 1 then should_on = false
+        elseif type(off_if) == "table" then
+          for _,k in ipairs(off_if) do if ctx[k] == 1 then should_on=false; break end end
+        end
+      end
+      return (should_on and 1 or 0), "auto(table)"
+    end
+    return 0, "auto(nil->0)"
+  else
+    local tgtPV = pv.target and pvGet(pv.target) or 0
+    return (tgtPV ~= 0) and 1 or 0, "manual(target)"
+  end
+end
+
+local function outStateFor(dev)
+  local spec = dev.spec or {}
+  local outs = spec.outputs or {}
+  local id = outs.main and mc[outs.main]
+  if not id then return -1 end
+  return sigRead(id)
+end
+
+local function runSnapshot()
+  if not AuxLib then log("ERROR", "AuxLib missing"); return end
+  local ctx = ctxNow()
+  log("INFO", string.format("ctx: spindle=%d inCycle=%d m6=%d virt=%d rot=%d", ctx.spindle, ctx.inCycle, ctx.m6, ctx.virt, ctx.rotation))
+  for name, dev in pairs(AuxLib.__dev or {}) do
+    local spec = dev.spec or {}
+    local pv   = spec.pv or {}
+    local aPV  = pv.auto and pvGet(pv.auto) or -1
+    local tPV  = pv.target and pvGet(pv.target) or -1
+    local want, why = computeDesired(dev, ctx)
+    local sig  = outStateFor(dev)
+    local outs = {}
+    for k, s in pairs(spec.outputs or {}) do outs[#outs+1] = k.."="..s end
+    table.sort(outs)
+    log("INFO", string.format("%s: outs={%s} auto#%s=%s target#%s=%s -> desired=%d (%s) sig=%d",
+        name, table.concat(outs,","), tostring(pv.auto), tostring(aPV), tostring(pv.target), tostring(tPV), want or -1, why or "?", sig))
+    if want ~= -1 and sig ~= -1 and want ~= sig then
+      log("WARNING", string.format("  MISMATCH: desired=%d but signal=%d", want, sig))
+    end
+  end
+end
+
+-- Run a few snapshots at intervals to observe stability
+for i=1,5 do runSnapshot(); wx.wxMilliSleep(200) end
+

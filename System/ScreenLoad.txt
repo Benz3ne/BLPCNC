@@ -50,15 +50,7 @@ _G.ToolLib   = _G.ToolLib   or safeRequire("ToolLib")
 _G.AuxLib    = _G.AuxLib    or safeRequire("AuxLib")
 _G.UILib     = _G.UILib     or safeRequire("UILib")
 
--- Enable verbose diagnostics (set to false to silence)
-do
-  local DEBUG_MODE = true
-  if SystemLib and SystemLib.SetDebugMode then
-    pcall(SystemLib.SetDebugMode, inst, DEBUG_MODE)
-  else
-    if DEBUG_MODE then mc.mcCntlSetLastError(inst, "Debug mode: ON (SystemLib not found; limited)") end
-  end
-end
+-- Removed auto-enable of debug mode; controlled via button script now
 
 -- Numeric safety: avoid tonumber(number) traps in this runtime
 local function num(v, default)

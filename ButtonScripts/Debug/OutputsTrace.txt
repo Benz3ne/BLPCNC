@@ -22,6 +22,10 @@ Or save in your Scripts folder and call via SystemLib.RunProfileScript.
 local mc = mc
 local wx = require("wx")
 
+-- User toggles for this diagnostic run
+local TRACE_GUARD_ON   = true    -- block ON writes to O3..O6 in trace window and log caller
+local TRACE_WINDOW_MS  = 1200    -- how long to keep mc.mcSignalSetState wrapper active (ms)
+
 -- ===== helpers ================================================================
 local function profDir(inst) local mach=mc.mcCntlGetMachDir(inst); local ok,p=pcall(mc.mcProfileGetName,inst); return (mach.."\\Profiles\\"..(ok and p or "BLP")) end
 local function utcStamp() local t=os.date("!*t"); return string.format("%04d%02d%02d-%02d%02d%02d",t.year,t.month,t.day,t.hour,t.min,t.sec) end
@@ -91,6 +95,50 @@ local function run()
   -- install temporary freeze switch
   local gate = installFreezeGate(inst, LOG)
 
+  -- PV sanity
+  LOG.log("PV sanity: #400=%d #401=%d #402=%d | #404=%d #403=%d #411=%d #412=%d",
+    pvG(inst,400),pvG(inst,401),pvG(inst,402),pvG(inst,404),pvG(inst,403),pvG(inst,411),pvG(inst,412))
+
+  -- Desired snapshot (AuxLib logic approximation without writing)
+  do
+    local sp = sigR(sigH(inst, mc.OSIG_SPINDLEON))
+    local ic = (mc.mcCntlIsInCycle(inst) == 1) and 1 or 0
+    local m6 = pvG(inst, 499)
+    local vt = pvG(inst, 406)
+    LOG.log("Desired snapshot: ctx spindle=%d inCycle=%d m6=%d virt=%d", sp, ic, (m6==1 and 1 or 0), (vt>=90 and 1 or 0))
+    for _,d in ipairs(DEV) do
+      local want, why
+      if d.key=="boot" and ((m6==1) or (vt>=90)) then want,why=0,"safety" else
+        if pvG(inst,d.autoPV)==1 then
+          if d.key=="dust" then want,why=(sp==1) and 1 or 0, "auto(fn)" else want,why=0,"auto(nil)" end
+        else
+          want,why = (pvG(inst,d.tgtPV)==1) and 1 or 0, "manual"
+        end
+      end
+      local sig = sigR(sigH(inst, d.osig))
+      LOG.log("  %-8s want=%d (%s) sig=%d", d.key, want or -1, why or "?", sig)
+    end
+  end
+
+  -- Install mc.mcSignalSetState wrapper to attribute direct writers
+  local origSet = mc.mcSignalSetState
+  local h2out = {}
+  local ids = { [3]=mc.OSIG_OUTPUT3,[4]=mc.OSIG_OUTPUT4,[5]=mc.OSIG_OUTPUT5,[6]=mc.OSIG_OUTPUT6 }
+  for n,id in pairs(ids) do local h=sigH(inst,id); if h and h~=0 then h2out[h]=n end end
+  mc.mcSignalSetState = function(hSig, v)
+    local write = (v==1 or v==true or v=="1" or v=="HIGH" or v=="high") and 1 or 0
+    local where = debug.getinfo(2, "Sl")
+    local src   = ((where and where.short_src) or "?") .. ":" .. ((where and where.currentline) or 0)
+    local before= sigR(hSig)
+    if TRACE_GUARD_ON and h2out[hSig] and write==1 then
+      LOG.log("[TRACE] GUARD block ON: O%d by %s", h2out[hSig], src)
+      return
+    end
+    origSet(hSig, write)
+    local after = sigR(hSig)
+    if h2out[hSig] then LOG.log("[TRACE] O%d by %s: before=%d want=%d after=%d", h2out[hSig], src, before, write, after) end
+  end
+
   -- snapshot
   local snap = {}
   for _,d in ipairs(DEV) do
@@ -108,6 +156,8 @@ local function run()
   pvS(inst, 4991, 1)
   LOG.log("TEST1: Freeze Aux (#4991=1), force OFF, watch 1s…")
   for _,d in ipairs(DEV) do sigW(sigH(inst,d.osig), 0) end
+  -- keep trace window alive
+  do local t=0; while t<TRACE_WINDOW_MS do sleep(20); t=t+20 end end
   sleep(1000)
   local ext = {}
   for _,d in ipairs(DEV) do
@@ -173,6 +223,8 @@ local function run()
   end
 
   LOG.log("\nReport: %s", LOG.file)
+  -- restore mc wrapper
+  mc.mcSignalSetState = origSet
   -- Restore prior logging/tracing PVs
   pvS(inst, 4990, prevDbg or 0)
   pvS(inst, 4992, prevTrc or 0)

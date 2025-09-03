@@ -316,11 +316,29 @@ function AuxLib.Update(inst)
 
         -- Default safe value if still nil
         if desired == nil then desired = 0 end
+        -- Optional per-device desired-change logging (debug trace via #4992)
+        local trace = (SystemLib and SystemLib.IsDebugMode and SystemLib.IsDebugMode()) and ((tonumber((pcall(mc.mcCntlGetPoundVar, inst, 4992)) and select(2, pcall(mc.mcCntlGetPoundVar, inst, 4992)) or 0) == 1)) or false
+        d.rt = d.rt or {}
+        if trace then
+            if d.rt._lastDesired ~= desired then
+                local autoPV = pv.auto and _clamp01(_pv_get(inst, pv.auto)) or -1
+                local tgtPV  = pv.target and _clamp01(_pv_get(inst, pv.target)) or -1
+                local rsn = (type(spec.safety)=="function" and "safety") or (autoPV==1 and ((type(spec.auto)=="function" and "auto(fn)") or (type(spec.auto)=="table" and "auto(table)") or "auto(nil)")) or "manual"
+                local msg = string.format("[AUXDBG] desired %s -> %d (%s) auto#%s=%s target#%s=%s", tostring(name), desired, rsn, tostring(pv.auto), tostring(autoPV), tostring(pv.target), tostring(tgtPV))
+                if SystemLib and SystemLib.Log then SystemLib.Log(inst, msg, "DEBUG") else mc.mcCntlSetLastError(inst, msg) end
+                d.rt._lastDesired = desired
+            end
+        end
 
         -- 3) Write outputs if changed (main only; extend for aux keys if desired)
         d.rt.last = d.rt.last or {}
         local last = d.rt.last.main
-        if last == nil or (last and 1 or 0) ~= desired then
+        if _G.__AUX_WRITE_BLOCK then
+            if trace then
+                local msg = string.format("[AUXDBG] %s write BLOCKED (desired=%d)", tostring(name), desired)
+                if SystemLib and SystemLib.Log then SystemLib.Log(inst, msg, "DEBUG") else mc.mcCntlSetLastError(inst, msg) end
+            end
+        elseif last == nil or (last and 1 or 0) ~= desired then
             -- Write every declared output key to desired (common pattern)
             for key, sigName in pairs(spec.outputs or {}) do
                 _sig_write(inst, sigName, desired == 1)

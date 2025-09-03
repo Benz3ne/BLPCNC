@@ -34,5 +34,22 @@ local v = (enable == true or enable == 1 or enable == "1") and 1 or 0
 for axis = 0, 5 do if mc.mcAxisIsEnabled(inst, axis) == 1 then mc.mcSoftLimitSetState(inst, axis, v) end end
 local hsig = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON); if hsig and hsig > 0 then mc.mcSignalSetState(hsig, v) end
 
+-- Start/stop flashing on the Soft Limits button after change
+local btn = "btnSoftLimits"
+if UILib then
+  if v == 0 then
+    -- Disabled: flash gray/yellow like HOME REQUIRED
+    if not (UILib.__flash and UILib.__flash[btn]) then
+      pcall(UILib.FlashButton, btn, { onColor="#FFFF00", offColor="#4B4B4B", onLabel=nil, offLabel=nil, frequency=2.0, duty=0.5, textBold=true, setState=true })
+    end
+  else
+    -- Enabled: stop flashing if present
+    if UILib.__flash and UILib.__flash[btn] and UILib.__flash[btn].Stop then
+      pcall(UILib.__flash[btn].Stop)
+      UILib.__flash[btn] = nil
+    end
+  end
+end
+
 -- Ask the centralized UI to sync the button from actual signal state
 if _G.UI and _G.UI.SyncSoftLimits then _G.UI.SyncSoftLimits() else mc.mcCntlSetLastError(inst, "UI.SyncSoftLimits not found: UI may lag") end

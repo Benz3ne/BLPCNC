@@ -91,6 +91,25 @@ do
 end
 
 -- ========================= Phase 1: Direct OFF & timing =========
+log("INFO", "-- MINIMAL DIRECT OFF (replicates known-good script) --")
+do
+  local minimal = {4,5,6}
+  for _, n in ipairs(minimal) do
+    local id = sigConst(n)
+    local h = getHandle(id)
+    if h and h > 0 then
+      mc.mcSignalSetState(h, 0)
+      local rb0 = mc.mcSignalGetState(h)
+      log("INFO", string.format("O%d minimal OFF -> immediate=%s", n, tostring(rb0)))
+      wx.wxMilliSleep(200)
+      local rb1 = mc.mcSignalGetState(h)
+      log("INFO", string.format("O%d minimal OFF -> after200ms=%s", n, tostring(rb1)))
+    else
+      log("ERROR", string.format("O%d handle invalid in minimal test", n))
+    end
+  end
+end
+
 for _, n in ipairs(TEST_OUTPUTS) do
   local id = sigConst(n)
   local start = readSig(id)
@@ -193,4 +212,3 @@ for n, bag in pairs(traced) do
 end
 
 log("INFO", "=== Outputs Trace: end ===")
-

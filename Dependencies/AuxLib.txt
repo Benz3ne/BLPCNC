@@ -285,22 +285,24 @@ function AuxLib.Update(inst)
                     local off_if = spec.auto.off_if
                     local should_be_on = false
                     
-                    if type(on_if) == "string" and ctx[on_if] == 1 then
+                    if type(on_if) == "string" and (ctx[on_if] == 1 or ctx[on_if] == true) then
                         should_be_on = true
                     elseif type(on_if) == "table" then
                         local all_true = true
                         for _, cond in ipairs(on_if) do
-                            if ctx[cond] ~= 1 then all_true = false; break end
+                            local v = ctx[cond]
+                            if not (v == 1 or v == true) then all_true = false; break end
                         end
                         should_be_on = all_true
                     end
 
                     if should_be_on then
-                        if type(off_if) == "string" and ctx[off_if] == 1 then
+                        if type(off_if) == "string" and (ctx[off_if] == 1 or ctx[off_if] == true) then
                             should_be_on = false
                         elseif type(off_if) == "table" then
                            for _, cond in ipairs(off_if) do
-                               if ctx[cond] == 1 then should_be_on = false; break end
+                               local v = ctx[cond]
+                               if (v == 1 or v == true) then should_be_on = false; break end
                            end
                         end
                     end

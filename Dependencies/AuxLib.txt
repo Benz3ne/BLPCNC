@@ -358,7 +358,7 @@ function AuxLib.Update(inst)
                 local msg = string.format("[AUXDBG] %s write BLOCKED (desired=%d)", tostring(name), desired)
                 if SystemLib and SystemLib.Log then SystemLib.Log(inst, msg, "DEBUG") else mc.mcCntlSetLastError(inst, msg) end
             end
-        elseif last == nil or (last and 1 or 0) ~= desired then
+        elseif last == nil or last ~= (desired == 1) then
             -- Write every declared output key to desired (common pattern)
             for key, sigName in pairs(spec.outputs or {}) do
                 _sig_write(inst, sigName, desired == 1)

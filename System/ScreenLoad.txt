@@ -423,33 +423,69 @@ function UI.SyncOutputs(snapshot)
   -- Dust collector
   do
     local on = b01(st.dust.on)
-    setp_ifdiff("btnDustCollect", "Button State", on == 1 and "1" or "0")
-    setp_ifdiff("btnDustCollect", "Bg Color",     on == 1 and "#00FF00" or "#404040")
+    -- Manual: Green ON, Red OFF
+    if UILib and UILib.SyncToggleButton then
+      UILib.SyncToggleButton("btnDustCollect", on==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
+    else
+      setp_ifdiff("btnDustCollect", "Button State", on == 1 and "1" or "0")
+      setp_ifdiff("btnDustCollect", "Bg Color",     on == 1 and "#00FF00" or "#FF0000")
+    end
     local pvAuto = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 400)) or mc.mcCntlGetPoundVar(inst, 400)
-    setp_ifdiff("btnDustAuto", "Button State", b01(pvAuto) == 1 and "1" or "0")
+    local a = b01(pvAuto)
+    if UILib and UILib.SyncToggleButton then
+      UILib.SyncToggleButton("btnDustAuto", a==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
+      -- legacy alias
+      UILib.SyncToggleButton("btnDustCollectAuto", a==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
+    else
+      setp_ifdiff("btnDustAuto", "Button State", a == 1 and "1" or "0")
+    end
   end
 
   -- Dust boot
   do
     local on = b01(st.boot.on)
-    setp_ifdiff("btnDustBoot", "Button State", on == 1 and "1" or "0")
-    setp_ifdiff("btnDustBoot", "Bg Color",     on == 1 and "#00FF00" or "#404040")
+    if UILib and UILib.SyncToggleButton then
+      UILib.SyncToggleButton("btnDustBoot", on==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
+    else
+      setp_ifdiff("btnDustBoot", "Button State", on == 1 and "1" or "0")
+      setp_ifdiff("btnDustBoot", "Bg Color",     on == 1 and "#00FF00" or "#FF0000")
+    end
     local pvAuto = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 402)) or mc.mcCntlGetPoundVar(inst, 402)
-    setp_ifdiff("btnBootAuto", "Button State", b01(pvAuto) == 1 and "1" or "0")
+    local a = b01(pvAuto)
+    if UILib and UILib.SyncToggleButton then
+      UILib.SyncToggleButton("btnBootAuto", a==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
+      UILib.SyncToggleButton("btnDustBootAuto", a==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
+    else
+      setp_ifdiff("btnBootAuto", "Button State", a == 1 and "1" or "0")
+    end
   end
 
   -- Vacuums
   do
     local onR = b01(st.vacRear.on)
-    setp_ifdiff("btnVacRear",  "Button State", onR == 1 and "1" or "0")
-    setp_ifdiff("btnVacRear",  "Bg Color",     onR == 1 and "#00FF00" or "#404040")
+    if UILib and UILib.SyncToggleButton then
+      UILib.SyncToggleButton("btnVacRear", onR==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
+    else
+      setp_ifdiff("btnVacRear",  "Button State", onR == 1 and "1" or "0")
+      setp_ifdiff("btnVacRear",  "Bg Color",     onR == 1 and "#00FF00" or "#FF0000")
+    end
 
     local onF = b01(st.vacFront.on)
-    setp_ifdiff("btnVacFront", "Button State", onF == 1 and "1" or "0")
-    setp_ifdiff("btnVacFront", "Bg Color",     onF == 1 and "#00FF00" or "#404040")
+    if UILib and UILib.SyncToggleButton then
+      UILib.SyncToggleButton("btnVacFront", onF==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
+    else
+      setp_ifdiff("btnVacFront", "Button State", onF == 1 and "1" or "0")
+      setp_ifdiff("btnVacFront", "Bg Color",     onF == 1 and "#00FF00" or "#FF0000")
+    end
 
     local pvAuto = (SystemLib and SystemLib.PoundVarGet and SystemLib.PoundVarGet(inst, 401)) or mc.mcCntlGetPoundVar(inst, 401)
-    setp_ifdiff("btnVacAuto", "Button State", b01(pvAuto) == 1 and "1" or "0")
+    local a = b01(pvAuto)
+    if UILib and UILib.SyncToggleButton then
+      UILib.SyncToggleButton("btnVacAuto", a==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
+      UILib.SyncToggleButton("btnVacuumAuto", a==1, {bgColor="#00FF00", state="1"}, {bgColor="#FF0000", state="0"})
+    else
+      setp_ifdiff("btnVacAuto", "Button State", a == 1 and "1" or "0")
+    end
   end
 
   -- Soft limits

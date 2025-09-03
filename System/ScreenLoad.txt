@@ -487,8 +487,20 @@ function UI.SyncOutputs(snapshot)
   -- Soft limits
   do
     local on = b01(st.softlimits)
-    setp_ifdiff("btnSoftLimits", "Button State", on == 1 and "1" or "0")
-    setp_ifdiff("btnSoftLimits", "Bg Color",     on == 1 and "#00FF00" or "#404040")
+    local btn = "btnSoftLimits"
+    local isFlashing = (UILib and UILib.__flash and UILib.__flash[btn]) and true or false
+    if not isFlashing then
+      if UILib and UILib.SyncToggleButton then
+        UILib.SyncToggleButton(btn, on==1, {bgColor="#00FF00", state="1"}, {bgColor="#404040", state="0"})
+      else
+        setp_ifdiff(btn, "Button State", on == 1 and "1" or "0")
+        setp_ifdiff(btn, "Bg Color",     on == 1 and "#00FF00" or "#404040")
+      end
+    end
+    if on == 1 and UILib and UILib.__flash and UILib.__flash[btn] and UILib.__flash[btn].Stop then
+      pcall(UILib.__flash[btn].Stop)
+      UILib.__flash[btn] = nil
+    end
   end
 end
 

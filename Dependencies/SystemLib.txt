@@ -701,7 +701,9 @@ Returns:
 --]]
 function SystemLib.SetDebugMode(inst, enabled)
     debugMode = enabled
-    mc.mcCntlSetPoundVar(inst, 4990, enabled and 1 or 0)
+    -- Avoid (enabled and 1 or 0) truthy bug if callers pass 0/1 numerics
+    local v = (enabled == true or enabled == 1 or enabled == "1") and 1 or 0
+    mc.mcCntlSetPoundVar(inst, 4990, v)
     mc.mcCntlSetLastError(inst, "Debug mode: " .. (enabled and "ON" or "OFF"))
 end
 

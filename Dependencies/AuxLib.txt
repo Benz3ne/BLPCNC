@@ -96,7 +96,11 @@ local function _edge(key, nowBool)
 end
 
 local function _bool(x) return (x and x ~= 0 and x ~= "0") and true or false end
-local function _clamp01(x) return (x and x ~= 0) and 1 or 0 end
+-- Normalize to 0/1; avoid treating string "0" as ON
+local function _clamp01(x)
+    local n = tonumber(x)
+    return (n and n ~= 0) and 1 or 0
+end
 
 ----------------------------------------------------------------
 -- Public API

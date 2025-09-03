@@ -520,6 +520,27 @@ if not _G.PopulateTools then
   end
 end
 
+-- Quick helper to sync only soft-limits button (used by SoftLimitsToggle)
+function UI.SyncSoftLimits()
+  local inst = mc.mcGetInstance()
+  local h = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON)
+  local on = (h and mc.mcSignalGetState(h) == 1) and 1 or 0
+  local btn = "btnSoftLimits"
+  local flashing = (UILib and UILib.__flash and UILib.__flash[btn]) and true or false
+  if on == 1 and flashing and UILib and UILib.__flash[btn].Stop then
+    pcall(UILib.__flash[btn].Stop)
+    UILib.__flash[btn] = nil
+  end
+  if not flashing then
+    if UILib and UILib.SyncToggleButton then
+      UILib.SyncToggleButton(btn, on==1, {bgColor="#00FF00", state="1"}, {bgColor="#404040", state="0"})
+    else
+      setp_ifdiff(btn, "Button State", on == 1 and "1" or "0")
+      setp_ifdiff(btn, "Bg Color",     on == 1 and "#00FF00" or "#404040")
+    end
+  end
+end
+
 -- ===== Defer anything UI/IO-sensitive until frame is alive ===============
 if wx and wx.wxCallAfter then
   wx.wxCallAfter(function()

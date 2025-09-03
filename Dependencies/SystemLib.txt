@@ -240,13 +240,15 @@ function SystemLib.SignalSetState(inst, signal, state)
   -- Optional guard: #4991 blocks ON writes to O3..O6
   if id and _isTracked(id) then
     local ok, guard = pcall(mc.mcCntlGetPoundVar, inst, 4991)
-    if ok and tonumber(guard) == 1 and (state and 1 or 0) == 1 then
+    -- NOTE: do NOT use (state and 1 or 0) here (0 is truthy in Lua). Use normalized v.
+    if ok and tonumber(guard) == 1 and v == 1 then
       mc.mcCntlSetLastError(inst, string.format("[SYSDBG][GUARD] Block ON write id=%s", tostring(id)))
       return true
     end
   end
 
-  mc.mcSignalSetState(handle, (state and 1 or 0))
+  local v = (state == true or state == 1 or state == "1" or state == "HIGH" or state == "high") and 1 or 0
+  mc.mcSignalSetState(handle, v)
 
   if debugOn and traceOn and id and _isTracked(id) then
     local imm = mc.mcSignalGetState(handle)
@@ -254,7 +256,8 @@ function SystemLib.SignalSetState(inst, signal, state)
     local aft = mc.mcSignalGetState(handle)
     local enH = SystemLib.SignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED)
     local en = (enH and mc.mcSignalGetState(enH) == 1) and 1 or 0
-    mc.mcCntlSetLastError(inst, string.format("[SYSDBG] SetState id=%s want=%s imm=%s aft=%s en=%d", tostring(id), tostring(state and 1 or 0), tostring(imm), tostring(aft), en))
+    -- NOTE: log normalized value actually written (avoid (state and 1 or 0) truthy bug)
+    mc.mcCntlSetLastError(inst, string.format("[SYSDBG] SetState id=%s want=%d imm=%s aft=%s en=%d", tostring(id), v, tostring(imm), tostring(aft), en))
   end
   return true
 end
@@ -1121,7 +1124,7 @@ function SystemLib.Signals.Write(inst, values, opts)
     local name = map[k] or k
     local id = mc[name] or name
     if traceOn and (id == mc.OSIG_OUTPUT3 or id == mc.OSIG_OUTPUT4 or id == mc.OSIG_OUTPUT5 or id == mc.OSIG_OUTPUT6) then
-      local want = (v and 1 or 0)
+      local want = (v == true or v == 1 or v == "1" or v == "HIGH" or v == "high") and 1 or 0
       local h = SystemLib.SignalGetHandle(inst, id)
       local okGuard, guard = pcall(mc.mcCntlGetPoundVar, inst, 4991)
       if okGuard and tonumber(guard) == 1 and want == 1 then
@@ -1131,7 +1134,8 @@ function SystemLib.Signals.Write(inst, values, opts)
         -- SignalSetState handles debug readback
       end
     else
-      SystemLib.SignalSetState(inst, id, (v and 1 or 0))
+      local want = (v == true or v == 1 or v == "1" or v == "HIGH" or v == "high") and 1 or 0
+      SystemLib.SignalSetState(inst, id, want)
     end
   end
 end

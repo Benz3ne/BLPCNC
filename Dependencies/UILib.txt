@@ -1505,6 +1505,12 @@ function UILib.SyncToggleButton(buttonName, isActive, activeOpts, inactiveOpts)
         if opts.fgColor then scr.SetProperty(buttonName, "Fg Color", opts.fgColor) end
         if opts.label then scr.SetProperty(buttonName, "Label", opts.label) end
         if opts.state then scr.SetProperty(buttonName, "Button State", opts.state) end
+        -- Optional bold text. Property names vary by screen; try both, ignore failures.
+        if opts.textBold ~= nil then
+            local boldVal = (opts.textBold and "1" or "0")
+            pcall(scr.SetProperty, buttonName, "Font Bold", boldVal)
+            pcall(scr.SetProperty, buttonName, "Label Bold", boldVal)
+        end
     end)
 end
 
@@ -1577,6 +1583,15 @@ function UILib.CreateDeviceToggle(panel, deviceName, opts)
         local isOn = (s.on == 1)
         btn:SetValue(isOn)
         btn:SetLabel(("%s : %s"):format(label, isOn and onText or offText))
+        -- Optional colors / bold via opts.toggleActive/Inactive
+        local tOpts = isOn and opts.toggleActive or opts.toggleInactive
+        if tOpts then
+            if tOpts.bgColor then btn:SetBackgroundColour(wx.wxColour(tOpts.bgColor)) end
+            if tOpts.fgColor then btn:SetForegroundColour(wx.wxColour(tOpts.fgColor)) end
+            if tOpts.textBold ~= nil then
+                local font = btn:GetFont(); font:SetWeight(tOpts.textBold and wx.wxFONTWEIGHT_BOLD or wx.wxFONTWEIGHT_NORMAL); btn:SetFont(font)
+            end
+        end
 
         -- optional AUTO
         if autoChk then
@@ -1626,6 +1641,88 @@ function UILib.CreateDeviceToggle(panel, deviceName, opts)
 
     local controls = { toggle = btn, auto = autoChk, Update = Update, Destroy = Destroy }
     return hs, controls
+end
+
+--[[ FlashButton
+Start a flashing UI state for a button using SyncToggleButton. Returns controller with Stop().
+Params:
+  name       (string)    control name
+  spec       (table):
+    onColor/offColor     (string hex) background colors
+    onTextColor/offTextColor (string hex) optional text colors
+    onLabel/offLabel     (string) optional labels
+    frequency            (number) flashes per second (default 2.0)
+    duty                 (0..1)   percent ON time (default 0.5)
+    textBold             (boolean) whether text should be bold during ON phase
+    setState             (boolean) also set Button State (default true)
+    aliases              ({string}) optional alias control names to try
+Robust exit handling: Stop() cancels timer; function is idempotent.
+]]
+UILib.__flash = UILib.__flash or {}
+function UILib.FlashButton(name, spec)
+    spec = spec or {}
+    local inst = mc.mcGetInstance()
+    local freq = tonumber(spec.frequency) or 2.0
+    local duty = tonumber(spec.duty) or 0.5
+    if duty < 0 then duty = 0 elseif duty > 1 then duty = 1 end
+    local onMs  = math.max(50, math.floor((1.0/freq) * duty * 1000))
+    local offMs = math.max(50, math.floor((1.0/freq) * (1.0-duty) * 1000))
+    local ctrlNames = { name }
+    for _,a in ipairs(spec.aliases or {}) do table.insert(ctrlNames, a) end
+
+    local function firstExisting()
+        for _,n in ipairs(ctrlNames) do
+            local ok = pcall(scr.GetProperty, n, "Visible")
+            if ok then return n end
+        end
+        return name
+    end
+
+    local active = true
+    local phaseOn = true
+    local timer = wx.wxTimer()
+    local ctrlName = firstExisting()
+
+    local function apply(on)
+        local optsOn = {
+            bgColor = spec.onColor or "#FFFF00",
+            fgColor = spec.onTextColor,
+            label   = spec.onLabel,
+            state   = (spec.setState == false) and nil or "1",
+            textBold= spec.textBold == true,
+        }
+        local optsOff = {
+            bgColor = spec.offColor or "#4B4B4B",
+            fgColor = spec.offTextColor,
+            label   = spec.offLabel,
+            state   = (spec.setState == false) and nil or "0",
+            textBold= spec.textBold == true,
+        }
+        UILib.SyncToggleButton(ctrlName, on, optsOn, optsOff)
+    end
+
+    local function tick()
+        if not active then return end
+        apply(phaseOn)
+        phaseOn = not phaseOn
+        timer:Start(phaseOn and onMs or offMs, wx.wxTIMER_ONE_SHOT)
+    end
+
+    timer:Connect(wx.wxEVT_TIMER, function() tick() end)
+    timer:Start(onMs, wx.wxTIMER_ONE_SHOT)
+
+    local function Stop()
+        if not active then return end
+        active = false
+        pcall(function()
+            timer:Stop()
+            timer:Disconnect(wx.wxEVT_TIMER)
+        end)
+    end
+
+    local handle = { Stop = Stop }
+    UILib.__flash[ctrlName] = handle
+    return handle
 end
 
 return UILib

@@ -1,0 +1,343 @@
+-- AuxLib.lua
+-- Single owner of non-tool auxiliaries (dust, boot, vacs, beacons, etc.)
+-- Execution only; no UI. Depends on Mach4; will use SystemLib.* if available.
+
+AuxLib = AuxLib or {}
+
+----------------------------------------------------------------
+-- Configuration & runtime
+----------------------------------------------------------------
+-- Interlocks: caller may supply functions; safe defaults if not bound.
+AuxLib.__interlocks = {
+    virtualActive  = function() return false end,  -- e.g., laser/probe active?
+    rotationActive = function() return false end,  -- G68 active?
+    m6Active       = function() return false end,  -- tool change in progress?
+}
+
+-- Registry of devices: name -> spec + runtime
+-- spec: {
+--   outputs = { main="OSIG_OUTPUT4", aux="OSIG_OUTPUT3", ... }   -- any keys you like
+--   pv      = { auto=400, target=404, override=405 }             -- all optional
+--   auto    = function(ctx) -> 0|1|nil                           -- desired when auto enabled
+--   safety  = function(ctx) -> 0|1|nil                           -- hard override (wins last)
+--   events  = { clearManualOnSpindleRise=true, offOnM30=true }   -- optional behaviors
+-- }
+AuxLib.__dev = {}   -- name -> {spec=..., rt={handles={}, last={}} }
+
+----------------------------------------------------------------
+-- Internal helpers (Mach4 + optional SystemLib usage)
+----------------------------------------------------------------
+local function _sig_id(nameOrId)
+    if type(nameOrId) == "string" and mc[nameOrId] then return mc[nameOrId] end
+    return nameOrId
+end
+
+local function _sig_handle(inst, nameOrId)
+    local id = _sig_id(nameOrId)
+    if SystemLib and SystemLib.SignalGetHandle then
+        return SystemLib.SignalGetHandle(inst, id)
+    end
+    return mc.mcSignalGetHandle(inst, id)
+end
+
+local function _sig_read(inst, handleOrName)
+    local h = type(handleOrName) == "number" and handleOrName or _sig_handle(inst, handleOrName)
+    if not h or h == 0 then return 0 end
+    return mc.mcSignalGetState(h) or 0
+end
+
+local function _sig_write(inst, nameOrId, v)
+    -- Prefer SystemLib.Signals.Write if available for consistency
+    if SystemLib and SystemLib.Signals and SystemLib.Signals.Write then
+        SystemLib.Signals.Write(inst, { [nameOrId] = (v and 1 or 0) })
+        return
+    end
+    local h = _sig_handle(inst, nameOrId)
+    if h and h ~= 0 then mc.mcSignalSetState(h, (v and 1 or 0)) end
+end
+
+local function _pv_get(inst, n)
+    if not n then return nil end
+    if SystemLib and SystemLib.PoundVarGet then return SystemLib.PoundVarGet(inst, n) end
+    return mc.mcCntlGetPoundVar(inst, n)
+end
+
+local function _pv_set(inst, n, val)
+    if not n then return end
+    if SystemLib and SystemLib.PoundVarSet then SystemLib.PoundVarSet(inst, n, val) return end
+    mc.mcCntlSetPoundVar(inst, n, val)
+end
+
+local function _edge(key, nowBool)
+    if SystemLib and SystemLib.Edge then
+        local rise, fall = SystemLib.Edge(key, nowBool and true or false)
+        return rise, fall
+    end
+    -- Minimal local edge detector (fallback)
+    AuxLib.__edges = AuxLib.__edges or {}
+    local prev = AuxLib.__edges[key]
+    AuxLib.__edges[key] = nowBool and true or false
+    if prev == nil then return false, false end
+    return (nowBool and not prev), (prev and not nowBool)
+end
+
+local function _bool(x) return (x and x ~= 0 and x ~= "0") and true or false end
+local function _clamp01(x) return (x and x ~= 0) and 1 or 0 end
+
+----------------------------------------------------------------
+-- Public API
+----------------------------------------------------------------
+
+--[[ Register
+Register a device and pre-cache its signal handles.
+Params:
+  name (string)
+  spec (table)  -- see header for fields
+Returns:
+  ok (bool), err (string|nil)
+]]
+function AuxLib.Register(name, spec)
+    if type(name) ~= "string" or name == "" then return false, "Invalid device name" end
+    if type(spec) ~= "table" or type(spec.outputs) ~= "table" then
+        return false, "spec.outputs required"
+    end
+    local entry = { spec = spec, rt = { handles = {}, last = {} } }
+    -- Pre-cache output handles (best-effort)
+    for key, sigName in pairs(spec.outputs) do
+        entry.rt.handles[key] = _sig_handle(mc.mcGetInstance(), sigName)
+    end
+    AuxLib.__dev[name] = entry
+    return true
+end
+
+--[[ BindInterlocks
+Override interlock predicates used in ctx.
+Params:
+  fns (table) fields optional: virtualActive, rotationActive, m6Active
+]]
+function AuxLib.BindInterlocks(fns)
+    if type(fns) ~= "table" then return end
+    for k, fn in pairs(fns) do
+        if AuxLib.__interlocks[k] and type(fn) == "function" then
+            AuxLib.__interlocks[k] = fn
+        end
+    end
+end
+
+--[[ State
+Return snapshot of a device (or all devices if name=nil).
+Snapshot fields (per device):
+  { on=0/1, auto=0/1, target=0/1, manualMode=bool, spindle=0/1, inCycle=0/1, m6=bool, virt=bool, rotation=bool }
+]]
+function AuxLib.State(inst, name)
+    local function build_ctx()
+        local spindle = _sig_read(inst, "OSIG_SPINDLEON")
+        local inCycle = (mc.mcCntlIsInCycle(inst) == 1) and 1 or 0
+        return {
+            spindle   = spindle,
+            inCycle   = inCycle,
+            m6        = _bool(AuxLib.__interlocks.m6Active()),
+            virt      = _bool(AuxLib.__interlocks.virtualActive()),
+            rotation  = _bool(AuxLib.__interlocks.rotationActive()),
+        }
+    end
+
+    local ctx = build_ctx()
+    if name then
+        local d = AuxLib.__dev[name]
+        if not d then return nil end
+        local pv = d.spec.pv or {}
+        local auto   = _clamp01(_pv_get(inst, pv.auto))
+        local target = _clamp01(_pv_get(inst, pv.target))
+        local manual = (auto == 0)
+        local on     = d.rt.last.main ~= nil and (d.rt.last.main and 1 or 0) or target
+        return { on=on, auto=auto, target=target, manualMode=manual,
+                 spindle=ctx.spindle, inCycle=ctx.inCycle, m6=ctx.m6, virt=ctx.virt, rotation=ctx.rotation }
+    end
+
+    local all = {}
+    for k, _ in pairs(AuxLib.__dev) do
+        all[k] = AuxLib.State(inst, k)
+    end
+    return all
+end
+
+--[[ Request
+Uniform control surface for UI/PLC.
+Params:
+  inst (number), req { device=string, action=string, value=0|1|nil }
+Actions:
+  "auto.on"|"auto.off"|"auto.toggle"
+  "manual.on"|"manual.off"|"manual.toggle"
+  "reset"         -- clears manual target to 0, leaves auto as-is
+  "update"        -- run one update tick immediately
+Returns:
+  ok (bool), err (string|nil)
+]]
+function AuxLib.Request(inst, req)
+    req = req or {}
+    local name = req.device
+    local d = AuxLib.__dev[name]
+    if not d then return false, "Unknown device: "..tostring(name) end
+    local pv = d.spec.pv or {}
+    local action = tostring(req.action or "")
+
+    if action == "auto.on" then
+        _pv_set(inst, pv.auto, 1)
+    elseif action == "auto.off" then
+        _pv_set(inst, pv.auto, 0)
+    elseif action == "auto.toggle" then
+        local cur = _clamp01(_pv_get(inst, pv.auto)); _pv_set(inst, pv.auto, (cur==1) and 0 or 1)
+    elseif action == "manual.on" then
+        _pv_set(inst, pv.auto, 0); _pv_set(inst, pv.target, 1)
+    elseif action == "manual.off" then
+        _pv_set(inst, pv.auto, 0); _pv_set(inst, pv.target, 0)
+    elseif action == "manual.toggle" then
+        _pv_set(inst, pv.auto, 0)
+        local cur = _clamp01(_pv_get(inst, pv.target)); _pv_set(inst, pv.target, (cur==1) and 0 or 1)
+    elseif action == "reset" then
+        _pv_set(inst, pv.target, 0)
+    elseif action == "update" then
+        AuxLib.Update(inst)
+    else
+        return false, "Unknown action: "..action
+    end
+    -- Debug: log resulting PVs (auto/target) after request
+    do
+        local autoPV, targetPV = (pv and pv.auto), (pv and pv.target)
+        local autoVal = _pv_get(inst, autoPV)
+        local targVal = _pv_get(inst, targetPV)
+        local msg = string.format("AuxLib.Request %s %s -> auto(#%s)=%s target(#%s)=%s",
+                                  tostring(name), tostring(action), tostring(autoPV), tostring(autoVal), tostring(targetPV), tostring(targVal))
+        if SystemLib and SystemLib.Log then SystemLib.Log(inst, msg, "INFO") else mc.mcCntlSetLastError(inst, msg) end
+    end
+    return true
+end
+
+--[[ OnEvent
+System-wide events that may affect multiple devices.
+Supported events: "m30", "spindle_rise", "spindle_fall"
+]]
+function AuxLib.OnEvent(inst, evt)
+    evt = tostring(evt or "")
+    for name, d in pairs(AuxLib.__dev) do
+        local spec = d.spec or {}
+        local pv   = spec.pv or {}
+        if evt == "m30" then
+            if spec.events and spec.events.offOnM30 then
+                _pv_set(inst, pv.target, 0)
+            end
+        elseif evt == "spindle_rise" then
+            if spec.events and spec.events.clearManualOnSpindleRise then
+                -- Clear manual target to defer to auto on next Update
+                _pv_set(inst, pv.target, 0)
+            end
+        end
+    end
+end
+
+--[[ Update
+Call each PLC tick. Computes desired state and writes outputs.
+Order of precedence per device:
+  1) safety(ctx) -> if returns 0/1, that wins
+  2) if pv.auto==1 then desired = auto(ctx) else desired = pv.target
+  3) Write outputs if changed; when in AUTO we mirror pv.target to desired for visibility
+]]
+function AuxLib.Update(inst)
+    -- Build shared context
+    local spindle = _sig_read(inst, "OSIG_SPINDLEON")
+    local inCycle = (mc.mcCntlIsInCycle(inst) == 1) and 1 or 0
+    local rise, fall = _edge("AuxLib.spindle", spindle == 1)
+
+    if rise then AuxLib.OnEvent(inst, "spindle_rise") end
+    if fall then AuxLib.OnEvent(inst, "spindle_fall") end
+
+    local ctx = {
+        spindle  = spindle,
+        inCycle  = inCycle,
+        m6       = _bool(AuxLib.__interlocks.m6Active()),
+        virt     = _bool(AuxLib.__interlocks.virtualActive()),
+        rotation = _bool(AuxLib.__interlocks.rotationActive()),
+    }
+    local dbg = (SystemLib and SystemLib.IsDebugMode and SystemLib.IsDebugMode()) and true or false
+
+    for name, d in pairs(AuxLib.__dev) do
+        local spec = d.spec or {}
+        local pv   = spec.pv or {}
+
+        -- 1) safety wins if it returns explicit 0/1
+        local desired = nil
+        if type(spec.safety) == "function" then
+            local ok, val = pcall(spec.safety, ctx)
+            if ok and (val == 0 or val == 1) then desired = val end
+        end
+
+        -- 2) auto vs manual target
+        if desired == nil then
+            local autoEnabled = _clamp01(_pv_get(inst, pv.auto)) == 1
+            if autoEnabled then
+                if type(spec.auto) == "function" then
+                    local ok, val = pcall(spec.auto, ctx)
+                    if ok and (val == 0 or val == 1) then desired = val end
+
+                elseif type(spec.auto) == "table" then
+                    local on_if = spec.auto.on_if
+                    local off_if = spec.auto.off_if
+                    local should_be_on = false
+                    
+                    if type(on_if) == "string" and ctx[on_if] then
+                        should_be_on = true
+                    elseif type(on_if) == "table" then
+                        local all_true = true
+                        for _, cond in ipairs(on_if) do
+                            if not ctx[cond] then all_true = false; break end
+                        end
+                        should_be_on = all_true
+                    end
+
+                    if should_be_on then
+                        if type(off_if) == "string" and ctx[off_if] then
+                            should_be_on = false
+                        elseif type(off_if) == "table" then
+                           for _, cond in ipairs(off_if) do
+                               if ctx[cond] then should_be_on = false; break end
+                           end
+                        end
+                    end
+                    desired = should_be_on and 1 or 0
+                end
+                
+                -- Mirror into pv.target for operator visibility
+                if desired ~= nil then _pv_set(inst, pv.target, desired) end
+            else
+                desired = _clamp01(_pv_get(inst, pv.target))
+            end
+        end
+
+        -- Default safe value if still nil
+        if desired == nil then desired = 0 end
+
+        -- 3) Write outputs if changed (main only; extend for aux keys if desired)
+        d.rt.last = d.rt.last or {}
+        local last = d.rt.last.main
+        if last == nil or (last and 1 or 0) ~= desired then
+            -- Write every declared output key to desired (common pattern)
+            for key, sigName in pairs(spec.outputs or {}) do
+                _sig_write(inst, sigName, desired == 1)
+                if dbg then
+                    local id = mc[sigName] or sigName
+                    local h  = (type(id)=="number") and mc.mcSignalGetHandle(inst, id) or _sig_handle(inst, sigName)
+                    local en = (_sig_read(inst, "OSIG_MACHINE_ENABLED") == 1) and 1 or 0
+                    local rb = (h and h ~= 0) and (mc.mcSignalGetState(h) or -1) or -1
+                    local msg = string.format(
+                        "AuxLib.Write %s: %s id=%s handle=%s en=%d want=%d read=%s",
+                        tostring(name), tostring(sigName), tostring(id), tostring(h), en, desired, tostring(rb))
+                    if SystemLib and SystemLib.Log then SystemLib.Log(inst, msg, "DEBUG") else mc.mcCntlSetLastError(inst, msg) end
+                end
+            end
+            d.rt.last.main = (desired == 1)
+        end
+    end
+end
+
+return AuxLib

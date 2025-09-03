@@ -1,210 +1,175 @@
 --[[
-AuxFreezeTrace.txt  — single‑file patch (drop‑in)
-Purpose:
-  • Give you a KILL‑SWITCH to freeze AuxLib’s output writes (#4991)
-  • Trace and log EVERY Lua write to OSIG_OUTPUT3..6 with caller file/line
-  • (Optional) make AuxLib.State() report the REAL on/off using live OSIG readback
-  • Zero project changes required; safe to remove at any time (restart restores originals)
+Outputs_FullAutoDiag.txt  — one‑shot, self‑contained diagnostic
+Goal: Do EVERYTHING automatically. No extra commands.
 
-How to use (any one of these):
-  A) Click a button that runs:  SystemLib.RunProfileScript(inst, "AuxFreezeTrace.txt")
-  B) From ScreenLoad.txt:      dofile("C:/Mach4Hobby/Profiles/BLP/Scripts/Dependencies/AuxFreezeTrace.txt")
-  C) From MDI/console:         SystemLib.RunProfileScript(inst, "AuxFreezeTrace.txt")
+What it does (per device: dust/boot/vacRear/vacFront):
+  1) Snapshot current OSIG + AUTO/TGT PVs.
+  2) Freeze AuxLib’s writer (temporary wrapper) and force OFF → watch 1s →
+     • If any comes back ON while frozen ⇒ EXTERNAL_REASSERT (plugin/hardware mapping)
+  3) Unfreeze and test Aux logic deterministically (no guessing):
+     • Manual path: AUTO=0; TGT=1 ⇒ expect ON; TGT=0 ⇒ expect OFF
+     • Auto path:   AUTO=1; TGT=0 ⇒ observe what Aux drives (classify)
+  4) Live “direct OSIG” test with Aux active: write 0, sample 200/1000ms ⇒ detect AUX_REASSERT.
+  5) Restore all PVs and outputs to the pre‑test snapshot.
+  6) Save a clean report here:
+       C:\Mach4Hobby\Profiles\<Profile>\Reports\Outputs_FullAutoDiag-YYYYMMDD-HHMMSS.log
+(Also mirrors key lines to the status bar.)
 
-Quick controls after load:
-  • _G.AuxTrace.Freeze(true)      -- sets #4991=1 (AuxLib.Update will skip writes)
-  • _G.AuxTrace.Freeze(false)     -- sets #4991=0 (unfreeze)
-  • _G.AuxTrace.ToggleFreeze()
-  • _G.AuxTrace.Status()          -- prints freeze + current OSIG states
-  • _G.AuxTrace.EnableTrace(true/false)  -- turn caller tracing on/off
-
-Where logs go:
-  <MachDir>\Profiles\<Profile>\Reports\AuxFreezeTrace-YYYYMMDD-HHMMSS.log
-  (Also mirrors key lines to the status bar via mcCntlSetLastError)
+How to run: paste into the Lua editor (Operator ▸ Edit/Debug Scripts) and Run.
+Or save in your Scripts folder and call via SystemLib.RunProfileScript.
 ]]
 
 local mc = mc
 local wx = require("wx")
 
--- ===== paths + logging ========================================================
-local function getProfileDir(inst)
-  local mach = mc.mcCntlGetMachDir(inst)
-  local ok, prof = pcall(mc.mcProfileGetName, inst)
-  return (mach .. "\\Profiles\\" .. (ok and prof or "BLP")):gsub("/","\\")
-end
-local function nowUTC() local t=os.date("!*t"); return string.format("%04d%02d%02d-%02d%02d%02d",t.year,t.month,t.day,t.hour,t.min,t.sec) end
+-- ===== helpers ================================================================
+local function profDir(inst) local mach=mc.mcCntlGetMachDir(inst); local ok,p=pcall(mc.mcProfileGetName,inst); return (mach.."\\Profiles\\"..(ok and p or "BLP")) end
+local function utcStamp() local t=os.date("!*t"); return string.format("%04d%02d%02d-%02d%02d%02d",t.year,t.month,t.day,t.hour,t.min,t.sec) end
 local function ensureDir(p) os.execute(string.format('if not exist "%s" mkdir "%s"', p, p)) end
-local function newLogger(inst)
-  local base = getProfileDir(inst) .. "\\Reports"; ensureDir(base)
-  local file = base .. "\\AuxFreezeTrace-"..nowUTC()..".log"
-  local fh = assert(io.open(file, "w"))
-  local function line(fmt, ...)
-    local msg = (select('#', ...) > 0) and string.format(fmt, ...) or tostring(fmt)
-    fh:write(os.date("%H:%M:%S "), msg, "\n"); fh:flush()
-    mc.mcCntlSetLastError(inst, msg)
+local function sleep(ms) wx.wxMilliSleep(ms) end
+local function nowhms() return os.date("%H:%M:%S") end
+
+local function newLog(inst)
+  local base = profDir(inst).."\\Reports"; ensureDir(base)
+  local file = base.."\\Outputs_FullAutoDiag-"..utcStamp()..".log"
+  local f = assert(io.open(file, "w"))
+  local function log(fmt, ...)
+    local s = (select('#',...)>0) and string.format(fmt, ...) or tostring(fmt)
+    f:write(nowhms()," ",s,"\n"); f:flush(); mc.mcCntlSetLastError(inst, s)
   end
-  return { file=file, log=line, close=function() fh:close() end }
+  return {file=file, log=log, close=function() f:close() end}
 end
 
--- ===== small helpers ==========================================================
-local function sigHandle(inst, id) local ok,h=pcall(mc.mcSignalGetHandle,inst,id); return ok and h or nil end
-local function sigState(h) local ok,s=pcall(mc.mcSignalGetState,h); return ok and (s==1 and 1 or 0) or -1 end
-local function setPV(inst, n, v) pcall(mc.mcCntlSetPoundVar, inst, n, tonumber(v) or 0) end
-local function getPV(inst, n) local ok,v=pcall(mc.mcCntlGetPoundVar, inst, n); return ok and tonumber(v) or 0 end
+local function sigH(inst, id) local ok,h=pcall(mc.mcSignalGetHandle,inst,id); return ok and h or nil end
+local function sigR(h) local ok,s=pcall(mc.mcSignalGetState,h); return ok and (s==1 and 1 or 0) or -1 end
+local function sigW(h,v) pcall(mc.mcSignalSetState,h,(v and 1 or 0)) end
+local function pvG(inst,n) local ok,v=pcall(mc.mcCntlGetPoundVar,inst,n); return ok and tonumber(v) or 0 end
+local function pvS(inst,n,v) pcall(mc.mcCntlSetPoundVar,inst,n,tonumber(v) or 0) end
 
--- Our devices of interest
-local MAP = {
-  dust     = { osig = mc.OSIG_OUTPUT4, autoPV=400, tgtPV=404, label="DustCollect" },
-  boot     = { osig = mc.OSIG_OUTPUT3, autoPV=402, tgtPV=403, label="DustBoot" },
-  vacRear  = { osig = mc.OSIG_OUTPUT5, autoPV=401, tgtPV=411, label="VacRear" },
-  vacFront = { osig = mc.OSIG_OUTPUT6, autoPV=401, tgtPV=412, label="VacFront" },
+local DEV = {
+  { key="dust",     name="Dust Collect", osig=mc.OSIG_OUTPUT4, autoPV=400, tgtPV=404 },
+  { key="boot",     name="Dust Boot",    osig=mc.OSIG_OUTPUT3, autoPV=402, tgtPV=403 },
+  { key="vacRear",  name="Vac Rear",     osig=mc.OSIG_OUTPUT5, autoPV=401, tgtPV=411 },
+  { key="vacFront", name="Vac Front",    osig=mc.OSIG_OUTPUT6, autoPV=401, tgtPV=412 },
 }
 
--- ===== install patch (deferred until libs are present) ========================
-local inst = mc.mcGetInstance()
-local L = newLogger(inst)
-L.log("AuxFreezeTrace: loading… (profile dir: %s)", getProfileDir(inst))
-
-_G.AuxTrace = _G.AuxTrace or {}
-local AuxTrace = _G.AuxTrace
-AuxTrace._traceEnabled = true
-
-function AuxTrace.EnableTrace(on)
-  AuxTrace._traceEnabled = (on ~= false)
-  L.log("[TRACE] caller tracing %s", AuxTrace._traceEnabled and "ENABLED" or "DISABLED")
-end
-
-function AuxTrace.Freeze(on)
-  setPV(inst, 4991, on and 1 or 0)
-  L.log("[FREEZE] AuxLib.Update is %s (#4991=%d)", on and "FROZEN" or "LIVE", getPV(inst,4991))
-end
-function AuxTrace.ToggleFreeze() AuxTrace.Freeze(getPV(inst,4991)==0) end
-
-function AuxTrace.Status()
-  local en = sigState(sigHandle(inst, mc.OSIG_MACHINE_ENABLED))
-  local lines = { string.format("STATUS: Enabled=%d Freeze=%d", en, getPV(inst,4991)) }
-  for k,c in pairs(MAP) do
-    local h = sigHandle(inst, c.osig)
-    table.insert(lines, string.format("  %-8s OSIG=%d auto=%d tgt=%d", k, sigState(h), getPV(inst,c.autoPV), getPV(inst,c.tgtPV)))
-  end
-  for _,s in ipairs(lines) do L.log(s) end
-end
-
--- ===== wrappers ===============================================================
-local function installWrappers()
+-- ===== temporary freeze wrapper around AuxLib.Update ==========================
+local function installFreezeGate(inst, LOG)
   local AuxLib = rawget(_G, "AuxLib")
-  local SystemLib = rawget(_G, "SystemLib")
-  if not AuxLib or not SystemLib then return false end
-
-  -- 1) Freeze gate for AuxLib.Update
-  if type(AuxLib.Update)=="function" and not AuxLib._AFT_wrapped then
-    local ORIG = AuxLib.Update
-    AuxLib.Update = function(i, ...)
-      if getPV(i or inst, 4991) == 1 then
-        -- Throttle message (every ~500ms)
-        local t = os.clock(); AuxTrace._lastSkip = AuxTrace._lastSkip or 0
-        if t - AuxTrace._lastSkip > 0.5 then
-          L.log("[FREEZE] Skipping AuxLib.Update writes (kill‑switch active)")
-          AuxTrace._lastSkip = t
-        end
-        return true
-      end
-      return ORIG(i or inst, ...)
-    end
-    AuxLib._AFT_wrapped = true
-    L.log("Wrapped AuxLib.Update with #4991 freeze gate")
+  if not AuxLib or type(AuxLib.Update) ~= "function" then
+    LOG.log("WARNING: AuxLib.Update not found; freeze gate skipped")
+    return {active=false}
   end
-
-  -- 2) Caller trace for SystemLib.SignalSetState (only OSIG 3..6)
-  if type(SystemLib.SignalSetState)=="function" and not SystemLib._AFT_wrapped then
-    local ORIG = SystemLib.SignalSetState
-    SystemLib.SignalSetState = function(i, idOrHandle, want)
-      local id = idOrHandle
-      if type(idOrHandle) ~= "number" then
-        -- assume handle
-        local ok, n = pcall(mc.mcSignalGetState, idOrHandle) -- touch to validate
-        id = idOrHandle -- keep as handle for ORIG; we’ll compute numeric id for log if possible
-      end
-
-      local numericId = nil
-      -- Try to map handle to numeric signal id (best effort)
-      if type(idOrHandle) ~= "number" then
-        for _,sid in ipairs({mc.OSIG_OUTPUT3, mc.OSIG_OUTPUT4, mc.OSIG_OUTPUT5, mc.OSIG_OUTPUT6}) do
-          if sigHandle(inst, sid) == idOrHandle then numericId = sid; break end
-        end
-      else
-        numericId = idOrHandle
-      end
-
-      local interesting = numericId==mc.OSIG_OUTPUT3 or numericId==mc.OSIG_OUTPUT4 or numericId==mc.OSIG_OUTPUT5 or numericId==mc.OSIG_OUTPUT6
-      if interesting and AuxTrace._traceEnabled then
-        local where = debug.getinfo(2, "Sl") or {}
-        L.log("[TRACE] write %s -> %s  @%s:%s", tostring(numericId or idOrHandle), tostring(want), tostring(where.short_src or "?"), tostring(where.currentline or "?"))
-      end
-
-      local rc = ORIG(i or inst, idOrHandle, want)
-
-      if interesting and AuxTrace._traceEnabled then
-        -- readback
-        local h = (type(idOrHandle)=="number") and sigHandle(i or inst, idOrHandle) or idOrHandle
-        local rb = h and sigState(h) or -1
-        L.log("[TRACE]   readback=%d", rb)
-      end
-      return rc
-    end
-    SystemLib._AFT_wrapped = true
-    L.log("Wrapped SystemLib.SignalSetState with caller tracing (OSIG 3..6)")
+  local ORIG = AuxLib.Update
+  local state = {active=true, orig=ORIG}
+  AuxLib.Update = function(i,...)
+    if pvG(i or inst, 4991) == 1 then return true end
+    return ORIG(i or inst, ...)
   end
-
-  -- 3) Optional: make AuxLib.State reflect LIVE OSIG readback for our four devices
-  if type(AuxLib.State)=="function" and not AuxLib._AFT_state_wrapped then
-    local ORIG = AuxLib.State
-    AuxLib.State = function(i, name, ...)
-      local t = ORIG(i or inst, name, ...)
-      if type(name)=="string" and MAP[name] and type(t)=="table" then
-        local h = sigHandle(i or inst, MAP[name].osig)
-        local live = (h and sigState(h) or 0)
-        t.on = (live==1) and 1 or 0
-        t.live = live
-        t.note = "on reflects live OSIG"
-      end
-      return t
-    end
-    AuxLib._AFT_state_wrapped = true
-    L.log("Patched AuxLib.State to prefer live OSIG for dust/boot/vac*")
-  end
-
-  return true
+  LOG.log("Installed Aux freeze gate (#4991)")
+  return state
 end
 
--- Try immediately, else retry a few times (libs may not yet be loaded)
-local ok = installWrappers()
-if not ok then
-  L.log("Libraries not ready; will retry to install wrappers…")
-  local tries, timer = 0, wx.wxTimer()
-  timer:Start(250)
-  timer:Connect(wx.wxEVT_TIMER, function()
-    tries = tries + 1
-    if installWrappers() or tries > 40 then
-      timer:Stop(); timer:Disconnect(wx.wxEVT_TIMER)
-      L.log(installWrappers() and "Wrappers installed on retry" or "Wrappers not installed (timeout)")
-    end
-  end)
+local function removeFreezeGate(state)
+  local AuxLib = rawget(_G, "AuxLib")
+  if AuxLib and state and state.active and state.orig then AuxLib.Update = state.orig end
 end
 
--- Expose a tiny one‑shot to prove external reassertor in 1s
-function AuxTrace.ProveExternal()
-  L.log("[PROVE] Forcing OFF, freezing Aux, watching 1s for reassert…")
-  AuxTrace.Freeze(true)
-  for k,c in pairs(MAP) do local h=sigHandle(inst,c.osig); if h then mc.mcSignalSetState(h,0) end end
-  wx.wxMilliSleep(1000)
-  for k,c in pairs(MAP) do
-    local h=sigHandle(inst,c.osig); local s=h and sigState(h) or -1
-    L.log(string.format("[PROVE] %-8s after 1s: %d", k, s))
+-- ===== main ==================================================================
+local function run()
+  local inst = mc.mcGetInstance(); if not inst then return end
+  local LOG = newLog(inst)
+  LOG.log("Outputs Full Auto Diagnostic start (Enabled=%d)", sigR(sigH(inst, mc.OSIG_MACHINE_ENABLED)))
+
+  -- install temporary freeze switch
+  local gate = installFreezeGate(inst, LOG)
+
+  -- snapshot
+  local snap = {}
+  for _,d in ipairs(DEV) do
+    local h = sigH(inst, d.osig)
+    snap[d.key] = { osig=sigR(h), auto=pvG(inst,d.autoPV), tgt=pvG(inst,d.tgtPV) }
   end
-  L.log("If any are 1 while frozen → controller/plugin is reasserting (not Lua)")
+  LOG.log("SNAPSHOT:")
+  for _,d in ipairs(DEV) do
+    local s=snap[d.key]
+    LOG.log("  %-8s OSIG=%d AUTO=%d TGT=%d", d.key, s.osig, s.auto, s.tgt)
+  end
+
+  -- TEST 1: Freeze Aux, force OFF, watch 1s → EXTERNAL?
+  local freezePrior = pvG(inst, 4991)
+  pvS(inst, 4991, 1)
+  LOG.log("TEST1: Freeze Aux (#4991=1), force OFF, watch 1s…")
+  for _,d in ipairs(DEV) do sigW(sigH(inst,d.osig), 0) end
+  sleep(1000)
+  local ext = {}
+  for _,d in ipairs(DEV) do
+    local s = sigR(sigH(inst,d.osig)); ext[d.key] = (s==1)
+    LOG.log("  %-8s after1s=%d  %s", d.key, s, s==1 and "REASSERTED (EXTERNAL)" or "held-LOW")
+  end
+
+  -- TEST 2: Unfreeze; deterministic Aux checks
+  pvS(inst, 4991, freezePrior) -- restore previous freeze state
+  LOG.log("TEST2: Aux live; manual then auto checks")
+  local auxVerdict = {}
+  for _,d in ipairs(DEV) do
+    local h = sigH(inst, d.osig)
+
+    -- Manual expected behavior (AUTO=0)
+    pvS(inst, d.autoPV, 0); pvS(inst, d.tgtPV, 1)
+    if _G.AuxLib and _G.AuxLib.Update then _G.AuxLib.Update(inst) end
+    sleep(50)
+    local on1 = sigR(h)
+    pvS(inst, d.tgtPV, 0)
+    if _G.AuxLib and _G.AuxLib.Update then _G.AuxLib.Update(inst) end
+    sleep(50)
+    local on2 = sigR(h)
+
+    local manualOK = (on1==1 and on2==0)
+
+    -- Auto behavior (AUTO=1)
+    pvS(inst, d.autoPV, 1); pvS(inst, d.tgtPV, 0)
+    if _G.AuxLib and _G.AuxLib.Update then _G.AuxLib.Update(inst) end
+    sleep(50)
+    local autoOn = sigR(h)
+
+    -- Direct OFF under Aux (should reveal Aux reassert)
+    sigW(h, 0); sleep(200); local d200 = sigR(h); sleep(800); local d1000 = sigR(h)
+
+    local verdict
+    if ext[d.key] then verdict = "EXTERNAL_REASSERT (plugin/hardware)"
+    elseif not manualOK then verdict = "AUX_MANUAL_PATH_BAD (check Request/PVs/rules)"
+    elseif autoOn==1 and (d200==1 or d1000==1) then verdict = "AUX_REASSERT (auto driving ON)"
+    else verdict = "OK (manual works; auto not forcing on)" end
+
+    auxVerdict[d.key] = {manualOK=manualOK, autoOn=autoOn, d200=d200, d1000=d1000, verdict=verdict}
+
+    LOG.log("  %-8s MANUAL: T1=%d T0=%d | AUTO=%d | DirectOFF +200=%d +1000=%d → %s",
+      d.key, on1, on2, autoOn, d200, d1000, verdict)
+  end
+
+  -- RESTORE to snapshot
+  LOG.log("RESTORE: returning PVs and outputs to snapshot…")
+  for _,d in ipairs(DEV) do
+    pvS(inst, d.autoPV, snap[d.key].auto)
+    pvS(inst, d.tgtPV,  snap[d.key].tgt)
+    sigW(sigH(inst,d.osig), snap[d.key].osig==1)
+  end
+
+  -- SUMMARY
+  LOG.log("\n=== SUMMARY ===")
+  for _,d in ipairs(DEV) do
+    local e = ext[d.key] and "EXTERNAL_REASSERT" or "-"
+    local a = auxVerdict[d.key]
+    LOG.log("%-8s ext=%s  manualOK=%s  autoOn=%d  directOff(+1s)=%d  → %s",
+      d.key, e, tostring(a.manualOK), a.autoOn, a.d1000, a.verdict)
+  end
+
+  LOG.log("\nReport: %s", LOG.file)
+  LOG.close()
+
+  -- remove freeze gate wrapper
+  removeFreezeGate(gate)
 end
 
--- Print an initial status snapshot
-AuxTrace.Status()
-L.log("AuxFreezeTrace ready. Log file: %s", L.file)
+run()

@@ -81,6 +81,13 @@ local function run()
   local LOG = newLog(inst)
   LOG.log("Outputs Full Auto Diagnostic start (Enabled=%d)", sigR(sigH(inst, mc.OSIG_MACHINE_ENABLED)))
 
+  -- Temporarily force library logging/tracing on; restore at end
+  local prevDbg = pvG(inst, 4990) or 0
+  local prevTrc = pvG(inst, 4992) or 0
+  pvS(inst, 4990, 1)
+  pvS(inst, 4992, 1)
+  LOG.log("Logging: prev #4990=%d #4992=%d -> forcing ON", prevDbg, prevTrc)
+
   -- install temporary freeze switch
   local gate = installFreezeGate(inst, LOG)
 
@@ -166,6 +173,10 @@ local function run()
   end
 
   LOG.log("\nReport: %s", LOG.file)
+  -- Restore prior logging/tracing PVs
+  pvS(inst, 4990, prevDbg or 0)
+  pvS(inst, 4992, prevTrc or 0)
+  LOG.log("Logging restored: #4990=%d #4992=%d", prevDbg, prevTrc)
   LOG.close()
 
   -- remove freeze gate wrapper

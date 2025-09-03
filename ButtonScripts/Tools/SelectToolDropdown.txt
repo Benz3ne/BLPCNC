@@ -1,0 +1,46 @@
+-- lstCurrentTool On Update Script (properly trimmed)
+local inst = mc.mcGetInstance()
+local rawValue = scr.GetProperty("lstCurrentTool", "Value")
+local selectedIndex = nil
+
+-- Try number first
+local numValue = tonumber(rawValue)
+if numValue and numValue >= 0 then
+    selectedIndex = numValue
+else
+    -- It's a string - find it in toolChoices
+    if _G.toolChoices and rawValue and rawValue ~= "" then
+        for i, choice in ipairs(_G.toolChoices) do
+            if choice == rawValue then
+                selectedIndex = i - 1  -- Convert to 0-based
+                break
+            end
+        end
+        
+        -- If not found, try parsing tool number
+        if not selectedIndex then
+            local toolNum = rawValue:match("^(%d+)")
+            if toolNum then
+                toolNum = tonumber(toolNum)
+                for i, t in ipairs(_G.toolNumbers) do
+                    if t == toolNum then
+                        selectedIndex = i - 1
+                        break
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Process the selection
+if selectedIndex and selectedIndex >= 0 then
+    _G.selectedToolIndex = selectedIndex
+    
+    if _G.toolNumbers and _G.toolNumbers[selectedIndex + 1] then
+        local toolNum = _G.toolNumbers[selectedIndex + 1]
+        local desc = (toolNum == 0) and "No Tool" or 
+                     (mc.mcToolGetDesc(inst, toolNum) or "Unnamed")
+        mc.mcCntlSetLastError(inst, string.format("Selected T%d - %s", toolNum, desc))
+    end
+end

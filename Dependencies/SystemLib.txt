@@ -1166,12 +1166,14 @@ function SystemLib.Signals.Apply(dest, map, opts)
 
   for k, fn in pairs(map or {}) do
     local id = norm(k)
-    dest[id] = function(state)
-      local ok, err = pcall(fn, (state ~= 0) and 1 or 0)
-      if not ok then
-        mc.mcCntlSetLastError(inst, "Signal handler error ["..tostring(k).."]: "..tostring(err))
+      dest[id] = function(state)
+        -- state from Mach is numeric 0/1; using (state ~= 0) is safe (boolean left side)
+        local val = ((tonumber(state) or 0) ~= 0) and 1 or 0
+        local ok, err = pcall(fn, val)
+        if not ok then
+          mc.mcCntlSetLastError(inst, "Signal handler error ["..tostring(k).."]: "..tostring(err))
+        end
       end
-    end
   end
   return dest
 end

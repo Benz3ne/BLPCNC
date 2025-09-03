@@ -1309,7 +1309,9 @@ function ToolLib.M6.Clamp(inst, state, opts)
         local tmo = tonumber(opts.timeout_ms or 2000)
         while true do
             local got = _sig_read(inst, opts["in"])
-            if got == (opts.expect and 1 or 0) then return true, nil end
+            -- Avoid truthy bug: normalize expect explicitly
+            local want = (opts.expect == true or opts.expect == 1 or opts.expect == "1") and 1 or 0
+            if got == want then return true, nil end
             if (wx.wxGetUTCTimeMillis():ToNumber() - t0) > tmo then
                 return false, "Clamp: timeout waiting for input"
             end
@@ -1343,7 +1345,9 @@ function ToolLib.M6.VerifyPresent(inst, expect, opts)
 
     while true do
         local now = _sig_read(inst, opts["in"])
-        if now == (expect and 1 or 0) then
+        -- Normalize expect explicitly (no (expect and 1 or 0))
+        local want = (expect == true or expect == 1 or expect == "1") and 1 or 0
+        if now == want then
             if last == now then
                 stableFor = stableFor + 10
                 if stableFor >= deb then return true, nil end

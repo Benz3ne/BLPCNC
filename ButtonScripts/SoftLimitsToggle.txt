@@ -29,8 +29,10 @@ if not enable then
 end
 
 -- Apply to all enabled axes + reflect the master signal
-for axis = 0, 5 do if mc.mcAxisIsEnabled(inst, axis) == 1 then mc.mcSoftLimitSetState(inst, axis, enable and 1 or 0) end end
-local hsig = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON); if hsig and hsig > 0 then mc.mcSignalSetState(hsig, enable and 1 or 0) end
+-- Normalize to avoid truthy bug if enable is numeric 0/1
+local v = (enable == true or enable == 1 or enable == "1") and 1 or 0
+for axis = 0, 5 do if mc.mcAxisIsEnabled(inst, axis) == 1 then mc.mcSoftLimitSetState(inst, axis, v) end end
+local hsig = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON); if hsig and hsig > 0 then mc.mcSignalSetState(hsig, v) end
 
 -- Ask the centralized UI to sync the button from actual signal state
 if _G.UI and _G.UI.SyncSoftLimits then _G.UI.SyncSoftLimits() else mc.mcCntlSetLastError(inst, "UI.SyncSoftLimits not found: UI may lag") end

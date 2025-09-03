@@ -19,3 +19,10 @@ Rationale: Keep libraries as the single source of truth for execution (IO/state)
 - Diagnostics: added Scripts\Diagnostics\OutputsDebug.txt — comprehensive output test for OSIG_OUTPUT3..6 with immediate and delayed readback, optional PV forcing to reduce interference, and Aux device/PV snapshot. Logs are printed to the message console with an [OUTDBG] prefix.
 - Debug: added ButtonScripts\Debug\OutputsTrace.txt — attribution harness that wraps SystemLib.SignalSetState/Signals.Write during a short trace window to capture caller (file:line), want/imm/aft states, and optionally guard ON writes to O3..O6; includes OFF reassertion timing sampler and UI control probes. All toggles configurable at top of the script.
   - Includes a minimal direct OFF test (identical to your known-good snippet) for O4/O5/O6 that writes via mc.mcSignalSetState(handle,0) and logs immediate and 200ms readback, to confirm base toggling.
+
+- SystemLib: added debug/guard toggles:
+  - #4992 (SignalsTrace): when #4990 debug mode ON, traces writes to O3..O6 in SignalSetState/Signals.Write with immediate and delayed read-back and machine-enabled state.
+  - #4991 (OutputGuard): when set to 1, blocks ON writes to O3..O6 and logs the attempt.
+- AuxLib: added per-device desired-change logging when #4992 enabled; added _G.__AUX_WRITE_BLOCK to skip writes for isolation tests.
+- Debug: added ButtonScripts\\Debug\\PVTrace.txt � audits PVs (#400/#401/#402/#404/#403/#411/#412), ctx (spindle/inCycle/m6/virt/rotation), computes desired per AuxLib logic, and compares to current signal state, flagging mismatches.
+

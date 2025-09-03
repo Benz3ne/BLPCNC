@@ -26,3 +26,5 @@ Rationale: Keep libraries as the single source of truth for execution (IO/state)
 - AuxLib: added per-device desired-change logging when #4992 enabled; added _G.__AUX_WRITE_BLOCK to skip writes for isolation tests.
 - Debug: added ButtonScripts\\Debug\\PVTrace.txt — audits PVs (#400/#401/#402/#404/#403/#411/#412), ctx (spindle/inCycle/m6/virt/rotation), computes desired per AuxLib logic, and compares to current signal state, flagging mismatches.
 
+
+- AuxLib: fixed truthiness bug in auto(table) evaluation; ctx fields are numeric (0/1) and were being treated as truthy. on_if/off_if now compare == 1 / ~= 1 explicitly.

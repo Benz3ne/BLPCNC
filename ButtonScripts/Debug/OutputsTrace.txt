@@ -1,214 +1,170 @@
--- OutputsTrace.txt
--- Purpose: Identify precisely who (file:line) reasserts OSIG_OUTPUT3..6 to 1 after OFF.
--- Safe: Does not enable/disable machine or e-stop. All tracing/guarding is temporary for this run.
+--[[
+Mach4 Output Flip Diagnostic v2 (edge + persistence)
+Purpose: Reconcile “my tiny script turns them OFF permanently” vs. “manual/direct OFF fails in diag.”
+Key: Detect edge‑triggered/latching reassertors and persistence timing.
 
-local inst = mc.mcGetInstance()
+What it does:
+  * Tests OFF behavior under four scenarios per device:
+      1) MANUAL OFF without priming (no prior ON)
+      2) MANUAL OFF after ON (prime rising edge)
+      3) DIRECT OFF without priming
+      4) DIRECT OFF after ON (prime rising edge)
+  * Runs each with AUTO PV = 0 and AUTO PV = 1
+  * Records immediate readback and delayed readback (200 ms, 1000 ms)
+  * Optional “hammer” (setSig(0) every 5 ms for 300 ms) to see if a continuous writer exists
+  * Saves report to: Profiles/<Profile>/Reports/OutputFlipDiagV2-YYYYMMDD-HHMMSS.log
 
--- ========================= User Toggles =========================
-local FORCE_AUTOS_OFF   = true   -- set autos/targets to 0 before tests
-local TRACE_MS          = 1200   -- trace window duration (ms)
-local TRACE_GUARD_ON    = true   -- within trace window, block ON (1) writes to O3..O6 and log caller
-local DELAY_MS          = 150    -- readback delay after each traced write (ms)
-local SAMPLE_OFF_FAST   = 10     -- rapid sampling step (ms) for OFF->1 reassert timing
-local SAMPLE_OFF_SLOW   = 50     -- slower sampling step (ms)
-local TEST_OUTPUTS      = {3,4,5,6,7}
+How to run:
+  * Paste into Lua editor (Operator ▸ Edit/Debug Scripts), Run.
+  * Machine ENABLED for realistic behavior (note: some mappings only act when enabled).
+  * If you can, test twice: (A) Brains enabled, (B) Brains disabled, compare summaries.
 
--- ========================= Helpers ==============================
-local function log(level, msg)
-  level = level or "INFO"
-  mc.mcCntlSetLastError(inst, string.format("[OUTTRACE][%s] %s", level, tostring(msg)))
+Interpreting classes:
+  * OK_STICK        – OFF holds across all delays
+  * REASSERT_EDGE   – OFF only fails when we first drive ON (prime). Classic Brain latch.
+  * REASSERT_CONT   – OFF fails even without prime; likely continuous writer
+  * AUX_DOMINATES   – MANUAL OFF fails but DIRECT OFF holds; Aux/auto/safety logic overrides
+  * AUTO_REQUIRED   – OFF only works when AUTO=0 (expected if you want auto to dominate)
+
+]]
+
+local mc = mc
+local wx = require("wx")
+
+-- ==== simple io/log helpers ===================================================
+local function getProfileDir(inst)
+  local mach = mc.mcCntlGetMachDir(inst)
+  local ok, prof = pcall(mc.mcProfileGetName, inst)
+  return mach .. "\\Profiles\\" .. (ok and prof or "BLP")
 end
-
-local function sigConst(n)
-  return mc[string.format("OSIG_OUTPUT%d", n)]
-end
-
-local function getHandle(id)
-  local h = mc.mcSignalGetHandle(inst, id)
-  return h
-end
-
-local function readSig(id)
-  local h = getHandle(id)
-  if not h or h == 0 then return -1 end
-  return mc.mcSignalGetState(h) or -1
-end
-
-local function writeSig(id, v)
-  local h = getHandle(id)
-  if not h or h == 0 then return false, -1, -1 end
-  mc.mcSignalSetState(h, (v and 1 or 0))
-  local imm = mc.mcSignalGetState(h)
-  wx.wxMilliSleep(DELAY_MS)
-  local aft = mc.mcSignalGetState(h)
-  return true, imm, aft
-end
-
-local function pvGet(n)
-  local v
-  if SystemLib and SystemLib.PoundVarGet then v = SystemLib.PoundVarGet(inst,n) else v = mc.mcCntlGetPoundVar(inst,n) end
-  return (type(v)=="number") and v or (tonumber(v) or 0)
-end
-
-local function pvSet(n, v)
-  if SystemLib and SystemLib.PoundVarSet then return SystemLib.PoundVarSet(inst,n,v) else return mc.mcCntlSetPoundVar(inst,n,v) end
-end
-
-local function enabled()
-  local h = mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED)
-  return (h and h~=0 and mc.mcSignalGetState(h) == 1) and 1 or 0
-end
-
-local function getCaller(depth)
-  depth = depth or 3
-  local info = debug.getinfo(depth, "Sl")
-  if not info then return "<unknown>" end
-  local src = tostring(info.short_src or info.source or "?")
-  local line = tostring(info.currentline or "?")
-  return string.format("%s:%s", src, line)
-end
-
--- ========================= Setup & Snapshot =====================
-log("INFO", "=== Outputs Trace: begin ===")
-log("INFO", string.format("Profile=%s  Time=%s  Enabled=%d",
-  tostring(mc.mcProfileGetName(inst)), os.date("%Y-%m-%d %H:%M:%S"), enabled()))
-
-if FORCE_AUTOS_OFF then
-  log("WARNING", "FORCE_AUTOS_OFF=true -> clearing autos (#400/#401/#402) and targets (#404/#403/#411/#412)")
-  pvSet(400,0); pvSet(401,0); pvSet(402,0);
-  pvSet(404,0); pvSet(403,0); pvSet(411,0); pvSet(412,0);
-end
-
--- Probe UI controls (to verify color-binding names) — non-fatal
-do
-  local probe = {
-    "btnBootAuto","btnDustBootAuto","btnDustAuto","btnDustCollectAuto","btnVacAuto","btnVacuumAuto",
-  }
-  for _, name in ipairs(probe) do
-    local ok, val = pcall(scr.GetProperty, name, "Button State")
-    if ok and val ~= nil then log("INFO", string.format("UI control present: %s state=%s", name, tostring(val))) end
+local function nowStamp()
+  local t = os.date("!*t"); return string.format("%04d%02d%02d-%02d%02d%02d",t.year,t.month,t.day,t.hour,t.min,t.sec) end
+local function ensureDir(path) os.execute(string.format('if not exist "%s" mkdir "%s"', path, path)) end
+local function newLogger(inst)
+  local base = getProfileDir(inst) .. "\\Reports"; ensureDir(base)
+  local file = base .. "\\OutputFlipDiagV2-" .. nowStamp() .. ".log"
+  local fh = assert(io.open(file, "w"))
+  local function log(fmt, ...)
+    local msg = (select('#', ...) > 0) and string.format(fmt, ...) or tostring(fmt)
+    fh:write(os.date("%H:%M:%S "), msg, "\n"); fh:flush(); mc.mcCntlSetLastError(inst, msg)
   end
+  return { file=file, log=log, close=function() fh:close() end }
 end
 
--- ========================= Phase 1: Direct OFF & timing =========
-log("INFO", "-- MINIMAL DIRECT OFF (replicates known-good script) --")
-do
-  local minimal = {4,5,6}
-  for _, n in ipairs(minimal) do
-    local id = sigConst(n)
-    local h = getHandle(id)
-    if h and h > 0 then
-      mc.mcSignalSetState(h, 0)
-      local rb0 = mc.mcSignalGetState(h)
-      log("INFO", string.format("O%d minimal OFF -> immediate=%s", n, tostring(rb0)))
-      wx.wxMilliSleep(200)
-      local rb1 = mc.mcSignalGetState(h)
-      log("INFO", string.format("O%d minimal OFF -> after200ms=%s", n, tostring(rb1)))
-    else
-      log("ERROR", string.format("O%d handle invalid in minimal test", n))
-    end
-  end
+-- ==== core Mach helpers =======================================================
+local function sigHandle(inst, id) local ok,h=pcall(mc.mcSignalGetHandle,inst,id); return ok and h or nil end
+local function sigGet(h) local ok,s=pcall(mc.mcSignalGetState,h); return ok and (s==1 and 1 or 0) or -1 end
+local function sigSet(h,v) local ok=pcall(mc.mcSignalSetState,h,(v and 1 or 0)); return ok end
+local function pvGet(inst,n) local ok,v=pcall(mc.mcCntlGetPoundVar,inst,n); return ok and tonumber(v) or nil end
+local function pvSet(inst,n,v) pcall(mc.mcCntlSetPoundVar,inst,n,tonumber(v) or 0) end
+
+-- optional library
+local AuxLib = rawget(_G, "AuxLib")
+
+-- ==== device map (matches your project) =======================================
+local DEV = {
+  { key="dust",     name="Dust Collect", osig=mc.OSIG_OUTPUT4, autoPV=400, tgtPV=404 },
+  { key="boot",     name="Dust Boot",    osig=mc.OSIG_OUTPUT3, autoPV=402, tgtPV=403 },
+  { key="vacRear",  name="Vac Rear",     osig=mc.OSIG_OUTPUT5, autoPV=401, tgtPV=411 },
+  { key="vacFront", name="Vac Front",    osig=mc.OSIG_OUTPUT6, autoPV=401, tgtPV=412 },
+}
+
+-- ==== utilities ===============================================================
+local function sample(msDelays, reader)
+  local out = {}
+  for _,ms in ipairs(msDelays) do wx.wxMilliSleep(ms); out[#out+1]=reader() end
+  return out
 end
 
-for _, n in ipairs(TEST_OUTPUTS) do
-  local id = sigConst(n)
-  local start = readSig(id)
-  log("INFO", string.format("O%d start=%s", n, tostring(start)))
-  local ok, imm, aft = writeSig(id, 0)
-  log("INFO", string.format("O%d direct OFF -> imm=%s delayed=%s", n, tostring(imm), tostring(aft)))
-  -- OFF->1 timing sample up to ~700 ms
-  local t0 = wx.wxGetUTCTimeMillis and wx.wxGetUTCTimeMillis() or os.clock()*1000
-  local first1
-  for i=1,20 do
-    wx.wxMilliSleep(SAMPLE_OFF_FAST)
-    if readSig(id) == 1 then first1 = ( (wx.wxGetUTCTimeMillis and wx.wxGetUTCTimeMillis() or os.clock()*1000) - t0 ); break end
-  end
-  if not first1 then
-    for i=1,10 do
-      wx.wxMilliSleep(SAMPLE_OFF_SLOW)
-      if readSig(id) == 1 then first1 = ( (wx.wxGetUTCTimeMillis and wx.wxGetUTCTimeMillis() or os.clock()*1000) - t0 ); break end
-    end
-  end
-  if first1 then log("INFO", string.format("O%d OFF->1 reassert ~%d ms", n, first1)) end
+local function hammerOff(h, durationMs, periodMs)
+  local t=0
+  while t < durationMs do sigSet(h,0); wx.wxMilliSleep(periodMs); t=t+periodMs end
 end
 
--- ========================= Phase 2: Caller Trace Window =========
-log("INFO", string.format("TRACE window: %d ms; guard=%s", TRACE_MS, tostring(TRACE_GUARD_ON)))
-local traced = {}
-local function acc(n, what, caller)
-  traced[n] = traced[n] or {}
-  local key = tostring(caller).."|"..tostring(what)
-  traced[n][key] = (traced[n][key] or 0) + 1
+local function auxUpdate(inst)
+  if AuxLib and AuxLib.Update then pcall(AuxLib.Update, inst) end
 end
 
-local saved = { }
-if SystemLib then
-  saved.sigSet = SystemLib.SignalSetState
-  saved.sigWrite = SystemLib.Signals and SystemLib.Signals.Write
+-- One scenario run
+local function runScenario(inst, L, d, h, opt)
+  -- opt: {auto=0/1, prime=false/true, method="manual"|"direct"}
+  pvSet(inst, d.autoPV, opt.auto or 0)
+  auxUpdate(inst)
 
-  SystemLib.SignalSetState = function(_, signal, state)
-    local id = signal
-    if type(signal) == "string" and mc[signal] then id = mc[signal] end
-    local outN
-    for _, n in ipairs({3,4,5,6}) do if id == sigConst(n) then outN = n break end end
-    local caller = getCaller(3)
-    if outN and TRACE_GUARD_ON and state == 1 then
-      log("WARNING", string.format("GUARD block ON: O%d by %s", outN, caller))
-      acc(outN, "block_on", caller)
-      return true
-    end
-    local ok = false
-    if saved.sigSet then ok = pcall(saved.sigSet, SystemLib, signal, state) end
-    if outN then
-      local imm = readSig(id)
-      wx.wxMilliSleep(DELAY_MS)
-      local aft = readSig(id)
-      log("DEBUG", string.format("TRACE write O%d by %s -> want=%s imm=%s aft=%s en=%d", outN, caller, tostring(state), tostring(imm), tostring(aft), enabled()))
-      acc(outN, string.format("want=%s imm=%s aft=%s", tostring(state), tostring(imm), tostring(aft)), caller)
-    end
-    return ok
+  local s0 = sigGet(h)
+  local tgt0 = pvGet(inst, d.tgtPV) or 0
+  L.log("Scenario %-7s auto=%d prime=%s start: OSIG=%d TGT=%d", opt.method, opt.auto or 0, tostring(opt.prime), s0, tgt0)
+
+  -- optional prime (force ON first)
+  if opt.prime then
+    if opt.method=="manual" then pvSet(inst, d.tgtPV, 1); auxUpdate(inst) else sigSet(h,1) end
+    wx.wxMilliSleep(30)
   end
 
-  if SystemLib.Signals then
-    SystemLib.Signals.Write = function(_, values, opts)
-      for k, v in pairs(values or {}) do
-        local id = mc[k] or k
-        local outN
-        for _, n in ipairs({3,4,5,6}) do if id == sigConst(n) then outN = n break end end
-        local caller = getCaller(3)
-        if outN and TRACE_GUARD_ON and v then
-          log("WARNING", string.format("GUARD block ON: O%d by %s (Signals.Write)", outN, caller))
-          acc(outN, "block_on(Write)", caller)
-        else
-          SystemLib.SignalSetState(SystemLib, id, (v and 1 or 0))
+  -- attempt OFF
+  if opt.method=="manual" then
+    pvSet(inst, d.tgtPV, 0); auxUpdate(inst)
+  else
+    sigSet(h, 0)
+  end
+
+  local imm, after200, after1000 = table.unpack(sample({0,200,800}, function() return sigGet(h) end))
+  L.log("  OFF readback: immediate=%d, +200ms=%d, +1000ms=%d", imm, after200, after1000)
+
+  -- hammer to see if a continuous writer exists
+  hammerOff(h, 300, 5)
+  local afterHammer = sigGet(h)
+  L.log("  after hammer(300ms,5ms): %d", afterHammer)
+
+  -- classify
+  local class
+  if imm==0 and after200==0 and after1000==0 then class="OK_STICK"
+  elseif (not opt.prime) and (imm==0) and (after200==1 or after1000==1) then class="REASSERT_CONT"
+  elseif opt.prime and (imm==0) and (after200==1 or after1000==1) then class="REASSERT_EDGE"
+  elseif opt.method=="manual" and (imm==1 and after200==1 and after1000==1) then class="AUX_DOMINATES"
+  else class="MIXED"
+  end
+
+  return {class=class, imm=imm, d200=after200, d1000=after1000, afterHammer=afterHammer}
+end
+
+local function RunV2()
+  local inst = mc.mcGetInstance(); if not inst then return end
+  local L = newLogger(inst)
+  local en = mc.mcSignalGetState(mc.mcSignalGetHandle(inst, mc.OSIG_MACHINE_ENABLED))
+  L.log("Output Flip Diag v2 start (MachineEnabled=%d)", en==1 and 1 or 0)
+
+  local results = {}
+  for _,d in ipairs(DEV) do
+    local h = sigHandle(inst, d.osig)
+    L.log("\n=== %s (%s) ===", d.name, d.key)
+    results[d.key] = {}
+    for _,auto in ipairs({0,1}) do
+      for _,prime in ipairs({false,true}) do
+        for _,method in ipairs({"manual","direct"}) do
+          local r = runScenario(inst, L, d, h, {auto=auto, prime=prime, method=method})
+          local tag = string.format("auto%d_%s_%s", auto, prime and "prime" or "noprime", method)
+          results[d.key][tag] = r
         end
       end
-      return true
     end
   end
-else
-  log("WARNING", "SystemLib missing; trace wrappers unavailable")
+
+  L.log("\n=== SUMMARY ===")
+  for _,d in ipairs(DEV) do
+    L.log("%s:", d.key)
+    for _,auto in ipairs({0,1}) do
+      for _,prime in ipairs({false,true}) do
+        for _,method in ipairs({"manual","direct"}) do
+          local tag = string.format("auto%d_%s_%s", auto, prime and "prime" or "noprime", method)
+          local r = results[d.key][tag]
+          L.log("  %-18s -> %-14s  (imm=%d, +200=%d, +1000=%d, hammer=%d)", tag, r.class or "?", r.imm, r.d200, r.d1000, r.afterHammer)
+        end
+      end
+    end
+  end
+  L.log("\nReport: %s", L.file)
+  L.close()
 end
 
--- Force all traced outputs OFF, then hold the window
-for _, n in ipairs({3,4,5,6}) do writeSig(sigConst(n), 0) end
-local tStart = wx.wxGetUTCTimeMillis and wx.wxGetUTCTimeMillis() or os.clock()*1000
-while true do
-  wx.wxMilliSleep(20)
-  local now = wx.wxGetUTCTimeMillis and wx.wxGetUTCTimeMillis() or os.clock()*1000
-  if (now - tStart) >= TRACE_MS then break end
-end
-
--- Restore originals
-if SystemLib then
-  if saved.sigSet then SystemLib.SignalSetState = saved.sigSet end
-  if SystemLib.Signals and saved.sigWrite then SystemLib.Signals.Write = saved.sigWrite end
-end
-
--- Summary
-for n, bag in pairs(traced) do
-  log("INFO", string.format("TRACE summary O%d:", n))
-  for key, cnt in pairs(bag) do log("INFO", string.format("  %s -> %d", key, cnt)) end
-end
-
-log("INFO", "=== Outputs Trace: end ===")
+RunV2()

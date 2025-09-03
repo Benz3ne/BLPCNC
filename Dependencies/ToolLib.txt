@@ -87,13 +87,20 @@ local function _line(fmt, ...)
     return string.format(fmt, ...):gsub("[\r\n]*$", "") .. "\n"
 end
 
+-- Avoid truthy-cast: map only explicit ON values to 1; everything else OFF
+local function _as01(x)
+    if x == true or x == 1 or x == "1" or x == "HIGH" or x == "high" then return 1 end
+    return 0
+end
+
 local function _sig_write(inst, nameOrId, v)
+    local want = _as01(v) -- WARNING: do not use (v and 1 or 0); 0 is truthy in Lua
     if SystemLib and SystemLib.Signals and SystemLib.Signals.Write then
-        SystemLib.Signals.Write(inst, { [nameOrId] = (v and 1 or 0) })
+        SystemLib.Signals.Write(inst, { [nameOrId] = want })
     else
         local id = (type(nameOrId) == "string" and mc[nameOrId]) or nameOrId
         local h = mc.mcSignalGetHandle(inst, id)
-        if h and h ~= 0 then mc.mcSignalSetState(h, (v and 1 or 0)) end
+        if h and h ~= 0 then mc.mcSignalSetState(h, want) end
     end
 end
 

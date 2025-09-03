@@ -1,0 +1,14 @@
+-- ProbeDown button clicked script
+local inst = mc.mcGetInstance()
+local currentTool = mc.mcToolGetCurrent(inst)
+
+if currentTool == 90 then
+    mc.mcCntlMdiExecute(inst, "T0 M6")
+else
+    mc.mcCntlMdiExecute(inst, "T90 M6")
+end
+
+-- Clear manual override when toggling automation
+if ClearDustBootOverride then
+    ClearDustBootOverride()
+end

@@ -4,6 +4,15 @@
 
 AuxLib = AuxLib or {}
 
+-- Log source of this module load (helps detect duplicate copies)
+do
+    local okInst, inst = pcall(mc.mcGetInstance)
+    local src = debug.getinfo(1, "S").source or "?"
+    if okInst and inst then
+        pcall(mc.mcCntlLog, inst, "AuxLib LOADED FROM: " .. tostring(src), "", -1)
+    end
+end
+
 ----------------------------------------------------------------
 -- Configuration & runtime
 ----------------------------------------------------------------
@@ -46,14 +55,19 @@ local function _sig_read(inst, handleOrName)
     return mc.mcSignalGetState(h) or 0
 end
 
+local function _as01(x)
+    if x == true or x == 1 or x == "1" or x == "HIGH" or x == "high" then return 1 end
+    return 0
+end
+
 local function _sig_write(inst, nameOrId, v)
     -- Prefer SystemLib.Signals.Write if available for consistency
     if SystemLib and SystemLib.Signals and SystemLib.Signals.Write then
-        SystemLib.Signals.Write(inst, { [nameOrId] = (v and 1 or 0) })
+        SystemLib.Signals.Write(inst, { [nameOrId] = (_as01(v) == 1) })
         return
     end
     local h = _sig_handle(inst, nameOrId)
-    if h and h ~= 0 then mc.mcSignalSetState(h, (v and 1 or 0)) end
+    if h and h ~= 0 then mc.mcSignalSetState(h, _as01(v)) end
 end
 
 local function _pv_get(inst, n)

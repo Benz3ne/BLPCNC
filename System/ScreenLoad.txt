@@ -593,6 +593,38 @@ end
       end
 
       pcall(UpdateToolPreview)
+
+      -- Home Required flashing (if any enabled axis not homed)
+      do
+        local homed = true
+        if SystemLib and SystemLib.CheckHoming then
+          local ok, allHomed = pcall(SystemLib.CheckHoming, inst, false)
+          homed = (ok and allHomed) and true or false
+        end
+        local ctrlName = "btnHomeRequired"
+        local exists = pcall(scr.GetProperty, ctrlName, "Visible")
+        if exists then
+          if not homed then
+            -- Start/continue flashing: yellow on/off
+            local flash = UILib and UILib.__flash and UILib.__flash[ctrlName]
+            if not flash and UILib and UILib.FlashButton then
+              UILib.FlashButton(ctrlName, { onColor="#FFFF00", offColor="#4B4B4B", onLabel="HOME REQUIRED", offLabel="HOME REQUIRED", frequency=2.0, duty=0.5, textBold=true, setState=true })
+            end
+          else
+            -- Stop flashing and set solid OFF
+            if UILib and UILib.__flash and UILib.__flash[ctrlName] and UILib.__flash[ctrlName].Stop then
+              pcall(UILib.__flash[ctrlName].Stop)
+              UILib.__flash[ctrlName] = nil
+            end
+            if UILib and UILib.SyncToggleButton then
+              UILib.SyncToggleButton(ctrlName, false, {bgColor="#4B4B4B", state="0"}, {bgColor="#4B4B4B", state="0"})
+            else
+              setp_ifdiff(ctrlName, "Button State", "0")
+              setp_ifdiff(ctrlName, "Bg Color", "#4B4B4B")
+            end
+          end
+        end
+      end
     end)
     svc.timer:Start(150)
   end)

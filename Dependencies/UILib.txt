@@ -360,23 +360,28 @@ function UILib.ShowCustomConfirm(spec)
     mainSizer:AddStretchSpacer()
     mainSizer:Add(wx.wxStaticLine(panel, wx.wxID_ANY), 0, wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT, 10)
 
-    -- 5. Buttons (plain horizontal sizer; center at bottom)
+    -- 5. Buttons (plain horizontal sizer; center at bottom, destructive on right)
     local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
     local result = { buttonId = nil }
     local defaultButtonCtrl
-
-    for _, btnSpec in ipairs(spec.buttons or {{id="ok", label="OK", isDefault=true}}) do
+    local specs = spec.buttons or {{id="ok", label="OK", isDefault=true}}
+    local normal, destructive = {}, {}
+    for _, b in ipairs(specs) do
+        if tostring(b.style) == "destructive" then table.insert(destructive, b) else table.insert(normal, b) end
+    end
+    local ordered = {}
+    for _, b in ipairs(normal) do table.insert(ordered, b) end
+    for _, b in ipairs(destructive) do table.insert(ordered, b) end
+    for _, btnSpec in ipairs(ordered) do
         local btn = wx.wxButton(panel, wx.wxID_ANY, tostring(btnSpec.label or ""))
         btn:Connect(wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
             result.buttonId = btnSpec.id
             dialog:EndModal(wx.wxID_OK)
         end)
-
-        if btnSpec.style == "destructive" then
+        if tostring(btnSpec.style) == "destructive" then
             btn:SetBackgroundColour(wx.wxColour(200, 0, 0))
             btn:SetForegroundColour(wx.wxWHITE)
         end
-
         if btnSpec.isDefault then
             btn:SetDefault()
             defaultButtonCtrl = btn

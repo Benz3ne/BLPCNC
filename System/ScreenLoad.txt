@@ -652,7 +652,7 @@ end
           tostring(exists), tostring(homed), tostring(UILib and UILib.__flash and UILib.__flash[ctrlName] ~= nil)))
         if exists then
           if not homed then
-            -- Ensure flashing is active (momentary-safe, visible)
+            -- Ensure flashing is active (momentary-safe, visible; bold HOME REQUIRED)
             if UILib and UILib.EnsureFlash then
               UILib.EnsureFlash(ctrlName, true, {
                 onColor="#FFFF00", offColor="#4B4B4B",
@@ -662,13 +662,16 @@ end
               })
             end
           else
-            -- Stop flashing and set solid OFF
+            -- Stop flashing and set solid OFF; restore label
             if UILib and UILib.StopFlash then UILib.StopFlash(ctrlName) end
             if UILib and UILib.SyncToggleButton then
-              UILib.SyncToggleButton(ctrlName, false, {bgColor="#4B4B4B", state="0"}, {bgColor="#4B4B4B", state="0"})
+              UILib.SyncToggleButton(ctrlName, false,
+                { bgColor="#4B4B4B", state="0" },
+                { bgColor="#4B4B4B", state="0", label="Ref All\nAxis", textBold=false })
             else
               setp_ifdiff(ctrlName, "Button State", "0")
               setp_ifdiff(ctrlName, "Bg Color", "#4B4B4B")
+              setp_ifdiff(ctrlName, "Label", "Ref All\nAxis")
             end
           end
         end

@@ -214,9 +214,14 @@ function SystemLib.SignalSetState(inst, signal, state)
   local handle = signal
   local id = nil
   if type(signal) == "number" then
-    id = signal
+    -- Only assign id if this numeric value resolves to a valid handle (i.e., it's an ID, not a handle)
     local h = SystemLib.SignalGetHandle(inst, signal)
-    if h and h > 0 then handle = h end
+    if h and h > 0 then
+      handle = h
+      id = signal
+    else
+      handle = signal -- assume caller passed a handle directly
+    end
   end
   if not handle or handle == 0 then return false end
 

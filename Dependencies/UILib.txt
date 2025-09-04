@@ -298,9 +298,16 @@ function UILib.ShowCustomConfirm(spec)
     local title = spec.title or "Confirm"
     local message = spec.message or "Are you sure?"
     local geometryName = spec.geometryName or "CustomConfirmDialog"
-    
-    -- Create dialog with geometry management
-    local dialog = UILib.CreateDialog(UILib.GetSafeParent(), title, geometryName, 450, 200, wx.wxDEFAULT_DIALOG_STYLE)
+
+    -- Create dialog with geometry management (resizable, larger default)
+    local dialog = UILib.CreateDialog(
+        UILib.GetSafeParent(),
+        title,
+        geometryName,
+        520, 260,
+        wx.wxDEFAULT_DIALOG_STYLE + wx.wxRESIZE_BORDER
+    )
+    dialog:SetMinSize(wx.wxSize(480, 240))
     local panel = wx.wxPanel(dialog, wx.wxID_ANY)
     local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
     
@@ -326,7 +333,7 @@ function UILib.ShowCustomConfirm(spec)
 
     -- 2. Message
     local msgText = wx.wxStaticText(panel, wx.wxID_ANY, message)
-    msgText:Wrap(350)
+    msgText:Wrap(420)
     contentSizer:Add(msgText, 1, wx.wxALL + wx.wxALIGN_CENTER_VERTICAL, 15)
     mainSizer:Add(contentSizer, 0, wx.wxEXPAND)
 
@@ -390,7 +397,7 @@ function UILib.ShowCustomConfirm(spec)
     end
 
     panel:SetSizer(mainSizer)
-    dialog:Fit()
+    dialog:Fit()  -- respects SetMinSize; ensures contents are visible
     dialog:Centre()
 
     -- Final result gathering

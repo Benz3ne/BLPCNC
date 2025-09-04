@@ -42,12 +42,11 @@ function UILib.DialogGeometryLoad(inst, name, defaultW, defaultH)
     local sw = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_X) or 1024
     local sh = wx.wxSystemSettings.GetMetric(wx.wxSYS_SCREEN_Y) or 768
     
-    -- Load saved values
-    -- mcProfileGetString may return (value, rc); select(1, ...) to avoid passing base to tonumber
-    local x = tonumber(select(1, SystemLib.ProfileRead(inst, section, name.."_x", "-1"))) or -1
-    local y = tonumber(select(1, SystemLib.ProfileRead(inst, section, name.."_y", "-1"))) or -1
-    local w = tonumber(select(1, SystemLib.ProfileRead(inst, section, name.."_w", tostring(defaultW)))) or defaultW
-    local h = tonumber(select(1, SystemLib.ProfileRead(inst, section, name.."_h", tostring(defaultH)))) or defaultH
+    -- Load saved values (SystemLib.ProfileRead returns a single string)
+    local x = tonumber(SystemLib.ProfileRead(inst, section, name.."_x", "-1")) or -1
+    local y = tonumber(SystemLib.ProfileRead(inst, section, name.."_y", "-1")) or -1
+    local w = tonumber(SystemLib.ProfileRead(inst, section, name.."_w", tostring(defaultW))) or defaultW
+    local h = tonumber(SystemLib.ProfileRead(inst, section, name.."_h", tostring(defaultH))) or defaultH
     
     -- Validate position is on screen
     if x < 0 or y < 0 or x > sw - 100 or y > sh - 100 then

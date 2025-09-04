@@ -595,7 +595,7 @@ end
           local ok, allHomed = pcall(SystemLib.CheckHoming, inst, false)
           homed = (ok and allHomed) and true or false
         end
-        local ctrlName = "btnHomeRequired"
+        local ctrlName = "btnRefAllAxes"
         local exists = pcall(scr.GetProperty, ctrlName, "Visible")
         if exists then
           if not homed then

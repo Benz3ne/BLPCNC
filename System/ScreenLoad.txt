@@ -473,6 +473,34 @@ function UI.SyncOutputs(snapshot)
       UILib.StopFlash(btn)
     end
   end
+
+  -- Home Required (Ref All Axes) — ensure flash on repaint if not homed
+  do
+    local homed = true
+    if SystemLib and SystemLib.CheckHoming then
+      local ok, allHomed = pcall(SystemLib.CheckHoming, inst, false)
+      homed = (ok and allHomed) and true or false
+    end
+    local btn = "btnRefAllAxes"
+    if not homed then
+      if UILib and UILib.EnsureFlash then
+        UILib.EnsureFlash(btn, true, {
+          onColor="#FFFF00", offColor="#4B4B4B",
+          onTextColor="#000000", offTextColor="#000000",
+          onLabel="HOME REQUIRED", offLabel="HOME REQUIRED",
+          frequency=2.0, duty=0.5, textBold=true, setState=false,
+        })
+      end
+    else
+      if UILib and UILib.StopFlash then UILib.StopFlash(btn) end
+      if UILib and UILib.SyncToggleButton then
+        UILib.SyncToggleButton(btn, false, {bgColor="#4B4B4B", state="0"}, {bgColor="#4B4B4B", state="0"})
+      else
+        setp_ifdiff(btn, "Button State", "0")
+        setp_ifdiff(btn, "Bg Color", "#4B4B4B")
+      end
+    end
+  end
 end
 
 local function ctrlExists(name, prop) local ok = pcall(scr.GetProperty, name, prop or "Visible"); return ok end
@@ -624,19 +652,18 @@ end
           tostring(exists), tostring(homed), tostring(UILib and UILib.__flash and UILib.__flash[ctrlName] ~= nil)))
         if exists then
           if not homed then
-            -- Start/continue flashing: yellow on/off
-            local flash = UILib and UILib.__flash and UILib.__flash[ctrlName]
-            if not flash and UILib and UILib.FlashButton then
-              dbg("starting flash")
-              UILib.FlashButton(ctrlName, { onColor="#FFFF00", offColor="#4B4B4B", onLabel="HOME REQUIRED", offLabel="HOME REQUIRED", frequency=2.0, duty=0.5, textBold=true, setState=false })
+            -- Ensure flashing is active (momentary-safe, visible)
+            if UILib and UILib.EnsureFlash then
+              UILib.EnsureFlash(ctrlName, true, {
+                onColor="#FFFF00", offColor="#4B4B4B",
+                onTextColor="#000000", offTextColor="#000000",
+                onLabel="HOME REQUIRED", offLabel="HOME REQUIRED",
+                frequency=2.0, duty=0.5, textBold=true, setState=false,
+              })
             end
           else
             -- Stop flashing and set solid OFF
-            if UILib and UILib.__flash and UILib.__flash[ctrlName] and UILib.__flash[ctrlName].Stop then
-              dbg("stopping flash")
-              pcall(UILib.__flash[ctrlName].Stop)
-              UILib.__flash[ctrlName] = nil
-            end
+            if UILib and UILib.StopFlash then UILib.StopFlash(ctrlName) end
             if UILib and UILib.SyncToggleButton then
               UILib.SyncToggleButton(ctrlName, false, {bgColor="#4B4B4B", state="0"}, {bgColor="#4B4B4B", state="0"})
             else

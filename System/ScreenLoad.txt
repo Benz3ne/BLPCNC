@@ -614,7 +614,7 @@ end
             -- Start/continue flashing: yellow on/off
             local flash = UILib and UILib.__flash and UILib.__flash[ctrlName]
             if not flash and UILib and UILib.FlashButton then
-              UILib.FlashButton(ctrlName, { onColor="#FFFF00", offColor="#4B4B4B", onLabel="HOME REQUIRED", offLabel="HOME REQUIRED", frequency=2.0, duty=0.5, textBold=true, setState=true })
+              UILib.FlashButton(ctrlName, { onColor="#FFFF00", offColor="#4B4B4B", onLabel="HOME REQUIRED", offLabel="HOME REQUIRED", frequency=2.0, duty=0.5, textBold=true, setState=false })
             end
           else
             -- Stop flashing and set solid OFF

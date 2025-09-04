@@ -159,6 +159,27 @@ function SystemLib.PoundVarSet(inst, var, value)
     return true
 end
 
+--[[ SystemLib.PoundVarSetSafe
+Set pound variable, optionally deferring until IDLE to avoid writing during motion.
+Params:
+  inst  (number)
+  var   (number)
+  value (number|string)
+  opts  (table|nil): { force=true|false, timeout_ms?, poll_ms? }
+Returns: ok(bool), err(string|nil)
+]]
+function SystemLib.PoundVarSetSafe(inst, var, value, opts)
+    opts = opts or {}
+    if not opts.force then
+        local tmo = opts.timeout_ms or 8000
+        local step = opts.poll_ms or 25
+        local ok, why = SystemLib.Await(inst, { idle = true }, { timeout_ms = tmo, poll_ms = step, mode = "block" })
+        if not ok then return false, (why == "timeout" and "Timeout waiting for IDLE" or tostring(why)) end
+    end
+    local ok = SystemLib.PoundVarSet(inst, var, value)
+    return ok, ok and nil or "Failed to set pound var"
+end
+
 --[[ SystemLib.SignalGetHandle
 Get signal handle with caching
 Params:

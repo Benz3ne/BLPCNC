@@ -499,7 +499,13 @@ end
     local h = mc.mcSignalGetHandle(inst, mc.OSIG_SOFTLIMITS_ON)
     local on = (h and mc.mcSignalGetState(h) == 1) and 1 or 0
     local btn = "btnSoftLimits"
-  local flashing = (UILib and UILib.__flash and UILib.__flash[btn]) and true or false
+    local flashing = (UILib and UILib.__flash and UILib.__flash[btn]) and true or false
+    -- Always update label to reflect state
+    if on == 0 then
+      setp_ifdiff(btn, "Label", "Soft Limits\nDISABLED")
+    else
+      setp_ifdiff(btn, "Label", "Soft Limits\nENABLE")
+    end
   if on == 1 and flashing and UILib and UILib.__flash[btn].Stop then
     pcall(UILib.__flash[btn].Stop)
     UILib.__flash[btn] = nil
@@ -511,11 +517,11 @@ end
         setp_ifdiff(btn, "Button State", on == 1 and "1" or "0")
         setp_ifdiff(btn, "Bg Color",     on == 1 and "#00FF00" or "#404040")
       end
-      -- Update label to reflect disabled state
+      -- Keep label consistent with state when not flashing
       if on == 0 then
         setp_ifdiff(btn, "Label", "Soft Limits\nDISABLED")
       else
-        setp_ifdiff(btn, "Label", "Soft Limits")
+        setp_ifdiff(btn, "Label", "Soft Limits\nENABLE")
       end
     end
   end

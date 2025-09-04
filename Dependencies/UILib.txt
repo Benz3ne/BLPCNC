@@ -360,13 +360,13 @@ function UILib.ShowCustomConfirm(spec)
     mainSizer:AddStretchSpacer()
     mainSizer:Add(wx.wxStaticLine(panel, wx.wxID_ANY), 0, wx.wxEXPAND + wx.wxLEFT + wx.wxRIGHT, 10)
 
-    -- 5. Buttons
-    local btnSizer = wx.wxStdDialogButtonSizer()
-    local result = { buttonId = nil } -- Holds the final result
+    -- 5. Buttons (plain horizontal sizer; center at bottom)
+    local btnSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
+    local result = { buttonId = nil }
     local defaultButtonCtrl
-    
+
     for _, btnSpec in ipairs(spec.buttons or {{id="ok", label="OK", isDefault=true}}) do
-        local btn = wx.wxButton(panel, wx.wxID_ANY, btnSpec.label)
+        local btn = wx.wxButton(panel, wx.wxID_ANY, tostring(btnSpec.label or ""))
         btn:Connect(wx.wxEVT_COMMAND_BUTTON_CLICKED, function()
             result.buttonId = btnSpec.id
             dialog:EndModal(wx.wxID_OK)
@@ -376,15 +376,14 @@ function UILib.ShowCustomConfirm(spec)
             btn:SetBackgroundColour(wx.wxColour(200, 0, 0))
             btn:SetForegroundColour(wx.wxWHITE)
         end
-        
+
         if btnSpec.isDefault then
             btn:SetDefault()
             defaultButtonCtrl = btn
         end
-        btnSizer:AddButton(btn)
+        btnSizer:Add(btn, 0, wx.wxLEFT + wx.wxRIGHT, 8)
     end
-    btnSizer:Realize()
-    mainSizer:Add(btnSizer, 0, wx.wxEXPAND + wx.wxALL, 10)
+    mainSizer:Add(btnSizer, 0, wx.wxALIGN_CENTER + wx.wxALL, 10)
 
     -- Input validation logic
     if spec.input and spec.input.match and defaultButtonCtrl then

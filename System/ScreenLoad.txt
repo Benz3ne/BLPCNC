@@ -609,16 +609,25 @@ end
         end
         local ctrlName = "btnRefAllAxes"
         local exists = pcall(scr.GetProperty, ctrlName, "Visible")
+        local function dbg(msg)
+          if SystemLib and SystemLib.IsDebugMode and SystemLib.IsDebugMode() then
+            SystemLib.Log(inst, "[HOMEFLASH] " .. msg, "DEBUG")
+          end
+        end
+        dbg(string.format("exists=%s homed=%s flashing=%s",
+          tostring(exists), tostring(homed), tostring(UILib and UILib.__flash and UILib.__flash[ctrlName] ~= nil)))
         if exists then
           if not homed then
             -- Start/continue flashing: yellow on/off
             local flash = UILib and UILib.__flash and UILib.__flash[ctrlName]
             if not flash and UILib and UILib.FlashButton then
+              dbg("starting flash")
               UILib.FlashButton(ctrlName, { onColor="#FFFF00", offColor="#4B4B4B", onLabel="HOME REQUIRED", offLabel="HOME REQUIRED", frequency=2.0, duty=0.5, textBold=true, setState=false })
             end
           else
             -- Stop flashing and set solid OFF
             if UILib and UILib.__flash and UILib.__flash[ctrlName] and UILib.__flash[ctrlName].Stop then
+              dbg("stopping flash")
               pcall(UILib.__flash[ctrlName].Stop)
               UILib.__flash[ctrlName] = nil
             end

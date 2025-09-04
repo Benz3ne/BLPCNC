@@ -1737,4 +1737,42 @@ function UILib.FlashButton(name, spec)
     return handle
 end
 
+-- Flash helpers: query, stop, and idempotent ensure
+function UILib.IsFlashing(name)
+    return (UILib.__flash and UILib.__flash[name] ~= nil) and true or false
+end
+
+function UILib.StopFlash(name)
+    local h = UILib.__flash and UILib.__flash[name]
+    if h and h.Stop then pcall(h.Stop) end
+    if UILib.__flash then UILib.__flash[name] = nil end
+end
+
+-- Ensure control flashes while condition is true; stop otherwise.
+-- Defaults are safe for momentary buttons (no Button State writes).
+function UILib.EnsureFlash(name, shouldFlash, spec)
+    spec = spec or {
+        onColor      = "#FFFF00",
+        offColor     = "#4B4B4B",
+        onTextColor  = nil,
+        offTextColor = nil,
+        onLabel      = nil,
+        offLabel     = nil,
+        frequency    = 2.0,
+        duty         = 0.5,
+        textBold     = true,
+        setState     = false,
+    }
+    local flashing = UILib.__flash and UILib.__flash[name]
+    if shouldFlash then
+        if not flashing then
+            UILib.FlashButton(name, spec)
+        end
+    else
+        if flashing and flashing.Stop then pcall(flashing.Stop) end
+        if UILib.__flash then UILib.__flash[name] = nil end
+    end
+    return UILib.IsFlashing(name)
+end
+
 return UILib

@@ -296,20 +296,21 @@ Returns:
 function UILib.ShowCustomConfirm(spec)
     spec = spec or {}
     local title = spec.title or "Confirm"
-    local message = spec.message or "Are you sure?"
     local geometryName = spec.geometryName or "CustomConfirmDialog"
+    -- Convert escaped newlines so text wraps properly
+    local message = tostring(spec.message or "Are you sure?"):gsub("\\r\\n", "\n"):gsub("\\n", "\n")
 
-    -- Create dialog with geometry management (resizable, larger default)
+    -- Create dialog with geometry management (resizable; user can shrink)
     local dialog = UILib.CreateDialog(
-        UILib.GetSafeParent(),
-        title,
-        geometryName,
-        520, 260,
-        wx.wxDEFAULT_DIALOG_STYLE + wx.wxRESIZE_BORDER
+        UILib.GetSafeParent(), title, geometryName,
+        520, 260, wx.wxDEFAULT_DIALOG_STYLE + wx.wxRESIZE_BORDER
     )
-    dialog:SetMinSize(wx.wxSize(480, 240))
     local panel = wx.wxPanel(dialog, wx.wxID_ANY)
     local mainSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    -- Wrap panel in a dialog-level sizer so layout anchors correctly
+    local dlgSizer = wx.wxBoxSizer(wx.wxVERTICAL)
+    dlgSizer:Add(panel, 1, wx.wxEXPAND)
+    dialog:SetSizer(dlgSizer)
     
     -- Main content sizer (icon + message)
     local contentSizer = wx.wxBoxSizer(wx.wxHORIZONTAL)
@@ -397,7 +398,7 @@ function UILib.ShowCustomConfirm(spec)
     end
 
     panel:SetSizer(mainSizer)
-    dialog:Fit()  -- respects SetMinSize; ensures contents are visible
+    dialog:Fit()
     dialog:Centre()
 
     -- Final result gathering

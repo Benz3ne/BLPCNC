@@ -549,8 +549,8 @@ Returns:
   value: Retrieved value or default
 --]]
 function SystemLib.ProfileRead(inst, section, key, default)
-    -- Return a single string value; mcProfileGetString may return (value, rc)
-    return select(1, mc.mcProfileGetString(inst, section, key, default or ""))
+    -- Return exactly one string; parentheses force single return even if API returns (value, rc)
+    return (mc.mcProfileGetString(inst, section, key, default or ""))
 end
 
 -- Raw variant: return both (value, rc) from mcProfileGetString for advanced callers

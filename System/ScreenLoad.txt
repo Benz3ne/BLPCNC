@@ -1,34 +1,6 @@
 -- ===== ScreenLoad (external) =====
 local inst = mc.mcGetInstance()
 
--- === BEGIN: one-time signal write tracer (gated by #4992) ===
-do
-  if not _G.__sigwrap then
-    local orig = mc.mcSignalSetState
-    local gi = debug.getinfo
-    mc.mcSignalSetState = function(hSig, val)
-      local ok, tracePV = pcall(mc.mcCntlGetPoundVar, inst, 4992)
-      local traceOn = ok and (tonumber(tracePV) == 1)
-      local write = (val == true or val == 1 or val == "1" or val == "HIGH" or val == "high") and 1 or 0
-      if traceOn then
-        local where  = gi(2, "Sl")
-        local src    = ((where and where.short_src) or "?") .. ":" .. ((where and where.currentline) or 0)
-        local before = mc.mcSignalGetState(hSig)
-        local rc     = orig(hSig, write)
-        local after  = mc.mcSignalGetState(hSig)
-        mc.mcCntlLog(inst, string.format(
-          "[SIGWRITE] %s h=%s before=%d requested=%s -> wrote=%d after=%d",
-          src, tostring(hSig), before or -1, tostring(val), write, after or -1), "", -1)
-        return rc
-      else
-        return orig(hSig, write)
-      end
-    end
-    _G.__sigwrap = true
-  end
-end
--- === END: tracer ===
-
 -- --- Paths / require ------------------------------------------------------
 local ROOT = [[C:\Mach4Hobby\Profiles\BLP\Scripts]]
 local DEPS = ROOT .. [[\Dependencies]]

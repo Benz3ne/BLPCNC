@@ -1,0 +1,7 @@
+local inst = mc.mcGetInstance()
+if AuxLib and AuxLib.Request then
+  AuxLib.Request(inst, { device = "vacFront", action = "manual.toggle" })
+else
+  mc.mcCntlSetLastError(inst, "Missing AuxLib.Request: vacFront manual.toggle")
+end
+

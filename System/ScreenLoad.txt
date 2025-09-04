@@ -45,12 +45,13 @@ do
       if not h or h == 0 then return nil end
       return mc.mcSignalGetState(h)
     end
+    -- Preserve SystemLib's guards/tracing; only normalize to a handle here then delegate
+    local orig = SL.SignalSetState
     SL.SignalSetState = function(_, signal, state)
       local h = toHandle(signal)
       if not h or h == 0 then return false end
-      local v = (state == true or state == 1 or state == "1" or state == "HIGH" or state == "high") and 1 or 0
-      mc.mcSignalSetState(h, v)
-      return true
+      -- Delegate to original so #4991/#4992 and tracking remain in force
+      return orig(_, h, state)
     end
   end
 end

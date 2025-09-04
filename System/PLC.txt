@@ -139,7 +139,8 @@ function PLC_Tick(inst)
 
   -- Cycle time label (assumes global machEnabled/time as in default PLC)
   if (_G.machEnabled == 1) then
-    local cycletime = mc.mcCntlGetRunTime(inst, _G.time)
+    -- Use standard Lua pattern: take first return (value)
+    local cycletime = select(1, mc.mcCntlGetRunTime(inst))
     if type(_G.SecondsToTime)=="function" then
       pcall(scr.SetProperty, "CycleTime", "Label", _G.SecondsToTime(cycletime))
     end
